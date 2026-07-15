@@ -113,4 +113,6 @@ python3 packaging/build_installer.py /path/to/aliyun-guard-install.sh
 
 ## 安全提醒
 
-Telegram Bot Token 和阿里云 AccessKey 一旦在聊天、终端录屏或公开日志中出现，就应立即在 BotFather 和阿里云 RAM 控制台撤销并重新创建。不要把真实凭据提交到 Git 仓库。
+本项目仅供学习与技术交流使用。
+虽然我们尽力适配和兜底了绝大部分的系统、网络、API 阻断与连接层 BUG，但作者不对因脚本异常、API 变更、依赖挂除或配置错误导致的任何流量流失及费用直接负责。
+强烈建议同时在阿里云费用中心后台设置「预算告警 / 垫底限额」作为最后的防线。
