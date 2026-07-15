@@ -53,7 +53,7 @@ chmod 700 aliyun-guard-install.sh
 文件放到自己的 HTTPS 地址后也可使用：
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Tyj15916789449/aliyun-guard/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main/install.sh | sh
 ```
 
 首次向导会依次设置检测间隔、通知模式、Telegram、AccessKey、Region、实例 ID、账号站点和流量阈值。保存实例前会执行只读 API 校验。
