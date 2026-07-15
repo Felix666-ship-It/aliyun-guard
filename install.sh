@@ -2136,12 +2136,21 @@ else
 fi
 
 printf '%s\n' "此操作将停止服务并删除 $APP_DIR。"
-printf '%s' "确认卸载？输入 YES 继续: "
-IFS= read -r answer <&3 || answer=""
-if [ "$answer" != "YES" ]; then
-    printf '%s\n' "已取消。"
-    exit 0
-fi
+while true; do
+    printf '%s' "确认卸载？输入 Y/N : "
+    if ! IFS= read -r answer <&3; then
+        printf '\n%s\n' "无法读取确认输入，已取消卸载。"
+        exit 1
+    fi
+    case "$answer" in
+        y|Y) break ;;
+        n|N)
+            printf '%s\n' "已取消卸载。"
+            exit 0
+            ;;
+        *) printf '%s\n' "输入无效，请输入 Y 或 N。" ;;
+    esac
+done
 
 printf '%s' "卸载前备份 config.json 到 /root？[Y/n]: "
 IFS= read -r backup <&3 || backup=""

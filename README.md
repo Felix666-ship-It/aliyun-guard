@@ -306,7 +306,7 @@ aliyun-guard dry-run
 aliyun-guard uninstall
 ```
 
-卸载器会要求输入 `YES` 确认，并询问是否先把 `config.json` 备份到 `/root`。随后会移除服务、cron 任务、命令链接和 `/opt/aliyun-guard`。
+卸载器会提示 `确认卸载？输入 Y/N :`；输入 `Y` 执行，输入 `N` 取消。确认后还会询问是否先把 `config.json` 备份到 `/root`，随后移除服务、cron 任务、命令链接和 `/opt/aliyun-guard`。
 
 ## 开发与验证
 
