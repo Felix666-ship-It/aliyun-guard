@@ -72,5 +72,8 @@ esac
 if [ -L /usr/local/bin/aliyun-guard ] || [ -f /usr/local/bin/aliyun-guard ]; then
     rm -f /usr/local/bin/aliyun-guard
 fi
+if [ -L /usr/local/bin/ag ] && [ "$(readlink /usr/local/bin/ag 2>/dev/null || true)" = "$APP_DIR/control.sh" ]; then
+    rm -f /usr/local/bin/ag
+fi
 rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"

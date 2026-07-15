@@ -7,7 +7,9 @@ APP_DIR=${ALIYUN_GUARD_HOME:-/opt/aliyun-guard}
 VENV_DIR="$APP_DIR/venv"
 SERVICE_NAME="aliyun-guard"
 BIN_LINK="/usr/local/bin/aliyun-guard"
+SHORT_BIN_LINK="/usr/local/bin/ag"
 MIN_PYTHON="3.8"
+SHORTCUT_AVAILABLE=no
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -1799,8 +1801,18 @@ def initial_setup(force=False):
 
 
 def menu():
-    if not CONFIG_FILE.exists():
-        initial_setup()
+    setup_needed = not CONFIG_FILE.exists()
+    if not setup_needed:
+        try:
+            setup_needed = not bool(load_config().get("users"))
+        except Exception:
+            setup_needed = True
+    if setup_needed:
+        if initial_setup(force=CONFIG_FILE.exists()) != 0:
+            return 2
+        print("\n首次配置已保存，正在启动后台服务...")
+        if run_control("start") != 0:
+            print("后台服务启动失败，请在管理面板查看运行状态或日志。")
     while True:
         try:
             config = load_config()
@@ -2179,6 +2191,9 @@ esac
 if [ -L /usr/local/bin/aliyun-guard ] || [ -f /usr/local/bin/aliyun-guard ]; then
     rm -f /usr/local/bin/aliyun-guard
 fi
+if [ -L /usr/local/bin/ag ] && [ "$(readlink /usr/local/bin/ag 2>/dev/null || true)" = "$APP_DIR/control.sh" ]; then
+    rm -f /usr/local/bin/ag
+fi
 rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
@@ -2193,6 +2208,20 @@ __AG_UNINSTALL_SH_EOF__
     sh -n "$APP_DIR/uninstall.sh"
     mkdir -p /usr/local/bin
     ln -sf "$APP_DIR/control.sh" "$BIN_LINK"
+    existing_shortcut=$(command -v ag 2>/dev/null || true)
+    if [ -n "$existing_shortcut" ] && [ "$existing_shortcut" != "$SHORT_BIN_LINK" ]; then
+        say "${YELLOW}快捷命令 ag 已被其他程序占用（$existing_shortcut），仅安装完整命令 aliyun-guard。${RESET}"
+    elif [ -e "$SHORT_BIN_LINK" ] || [ -L "$SHORT_BIN_LINK" ]; then
+        if [ "$(readlink "$SHORT_BIN_LINK" 2>/dev/null || true)" = "$APP_DIR/control.sh" ]; then
+            ln -sf "$APP_DIR/control.sh" "$SHORT_BIN_LINK"
+            SHORTCUT_AVAILABLE=yes
+        else
+            say "${YELLOW}快捷命令 ag 已被其他程序占用，仅安装完整命令 aliyun-guard。${RESET}"
+        fi
+    else
+        ln -s "$APP_DIR/control.sh" "$SHORT_BIN_LINK"
+        SHORTCUT_AVAILABLE=yes
+    fi
 }
 
 remove_cron_entry() {
@@ -2242,7 +2271,12 @@ EOF
     remove_cron_entry
     printf '%s\n' systemd > "$APP_DIR/service_backend"
     systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME.service"
+    if [ "$START_BACKEND" = yes ]; then
+        systemctl enable --now "$SERVICE_NAME.service"
+    else
+        systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+        systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    fi
 }
 
 setup_openrc() {
@@ -2266,8 +2300,13 @@ EOF
     rm -f "/etc/systemd/system/$SERVICE_NAME.service"
     remove_cron_entry
     printf '%s\n' openrc > "$APP_DIR/service_backend"
-    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-    rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start
+    if [ "$START_BACKEND" = yes ]; then
+        rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+        rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start
+    else
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
 }
 
 start_cron_service() {
@@ -2293,7 +2332,12 @@ setup_cron() {
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
-    rm -f "$APP_DIR/disabled"
+    if [ "$START_BACKEND" = yes ]; then
+        rm -f "$APP_DIR/disabled"
+    else
+        : > "$APP_DIR/disabled"
+        chmod 600 "$APP_DIR/disabled"
+    fi
     printf '%s\n' cron > "$APP_DIR/service_backend"
     start_cron_service
 }
@@ -2310,11 +2354,16 @@ setup_backend() {
     chmod 600 "$APP_DIR/service_backend"
 }
 
-run_setup() {
-    say "${YELLOW}[4/6] 打开首次配置向导...${RESET}"
-    "$VENV_DIR/bin/python" "$APP_DIR/manager.py" setup <&3
-    [ -s "$APP_DIR/config.json" ] || die "首次配置未完成。"
-    chmod 600 "$APP_DIR/config.json"
+prepare_configuration() {
+    say "${YELLOW}[4/6] 检查首次配置状态...${RESET}"
+    if [ -s "$APP_DIR/config.json" ]; then
+        chmod 600 "$APP_DIR/config.json"
+        START_BACKEND=yes
+        say "${GREEN}已保留现有配置，安装完成后自动恢复后台服务。${RESET}"
+    else
+        START_BACKEND=no
+        say "${YELLOW}尚未配置账号。安装完成后需手动输入管理命令。${RESET}"
+    fi
 }
 
 finish() {
@@ -2323,7 +2372,19 @@ finish() {
     "$APP_DIR/control.sh" backend-status || true
     say ""
     say "${GREEN}安装完成。${RESET}"
+    if [ "$START_BACKEND" = no ]; then
+        say "${YELLOW}管理面板不会自动打开。请返回命令行后手动输入以下命令：${RESET}"
+        say "完整命令: ${CYAN}aliyun-guard${RESET}"
+        if [ "$SHORTCUT_AVAILABLE" = yes ]; then
+            say "快捷命令: ${CYAN}ag${RESET}"
+        fi
+        say "首次打开时会进入配置向导；配置成功后后台服务才会启动。"
+        return
+    fi
     say "管理面板: ${CYAN}aliyun-guard${RESET}"
+    if [ "$SHORTCUT_AVAILABLE" = yes ]; then
+        say "快捷面板: ${CYAN}ag${RESET}"
+    fi
     say "立即检测: ${CYAN}aliyun-guard run${RESET}"
     say "演练检测: ${CYAN}aliyun-guard dry-run${RESET}"
     say "查看状态: ${CYAN}aliyun-guard status${RESET}"
@@ -2340,10 +2401,6 @@ mkdir -p "$APP_DIR"
 create_venv
 stop_old_backend
 write_payload
-if [ ! -f "$APP_DIR/config.json" ]; then
-    run_setup
-else
-    say "${GREEN}已保留现有配置。${RESET}"
-fi
+prepare_configuration
 setup_backend
 finish

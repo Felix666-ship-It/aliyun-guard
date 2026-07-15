@@ -560,8 +560,18 @@ def initial_setup(force=False):
 
 
 def menu():
-    if not CONFIG_FILE.exists():
-        initial_setup()
+    setup_needed = not CONFIG_FILE.exists()
+    if not setup_needed:
+        try:
+            setup_needed = not bool(load_config().get("users"))
+        except Exception:
+            setup_needed = True
+    if setup_needed:
+        if initial_setup(force=CONFIG_FILE.exists()) != 0:
+            return 2
+        print("\n首次配置已保存，正在启动后台服务...")
+        if run_control("start") != 0:
+            print("后台服务启动失败，请在管理面板查看运行状态或日志。")
     while True:
         try:
             config = load_config()

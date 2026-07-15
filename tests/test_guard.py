@@ -392,5 +392,36 @@ class UpdateTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class FirstSetupFlowTests(unittest.TestCase):
+    def test_first_manual_open_runs_setup_then_starts_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config = make_config()
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "initial_setup", return_value=0
+            ) as setup, mock.patch.object(manager, "run_control", return_value=0) as control, mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(manager, "prompt_int", return_value=14):
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        setup.assert_called_once_with(force=False)
+        control.assert_called_once_with("start")
+
+    def test_opening_existing_panel_does_not_force_start_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            config = make_config()
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "initial_setup"
+            ) as setup, mock.patch.object(manager, "run_control") as control, mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(manager, "prompt_int", return_value=14):
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        setup.assert_not_called()
+        control.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
