@@ -1,0 +1,198 @@
+#!/bin/sh
+set -u
+
+APP_DIR=${ALIYUN_GUARD_HOME:-/opt/aliyun-guard}
+PYTHON="$APP_DIR/venv/bin/python"
+APP="$APP_DIR/aliyun_guard.py"
+MANAGER="$APP_DIR/manager.py"
+BACKEND_FILE="$APP_DIR/service_backend"
+SERVICE_NAME="aliyun-guard"
+
+backend() {
+    if [ -r "$BACKEND_FILE" ]; then
+        sed -n '1p' "$BACKEND_FILE"
+    else
+        printf '%s\n' unknown
+    fi
+}
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        printf '%s\n' "请使用 root 权限运行。" >&2
+        exit 1
+    fi
+}
+
+backend_status() {
+    current=$(backend)
+    printf '调度后端: %s\n' "$current"
+    case "$current" in
+        systemd)
+            systemctl is-enabled "$SERVICE_NAME.service" 2>/dev/null || true
+            systemctl is-active "$SERVICE_NAME.service" 2>/dev/null || true
+            ;;
+        openrc)
+            rc-service "$SERVICE_NAME" status 2>/dev/null || true
+            ;;
+        cron)
+            if [ -e "$APP_DIR/disabled" ]; then
+                printf '%s\n' "状态: 已暂停"
+            else
+                printf '%s\n' "状态: 已启用"
+            fi
+            crontab -l 2>/dev/null | grep '# aliyun-guard' || true
+            ;;
+        *)
+            printf '%s\n' "未识别调度后端，请重新运行安装器修复。"
+            return 1
+            ;;
+    esac
+}
+
+start_service() {
+    need_root
+    current=$(backend)
+    case "$current" in
+        systemd)
+            systemctl enable --now "$SERVICE_NAME.service"
+            ;;
+        openrc)
+            rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+            rc-service "$SERVICE_NAME" start
+            ;;
+        cron)
+            rm -f "$APP_DIR/disabled"
+            printf '%s\n' "cron 调度已启用。"
+            ;;
+        *)
+            printf '%s\n' "未知调度后端: $current" >&2
+            return 1
+            ;;
+    esac
+}
+
+stop_service() {
+    need_root
+    current=$(backend)
+    case "$current" in
+        systemd)
+            systemctl stop "$SERVICE_NAME.service"
+            ;;
+        openrc)
+            rc-service "$SERVICE_NAME" stop
+            ;;
+        cron)
+            : > "$APP_DIR/disabled"
+            chmod 600 "$APP_DIR/disabled"
+            printf '%s\n' "cron 调度已暂停。"
+            ;;
+        *)
+            printf '%s\n' "未知调度后端: $current" >&2
+            return 1
+            ;;
+    esac
+}
+
+restart_service() {
+    need_root
+    current=$(backend)
+    case "$current" in
+        systemd)
+            systemctl restart "$SERVICE_NAME.service"
+            systemctl is-active "$SERVICE_NAME.service"
+            ;;
+        openrc)
+            rc-service "$SERVICE_NAME" restart
+            ;;
+        cron)
+            rm -f "$APP_DIR/disabled"
+            "$PYTHON" "$APP" scheduled
+            ;;
+        *)
+            printf '%s\n' "未知调度后端: $current" >&2
+            return 1
+            ;;
+    esac
+}
+
+show_help() {
+    cat <<'EOF'
+用法: aliyun-guard [命令]
+
+不带命令             打开交互式管理面板
+status                查看服务和最近检测状态
+run                    立即执行一轮检测并通知
+dry-run                演练一轮，不执行开关机
+test-telegram          发送 Telegram 测试消息
+logs                   查看最近 100 行日志
+logs-follow            持续查看日志
+start|stop|restart     管理后台调度
+add                    交互式添加实例
+uninstall              交互式卸载
+help                   显示本帮助
+EOF
+}
+
+if [ ! -x "$PYTHON" ] || [ ! -f "$APP" ]; then
+    printf '%s\n' "程序不完整，请重新运行安装器。" >&2
+    exit 1
+fi
+
+command_name=${1:-menu}
+case "$command_name" in
+    menu)
+        exec "$PYTHON" "$MANAGER" menu
+        ;;
+    status)
+        backend_status
+        printf '\n'
+        exec "$PYTHON" "$APP" status
+        ;;
+    backend-status)
+        backend_status
+        ;;
+    run|once)
+        exec "$PYTHON" "$APP" once
+        ;;
+    dry-run)
+        exec "$PYTHON" "$APP" once --dry-run
+        ;;
+    test-telegram)
+        exec "$PYTHON" "$APP" test-telegram
+        ;;
+    logs)
+        if [ -f "$APP_DIR/logs/guard.log" ]; then
+            tail -n 100 "$APP_DIR/logs/guard.log"
+        else
+            printf '%s\n' "日志尚未生成。"
+        fi
+        ;;
+    logs-follow)
+        touch "$APP_DIR/logs/guard.log"
+        exec tail -f "$APP_DIR/logs/guard.log"
+        ;;
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    add)
+        exec "$PYTHON" "$MANAGER" add
+        ;;
+    uninstall)
+        need_root
+        exec "$APP_DIR/uninstall.sh"
+        ;;
+    help|-h|--help)
+        show_help
+        ;;
+    *)
+        printf '未知命令: %s\n\n' "$command_name" >&2
+        show_help >&2
+        exit 2
+        ;;
+esac
