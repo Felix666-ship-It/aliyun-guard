@@ -24,10 +24,12 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
+ANSI_YELLOW = "\033[33m"
+ANSI_RESET = "\033[0m"
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -55,6 +57,17 @@ def title(text):
     line()
     print(text)
     line()
+
+
+def yellow_text(text):
+    if os.environ.get("NO_COLOR") is not None or os.environ.get("TERM") == "dumb":
+        return text
+    try:
+        if not sys.stdout.isatty():
+            return text
+    except (AttributeError, OSError):
+        return text
+    return "{}{}{}".format(ANSI_YELLOW, text, ANSI_RESET)
 
 
 def prompt(text, default=None, required=False):
@@ -646,6 +659,8 @@ def menu():
             update_info = check_for_github_update()
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
+        if update_info and update_info.get("available"):
+            print(yellow_text("发现新版本: v{}（请选择 13 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -660,7 +675,7 @@ def menu():
         print("12) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
-            update_hint = "  [有新版本 v{}]".format(update_info["version"])
+            update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
         print("13) 更新 GitHub 版本{}".format(update_hint))
         print("14) 退出")
         choice = prompt_int("请输入序号", 1, 1, 14)
