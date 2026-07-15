@@ -451,6 +451,8 @@ finish() {
     "$APP_DIR/control.sh" backend-status || true
     say ""
     say "${GREEN}安装完成。${RESET}"
+    version_text=$("$VENV_DIR/bin/python" "$APP_DIR/manager.py" version)
+    say "当前版本: ${CYAN}$version_text${RESET}"
     if [ "$START_BACKEND" = no ]; then
         say "${YELLOW}管理面板不会自动打开。请返回命令行后手动输入以下命令：${RESET}"
         say "完整命令: ${CYAN}aliyun-guard${RESET}"

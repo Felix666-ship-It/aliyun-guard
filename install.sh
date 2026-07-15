@@ -1265,6 +1265,10 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
+APP_VERSION = "1.1.0"
+LOCAL_RELEASE_ID = "f6c5af2633b48eeafbd11a74f55d3da7136eb6fbd0bca37cdcdf6f92c4b7201f"
+UPDATE_MANIFEST_NAME = "version.json"
+UPDATE_CHECK_TIMEOUT_SECONDS = 5
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -1709,8 +1713,51 @@ def download_update_file(url, timeout=30, retries=3):
     raise guard.GuardError("下载失败（已重试 {} 次）: {}".format(retries, guard.compact_error(last_error)))
 
 
+def parse_release_id(value):
+    release_id = str(value or "").strip().lower()
+    if len(release_id) != 64 or any(char not in "0123456789abcdef" for char in release_id):
+        raise guard.GuardError("版本构建标识格式无效")
+    return release_id
+
+
+def parse_version_manifest(payload):
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", "strict")
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise guard.GuardError("GitHub 版本清单格式无效")
+    version = str(data.get("version", "")).strip()
+    allowed = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+"
+    if not version or len(version) > 32 or any(char not in allowed for char in version):
+        raise guard.GuardError("GitHub 版本号格式无效")
+    return {
+        "version": version,
+        "release_id": parse_release_id(data.get("release_id")),
+    }
+
+
+def check_for_github_update():
+    """Return remote release details, or None when the startup check is unavailable."""
+    try:
+        local_release_id = parse_release_id(LOCAL_RELEASE_ID)
+    except Exception:
+        return None
+    try:
+        payload = download_update_file(
+            UPDATE_BASE_URL + "/" + UPDATE_MANIFEST_NAME,
+            timeout=UPDATE_CHECK_TIMEOUT_SECONDS,
+            retries=1,
+        )
+        remote = parse_version_manifest(payload)
+    except Exception:
+        return None
+    remote["available"] = remote["release_id"] != local_release_id
+    return remote
+
+
 def update_from_github(confirm_update=True):
     title("更新 GitHub 版本")
+    print("当前版本: v{}".format(APP_VERSION))
     print("更新来源: {}".format(UPDATE_BASE_URL))
     print("现有 config.json、state.json 和日志会保留。")
     try:
@@ -1813,13 +1860,20 @@ def menu():
         print("\n首次配置已保存，正在启动后台服务...")
         if run_control("start") != 0:
             print("后台服务启动失败，请在管理面板查看运行状态或日志。")
+    update_info = None
+    update_checked = False
     while True:
         try:
             config = load_config()
         except Exception as exc:
             print("配置加载失败: {}".format(exc))
             return 2
-        title("阿里云保活与通知 - 管理面板")
+        if not update_checked:
+            if config.get("force_ipv4", True):
+                guard.enable_ipv4_only()
+            update_info = check_for_github_update()
+            update_checked = True
+        title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -1832,7 +1886,10 @@ def menu():
         print("10) 修改全局设置")
         print("11) 查看最近日志")
         print("12) 重启后台服务")
-        print("13) 更新 GitHub 版本")
+        update_hint = ""
+        if update_info and update_info.get("available"):
+            update_hint = "  [有新版本 v{}]".format(update_info["version"])
+        print("13) 更新 GitHub 版本{}".format(update_hint))
         print("14) 退出")
         choice = prompt_int("请输入序号", 1, 1, 14)
         try:
@@ -1881,6 +1938,7 @@ def parse_args(argv=None):
     subparsers.add_parser("status", help="显示状态")
     subparsers.add_parser("add", help="添加实例")
     subparsers.add_parser("update", help="从 GitHub 更新程序")
+    subparsers.add_parser("version", help="显示当前版本")
     return parser.parse_args(argv)
 
 
@@ -1900,6 +1958,9 @@ def main(argv=None):
         if args.command == "update":
             result = update_from_github()
             return 1 if result is False else 0
+        if args.command == "version":
+            print("Aliyun Guard v{}".format(APP_VERSION))
+            return 0
         return menu()
     except guard.GuardError as exc:
         print("错误: {}".format(exc), file=sys.stderr)
@@ -2040,6 +2101,7 @@ run                    立即执行一轮检测并通知
 dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
 update                 从 GitHub 下载并安装最新版本
+version                显示当前版本号
 logs                   查看最近 100 行日志
 logs-follow            持续查看日志
 start|stop|restart     管理后台调度
@@ -2078,6 +2140,9 @@ case "$command_name" in
         ;;
     update)
         exec "$PYTHON" "$MANAGER" update
+        ;;
+    version|-V|--version)
+        exec "$PYTHON" "$MANAGER" version
         ;;
     logs)
         if [ -f "$APP_DIR/logs/guard.log" ]; then
@@ -2381,6 +2446,8 @@ finish() {
     "$APP_DIR/control.sh" backend-status || true
     say ""
     say "${GREEN}安装完成。${RESET}"
+    version_text=$("$VENV_DIR/bin/python" "$APP_DIR/manager.py" version)
+    say "当前版本: ${CYAN}$version_text${RESET}"
     if [ "$START_BACKEND" = no ]; then
         say "${YELLOW}管理面板不会自动打开。请返回命令行后手动输入以下命令：${RESET}"
         say "完整命令: ${CYAN}aliyun-guard${RESET}"

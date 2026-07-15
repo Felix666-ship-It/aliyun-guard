@@ -1,5 +1,6 @@
 import datetime as dt
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -369,6 +370,41 @@ class ConfigTests(unittest.TestCase):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_startup_check_reports_remote_version(self):
+        local_release = "a" * 64
+        remote_release = "b" * 64
+        manifest = json.dumps(
+            {"version": "1.2.0", "release_id": remote_release}
+        ).encode("utf-8")
+        with mock.patch.object(manager, "LOCAL_RELEASE_ID", local_release), mock.patch.object(
+            manager, "download_update_file", return_value=manifest
+        ) as download:
+            result = manager.check_for_github_update()
+        self.assertTrue(result["available"])
+        self.assertEqual(result["version"], "1.2.0")
+        download.assert_called_once_with(
+            manager.UPDATE_BASE_URL + "/version.json",
+            timeout=manager.UPDATE_CHECK_TIMEOUT_SECONDS,
+            retries=1,
+        )
+
+    def test_startup_check_recognizes_current_release(self):
+        release_id = "a" * 64
+        manifest = json.dumps(
+            {"version": manager.APP_VERSION, "release_id": release_id}
+        ).encode("utf-8")
+        with mock.patch.object(manager, "LOCAL_RELEASE_ID", release_id), mock.patch.object(
+            manager, "download_update_file", return_value=manifest
+        ):
+            result = manager.check_for_github_update()
+        self.assertFalse(result["available"])
+
+    def test_startup_check_failure_does_not_block_menu(self):
+        with mock.patch.object(manager, "LOCAL_RELEASE_ID", "a" * 64), mock.patch.object(
+            manager, "download_update_file", side_effect=OSError("offline")
+        ):
+            self.assertIsNone(manager.check_for_github_update())
+
     def test_github_update_verifies_checksum_and_runs_update_mode(self):
         installer = b"#!/bin/sh\nexit 0\n"
         checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
@@ -393,6 +429,28 @@ class UpdateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_menu_marks_available_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            config = make_config()
+            config["force_ipv4"] = False
+            output = io.StringIO()
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(
+                manager,
+                "check_for_github_update",
+                return_value={"available": True, "version": "1.2.0", "release_id": "b" * 64},
+            ) as check, mock.patch.object(manager, "prompt_int", return_value=14), mock.patch(
+                "sys.stdout", output
+            ):
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        self.assertIn("阿里云保活与通知 v1.1.0 - 管理面板", output.getvalue())
+        self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.2.0]", output.getvalue())
+        check.assert_called_once_with()
+
     def test_first_manual_open_runs_setup_then_starts_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
