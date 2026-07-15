@@ -370,12 +370,29 @@ class ConfigTests(unittest.TestCase):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_current_release_returns_without_downloading(self):
+        release_info = {
+            "available": False,
+            "version": manager.APP_VERSION,
+            "release_id": "a" * 64,
+        }
+        output = io.StringIO()
+        with mock.patch.object(manager, "download_update_file") as download, mock.patch.object(
+            manager, "yes_no"
+        ) as confirm, mock.patch("sys.stdout", output):
+            result = manager.update_from_github(release_info=release_info)
+        self.assertIsNone(result)
+        self.assertIn("当前版本: v1.1.3", output.getvalue())
+        self.assertIn("当前版本已经是最新版本了。", output.getvalue())
+        download.assert_not_called()
+        confirm.assert_not_called()
+
     def test_update_confirmation_names_target_version(self):
-        release_info = {"available": True, "version": "1.1.2", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "1.1.3", "release_id": "b" * 64}
         with mock.patch.object(manager, "yes_no", return_value=False) as confirm:
             result = manager.update_from_github(release_info=release_info)
         self.assertIsNone(result)
-        confirm.assert_called_once_with("下载并安装 GitHub v1.1.2", True)
+        confirm.assert_called_once_with("下载并安装 GitHub v1.1.3", True)
 
     def test_startup_check_reports_remote_version(self):
         local_release = "a" * 64
@@ -415,7 +432,7 @@ class UpdateTests(unittest.TestCase):
     def test_github_update_verifies_checksum_and_runs_update_mode(self):
         installer = b"#!/bin/sh\nexit 0\n"
         checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
-        release_info = {"available": True, "version": "1.1.2", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "1.1.3", "release_id": "b" * 64}
         output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
@@ -426,8 +443,8 @@ class UpdateTests(unittest.TestCase):
                     release_info=release_info,
                 )
         self.assertTrue(result)
-        self.assertIn("当前版本: v1.1.2", output.getvalue())
-        self.assertIn("最新版本: v1.1.2", output.getvalue())
+        self.assertIn("当前版本: v1.1.3", output.getvalue())
+        self.assertIn("最新版本: v1.1.3", output.getvalue())
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
@@ -473,7 +490,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             ):
                 result = manager.menu()
         self.assertEqual(result, 0)
-        self.assertIn("阿里云保活与通知 v1.1.2 - 管理面板", output.getvalue())
+        self.assertIn("阿里云保活与通知 v1.1.3 - 管理面板", output.getvalue())
         self.assertIn("发现新版本: v1.2.0（请选择 13 更新）", output.getvalue())
         self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.2.0]", output.getvalue())
         check.assert_called_once_with()

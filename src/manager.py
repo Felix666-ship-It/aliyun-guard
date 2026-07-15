@@ -24,7 +24,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -538,11 +538,11 @@ def update_from_github(confirm_update=True, release_info=None):
     if release_info is None:
         release_info = check_for_github_update()
     target_version = release_info.get("version") if release_info else None
+    if target_version and not release_info.get("available"):
+        print("当前版本已经是最新版本了。")
+        return None
     if target_version:
-        status = ""
-        if not release_info.get("available"):
-            status = "（当前已是最新版）"
-        print("最新版本: v{}{}".format(target_version, status))
+        print("最新版本: v{}".format(target_version))
     else:
         print("最新版本: 暂时无法获取（仍可继续更新）")
     print("更新来源: {}".format(UPDATE_BASE_URL))
