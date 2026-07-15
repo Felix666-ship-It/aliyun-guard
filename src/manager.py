@@ -4,11 +4,15 @@
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
 
 import aliyun_guard as guard
 
@@ -16,6 +20,10 @@ import aliyun_guard as guard
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 CONTROL_FILE = APP_DIR / "control.sh"
+UPDATE_BASE_URL = os.environ.get(
+    "ALIYUN_GUARD_UPDATE_BASE",
+    "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
+).rstrip("/")
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -446,6 +454,74 @@ def show_logs(lines=80):
     print("".join(content), end="")
 
 
+def download_update_file(url, timeout=30, retries=3):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Updater"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 8))
+    raise guard.GuardError("下载失败（已重试 {} 次）: {}".format(retries, guard.compact_error(last_error)))
+
+
+def update_from_github(confirm_update=True):
+    title("更新 GitHub 版本")
+    print("更新来源: {}".format(UPDATE_BASE_URL))
+    print("现有 config.json、state.json 和日志会保留。")
+    try:
+        if load_config().get("force_ipv4", True):
+            guard.enable_ipv4_only()
+    except Exception:
+        pass
+    if confirm_update and not yes_no("下载并安装 GitHub main 分支最新版本", True):
+        print("已取消更新。")
+        return None
+
+    installer_url = UPDATE_BASE_URL + "/install.sh"
+    checksum_url = UPDATE_BASE_URL + "/install.sh.sha256"
+    print("正在下载更新和校验文件...")
+    try:
+        installer = download_update_file(installer_url)
+        checksum_text = download_update_file(checksum_url).decode("ascii", "strict").strip()
+        expected = checksum_text.split()[0].lower()
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise guard.GuardError("GitHub 校验文件格式无效")
+        actual = hashlib.sha256(installer).hexdigest()
+        if actual != expected:
+            raise guard.GuardError("SHA-256 校验失败，已拒绝安装")
+    except Exception as exc:
+        print("更新下载失败: {}".format(guard.compact_error(exc)))
+        return False
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="aliyun-guard-update-", suffix=".sh", delete=False) as handle:
+            handle.write(installer)
+            temporary_path = handle.name
+        os.chmod(temporary_path, 0o700)
+        print("SHA-256 校验通过: {}".format(actual))
+        result = subprocess.call(["/bin/sh", temporary_path, "--update"])
+    except Exception as exc:
+        print("执行更新失败: {}".format(guard.compact_error(exc)))
+        return False
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+    if result != 0:
+        print("更新安装器退出码: {}".format(result))
+        return False
+    print("GitHub 最新版本已安装，后台服务已重启。")
+    return True
+
+
 def show_status(config):
     title("运行状态")
     run_control("backend-status")
@@ -463,7 +539,7 @@ def initial_setup(force=False):
     config = default_config()
     title("阿里云保活与 Telegram 通知 - 首次设置")
     print("保活规则：当月 CDT 流量低于阈值时确保 ECS 运行；达到阈值时停止 ECS。")
-    print("本程序不查询账单接口，避免账单权限错误干扰保活判断。")
+    print("BSS 账单错误会单独通知，但不会阻断基于 CDT 流量的保活判断。")
     config["interval_seconds"] = prompt_int("检测间隔（秒）", 300, 60, 86400)
     config["notification_mode"] = choose_notification_mode("always")
     config["force_ipv4"] = yes_no("网络请求优先使用 IPv4", True)
@@ -505,8 +581,9 @@ def menu():
         print("10) 修改全局设置")
         print("11) 查看最近日志")
         print("12) 重启后台服务")
-        print("13) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 13)
+        print("13) 更新 GitHub 版本")
+        print("14) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 14)
         try:
             if choice == 1:
                 show_status(config)
@@ -534,10 +611,13 @@ def menu():
             elif choice == 12:
                 run_control("restart")
             elif choice == 13:
+                if update_from_github() is True:
+                    return 0
+            elif choice == 14:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 13:
+        if choice != 14:
             prompt("按回车返回菜单")
 
 
@@ -549,6 +629,7 @@ def parse_args(argv=None):
     subparsers.add_parser("menu", help="打开管理面板")
     subparsers.add_parser("status", help="显示状态")
     subparsers.add_parser("add", help="添加实例")
+    subparsers.add_parser("update", help="从 GitHub 更新程序")
     return parser.parse_args(argv)
 
 
@@ -565,6 +646,9 @@ def main(argv=None):
             config = load_config()
             add_user(config)
             return 0
+        if args.command == "update":
+            result = update_from_github()
+            return 1 if result is False else 0
         return menu()
     except guard.GuardError as exc:
         print("错误: {}".format(exc), file=sys.stderr)

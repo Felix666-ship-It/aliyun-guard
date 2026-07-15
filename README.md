@@ -50,7 +50,7 @@ chmod 700 aliyun-guard-install.sh
 ./aliyun-guard-install.sh
 ```
 
-文件放到自己的 HTTPS 地址后也可使用：
+也可直接从 GitHub 安装：
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main/install.sh | sh
@@ -75,11 +75,14 @@ aliyun-guard status          # 服务和最近检测状态
 aliyun-guard run             # 立即执行并按配置通知
 aliyun-guard dry-run         # 查询真实数据，但不执行开关机
 aliyun-guard test-telegram   # 发送测试消息
+aliyun-guard update          # 校验并安装 GitHub 最新版本
 aliyun-guard logs            # 最近 100 行日志
 aliyun-guard logs-follow     # 持续查看日志
 aliyun-guard restart         # 重启后台服务
 aliyun-guard uninstall       # 交互式卸载
 ```
+
+也可以在管理面板选择“更新 GitHub 版本”。更新器会同时下载 `install.sh.sha256`，校验通过后才执行安装，并保留现有配置、状态和日志。
 
 默认目录：
 

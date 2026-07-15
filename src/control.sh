@@ -124,6 +124,7 @@ status                查看服务和最近检测状态
 run                    立即执行一轮检测并通知
 dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
+update                 从 GitHub 下载并安装最新版本
 logs                   查看最近 100 行日志
 logs-follow            持续查看日志
 start|stop|restart     管理后台调度
@@ -159,6 +160,9 @@ case "$command_name" in
         ;;
     test-telegram)
         exec "$PYTHON" "$APP" test-telegram
+        ;;
+    update)
+        exec "$PYTHON" "$MANAGER" update
         ;;
     logs)
         if [ -f "$APP_DIR/logs/guard.log" ]; then

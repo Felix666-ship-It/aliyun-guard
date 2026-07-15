@@ -15,6 +15,15 @@ YELLOW='\033[33m'
 CYAN='\033[36m'
 RESET='\033[0m'
 
+case ${1:-} in
+    "") INSTALL_ACTION=interactive ;;
+    --update) INSTALL_ACTION=update ;;
+    *)
+        printf '%s\n' "未知安装参数: $1" >&2
+        exit 2
+        ;;
+esac
+
 say() {
     printf '%b\n' "$*"
 }
@@ -28,10 +37,14 @@ if [ "$(id -u)" -ne 0 ]; then
     die "请使用 root 权限运行（sudo -i）。"
 fi
 
-if [ ! -r /dev/tty ]; then
+if [ ! -r /dev/tty ] && [ "$INSTALL_ACTION" = interactive ]; then
     die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
 fi
-exec 3</dev/tty
+if [ -r /dev/tty ]; then
+    exec 3</dev/tty
+else
+    exec 3<&0
+fi
 
 prompt() {
     question=$1
@@ -91,6 +104,11 @@ detect_os() {
 }
 
 existing_menu() {
+    if [ "$INSTALL_ACTION" = update ]; then
+        [ -f "$APP_DIR/config.json" ] || die "未检测到现有配置，不能使用 --update；请执行首次交互安装。"
+        say "${YELLOW}更新模式：保留现有配置和状态。${RESET}"
+        return
+    fi
     if [ ! -f "$APP_DIR/config.json" ]; then
         return
     fi
@@ -140,6 +158,9 @@ existing_menu() {
 }
 
 handle_legacy_monitor() {
+    if [ "$INSTALL_ACTION" = update ]; then
+        return
+    fi
     legacy_found=no
     if [ -f /opt/scripts/monitor.py ]; then
         legacy_found=yes
@@ -399,16 +420,17 @@ finish() {
     say "演练检测: ${CYAN}aliyun-guard dry-run${RESET}"
     say "查看状态: ${CYAN}aliyun-guard status${RESET}"
     say "查看日志: ${CYAN}aliyun-guard logs${RESET}"
+    say "更新版本: ${CYAN}aliyun-guard update${RESET}"
 }
 
 detect_os
 existing_menu
 handle_legacy_monitor
-stop_old_backend
 install_packages
 find_python
 mkdir -p "$APP_DIR"
 create_venv
+stop_old_backend
 write_payload
 if [ ! -f "$APP_DIR/config.json" ]; then
     run_setup

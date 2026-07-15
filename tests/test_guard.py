@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import aliyun_guard as guard
+import manager
 
 
 def make_user(**overrides):
@@ -364,6 +366,30 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(errors, 1)
         self.assertIn("账单: 查询失败", summary)
         self.assertIn("错误: BSS 账单查询失败: NoPermission", summary)
+
+
+class UpdateTests(unittest.TestCase):
+    def test_github_update_verifies_checksum_and_runs_update_mode(self):
+        installer = b"#!/bin/sh\nexit 0\n"
+        checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
+        with mock.patch.object(
+            manager, "download_update_file", side_effect=[installer, checksum]
+        ), mock.patch.object(manager.subprocess, "call", return_value=0) as run:
+            result = manager.update_from_github(confirm_update=False)
+        self.assertTrue(result)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/bin/sh")
+        self.assertEqual(command[-1], "--update")
+
+    def test_github_update_rejects_checksum_mismatch(self):
+        installer = b"#!/bin/sh\nexit 0\n"
+        bad_checksum = ("0" * 64 + "  install.sh\n").encode("ascii")
+        with mock.patch.object(
+            manager, "download_update_file", side_effect=[installer, bad_checksum]
+        ), mock.patch.object(manager.subprocess, "call") as run:
+            result = manager.update_from_github(confirm_update=False)
+        self.assertFalse(result)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
