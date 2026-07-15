@@ -1265,8 +1265,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.1.0"
-LOCAL_RELEASE_ID = "f6c5af2633b48eeafbd11a74f55d3da7136eb6fbd0bca37cdcdf6f92c4b7201f"
+APP_VERSION = "1.1.1"
+LOCAL_RELEASE_ID = "bc0e1175610cff52f5772dc650d5a58294fca1b64f1dadace238780cdfcf30a1"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 
@@ -1755,17 +1755,30 @@ def check_for_github_update():
     return remote
 
 
-def update_from_github(confirm_update=True):
+def update_from_github(confirm_update=True, release_info=None):
     title("更新 GitHub 版本")
     print("当前版本: v{}".format(APP_VERSION))
-    print("更新来源: {}".format(UPDATE_BASE_URL))
-    print("现有 config.json、state.json 和日志会保留。")
     try:
         if load_config().get("force_ipv4", True):
             guard.enable_ipv4_only()
     except Exception:
         pass
-    if confirm_update and not yes_no("下载并安装 GitHub main 分支最新版本", True):
+    if release_info is None:
+        release_info = check_for_github_update()
+    target_version = release_info.get("version") if release_info else None
+    if target_version:
+        status = ""
+        if not release_info.get("available"):
+            status = "（当前已是最新版）"
+        print("最新版本: v{}{}".format(target_version, status))
+    else:
+        print("最新版本: 暂时无法获取（仍可继续更新）")
+    print("更新来源: {}".format(UPDATE_BASE_URL))
+    print("现有 config.json、state.json 和日志会保留。")
+    confirm_text = "下载并安装 GitHub main 分支最新版本"
+    if target_version:
+        confirm_text = "下载并安装 GitHub v{}".format(target_version)
+    if confirm_update and not yes_no(confirm_text, True):
         print("已取消更新。")
         return None
 
@@ -1919,7 +1932,7 @@ def menu():
             elif choice == 12:
                 run_control("restart")
             elif choice == 13:
-                if update_from_github() is True:
+                if update_from_github(release_info=update_info) is True:
                     return 0
             elif choice == 14:
                 return 0

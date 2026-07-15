@@ -370,6 +370,13 @@ class ConfigTests(unittest.TestCase):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_update_confirmation_names_target_version(self):
+        release_info = {"available": True, "version": "1.1.1", "release_id": "b" * 64}
+        with mock.patch.object(manager, "yes_no", return_value=False) as confirm:
+            result = manager.update_from_github(release_info=release_info)
+        self.assertIsNone(result)
+        confirm.assert_called_once_with("下载并安装 GitHub v1.1.1", True)
+
     def test_startup_check_reports_remote_version(self):
         local_release = "a" * 64
         remote_release = "b" * 64
@@ -408,11 +415,19 @@ class UpdateTests(unittest.TestCase):
     def test_github_update_verifies_checksum_and_runs_update_mode(self):
         installer = b"#!/bin/sh\nexit 0\n"
         checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
+        release_info = {"available": True, "version": "1.1.1", "release_id": "b" * 64}
+        output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
         ), mock.patch.object(manager.subprocess, "call", return_value=0) as run:
-            result = manager.update_from_github(confirm_update=False)
+            with mock.patch("sys.stdout", output):
+                result = manager.update_from_github(
+                    confirm_update=False,
+                    release_info=release_info,
+                )
         self.assertTrue(result)
+        self.assertIn("当前版本: v1.1.1", output.getvalue())
+        self.assertIn("最新版本: v1.1.1", output.getvalue())
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
@@ -447,7 +462,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             ):
                 result = manager.menu()
         self.assertEqual(result, 0)
-        self.assertIn("阿里云保活与通知 v1.1.0 - 管理面板", output.getvalue())
+        self.assertIn("阿里云保活与通知 v1.1.1 - 管理面板", output.getvalue())
         self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.2.0]", output.getvalue())
         check.assert_called_once_with()
 
