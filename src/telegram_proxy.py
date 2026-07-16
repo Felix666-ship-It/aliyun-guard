@@ -319,27 +319,6 @@ def describe_node_link(link):
     return "{} 节点".format(outbound["type"].upper())
 
 
-def measure_node_latency(link, attempts=3, timeout=2.0):
-    outbound = parse_node_link(link)
-    server = str(outbound.get("server", "")).strip()
-    port = int(outbound.get("server_port", 0) or 0)
-    attempts = max(1, min(5, int(attempts)))
-    timeout = max(0.5, min(10.0, float(timeout)))
-    latencies = []
-    last_error = None
-    for _index in range(attempts):
-        started = time.perf_counter()
-        try:
-            with socket.create_connection((server, port), timeout=timeout):
-                latencies.append((time.perf_counter() - started) * 1000.0)
-        except OSError as exc:
-            last_error = exc
-    if not latencies:
-        detail = "{}:{}".format(server, port)
-        raise ProxyError("无法连接节点服务器 {}".format(detail)) from last_error
-    return sum(latencies) / len(latencies)
-
-
 def build_sing_box_config(node_link, listen_port):
     return {
         "log": {"level": "warn", "timestamp": True},

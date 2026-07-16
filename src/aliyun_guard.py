@@ -639,14 +639,26 @@ def send_telegram_message(telegram, text):
     return results
 
 
-def test_telegram(telegram, node_latency_ms=None):
+def test_telegram(telegram, latency_attempts=3, result_details=None):
+    latency_attempts = max(1, min(5, int(latency_attempts)))
     bot = telegram_api(telegram, "getMe")
+    latencies = []
+    for _index in range(latency_attempts):
+        started = time.perf_counter()
+        bot = telegram_api(telegram, "getMe")
+        latencies.append((time.perf_counter() - started) * 1000.0)
+    latency_ms = sum(latencies) / len(latencies)
     username = bot.get("username", "unknown") if isinstance(bot, dict) else "unknown"
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     message = "阿里云保活通知测试成功\n时间: {}\nBot: @{}".format(now, username)
-    if node_latency_ms is not None:
-        message += "\n节点延迟: {:.0f} ms（TCP）".format(float(node_latency_ms))
+    message += "\nTelegram 往返延迟: {:.0f} ms（{} 次平均）".format(
+        latency_ms,
+        latency_attempts,
+    )
     send_telegram_message(telegram, message)
+    if result_details is not None:
+        result_details["latency_ms"] = latency_ms
+        result_details["latency_attempts"] = latency_attempts
     return username
 
 
@@ -1121,8 +1133,19 @@ def main(argv=None):
             config = load_config()
             if config.get("force_ipv4", True):
                 enable_ipv4_only()
-            username = test_telegram(config.get("telegram", {}))
+            details = {}
+            username = test_telegram(
+                config.get("telegram", {}),
+                latency_attempts=3,
+                result_details=details,
+            )
             print("Telegram 测试成功: @{}".format(username))
+            print(
+                "Telegram 往返延迟: {:.0f} ms（{} 次平均）".format(
+                    details["latency_ms"],
+                    details["latency_attempts"],
+                )
+            )
             return 0
         with cycle_lock() as locked:
             if not locked:

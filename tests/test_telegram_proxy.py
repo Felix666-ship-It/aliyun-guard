@@ -128,35 +128,6 @@ class NodeParserTests(unittest.TestCase):
             "SHADOWSOCKS 节点（ss.example.com:8388）",
         )
 
-    def test_measures_average_node_tcp_latency(self):
-        link = "ss://{}@ss.example.com:8388".format(
-            encoded("aes-256-gcm:secret-password")
-        )
-        clock = [1.0, 1.020, 2.0, 2.030, 3.0, 3.040]
-        with mock.patch.object(
-            telegram_proxy.socket, "create_connection", return_value=mock.MagicMock()
-        ) as connect, mock.patch.object(
-            telegram_proxy.time, "perf_counter", side_effect=clock
-        ):
-            latency = telegram_proxy.measure_node_latency(link, attempts=3, timeout=2)
-        self.assertAlmostEqual(latency, 30.0)
-        self.assertEqual(connect.call_count, 3)
-        connect.assert_called_with(("ss.example.com", 8388), timeout=2.0)
-
-    def test_node_latency_failure_is_clear(self):
-        link = "ss://{}@ss.example.com:8388".format(
-            encoded("aes-256-gcm:secret-password")
-        )
-        with mock.patch.object(
-            telegram_proxy.socket,
-            "create_connection",
-            side_effect=OSError("timeout"),
-        ):
-            with self.assertRaisesRegex(
-                telegram_proxy.ProxyError, "ss.example.com:8388"
-            ):
-                telegram_proxy.measure_node_latency(link, attempts=2, timeout=0.5)
-
     def test_builds_loopback_only_sing_box_config(self):
         link = "ss://{}@ss.example.com:8388".format(encoded("aes-128-gcm:password"))
         config = telegram_proxy.build_sing_box_config(link, 19001)

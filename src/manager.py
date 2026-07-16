@@ -26,7 +26,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -320,23 +320,38 @@ def _telegram_connection_signature(telegram):
     )
 
 
-def test_selected_node_latency(telegram):
-    if str(telegram.get("connection_mode", "direct") or "direct") != "node":
-        return None
-    print("正在测试所选节点延迟（TCP，3 次）...")
-    try:
-        latency_ms = telegram_proxy.measure_node_latency(
-            telegram.get("node_url", ""), attempts=3, timeout=2.0
+def run_telegram_connection_test(telegram):
+    print("本次测试方式: {}".format(describe_telegram_connection(telegram)))
+    print("正在测试当前连接到 Telegram Bot API 的往返延迟（3 次）并发送消息...")
+    details = {}
+    username = guard.test_telegram(
+        telegram,
+        latency_attempts=3,
+        result_details=details,
+    )
+    print(
+        "Telegram 往返延迟: {:.0f} ms（{} 次平均）".format(
+            details["latency_ms"],
+            details["latency_attempts"],
         )
-        print("当前节点延迟: {:.0f} ms（TCP）".format(latency_ms))
-        return latency_ms
-    except Exception as exc:
-        print(
-            "节点延迟测试失败: {}".format(
-                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
-            )
-        )
-        return None
+    )
+    return username
+
+
+def confirm_connection_change(candidate, active):
+    if active is None or _telegram_connection_signature(candidate) == _telegram_connection_signature(active):
+        return True
+    current_mode = str(active.get("connection_mode", "direct") or "direct")
+    pending_mode = str(candidate.get("connection_mode", "direct") or "direct")
+    current_label = TELEGRAM_CONNECTION_LABELS.get(current_mode, "未知")
+    pending_label = TELEGRAM_CONNECTION_LABELS.get(pending_mode, "未知")
+    question = "将从“{}”切换为“{}”，并使用待保存方式连接 Telegram Bot API 进行测试".format(
+        current_label,
+        pending_label,
+    )
+    if current_mode == "node" and pending_mode != "node":
+        question += "（原节点链接仍会保留）"
+    return yes_no(question + "，确认继续", default=False)
 
 
 def _set_telegram_identity(candidate):
@@ -371,9 +386,6 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         choice = prompt_int("请选择", 8, 1, 8)
         if choice == 1:
             candidate["connection_mode"] = "direct"
-            candidate["proxy_url"] = ""
-            candidate["node_url"] = ""
-            candidate["api_base_url"] = "https://api.telegram.org"
             print("已选择 Telegram 直连。")
         elif choice == 2:
             candidate["connection_mode"] = "socks5"
@@ -382,8 +394,6 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 candidate.get("proxy_url") or "socks5h://127.0.0.1:1080",
                 required=True,
             )
-            candidate["node_url"] = ""
-            candidate["api_base_url"] = "https://api.telegram.org"
         elif choice == 3:
             candidate["connection_mode"] = "http"
             candidate["proxy_url"] = prompt(
@@ -391,8 +401,6 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 candidate.get("proxy_url") or "http://127.0.0.1:8080",
                 required=True,
             )
-            candidate["node_url"] = ""
-            candidate["api_base_url"] = "https://api.telegram.org"
         elif choice == 4:
             node_url = prompt_secret(
                 "节点链接（vless://、vmess:// 或 ss://）",
@@ -401,8 +409,6 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             if node_url:
                 candidate["node_url"] = node_url
             candidate["connection_mode"] = "node"
-            candidate["proxy_url"] = ""
-            candidate["api_base_url"] = "https://api.telegram.org"
             try:
                 print("已识别: {}".format(telegram_proxy.describe_node_link(candidate.get("node_url"))))
             except telegram_proxy.ProxyError as exc:
@@ -414,8 +420,6 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 candidate.get("api_base_url") or "https://api.telegram.org",
                 required=True,
             ).rstrip("/")
-            candidate["proxy_url"] = ""
-            candidate["node_url"] = ""
         elif choice == 6:
             print("当前选择: {}".format(describe_telegram_connection(candidate)))
         elif choice == 7:
@@ -424,6 +428,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 continue
             return None
         elif choice == 8:
+            if not confirm_connection_change(candidate, active):
+                print("已取消切换，当前连接方式和节点保持不变。")
+                continue
             try:
                 guard.validate_telegram_config(candidate)
             except Exception as exc:
@@ -444,13 +451,8 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                     continue
             if force_ipv4:
                 guard.enable_ipv4_only()
-            node_latency_ms = test_selected_node_latency(candidate)
-            print("正在测试当前连接并发送消息...")
             try:
-                username = guard.test_telegram(
-                    candidate,
-                    node_latency_ms=node_latency_ms,
-                )
+                username = run_telegram_connection_test(candidate)
                 print("Telegram 测试成功，Bot: @{}".format(username))
                 return candidate, True
             except Exception as exc:
@@ -497,13 +499,8 @@ def test_current_telegram(config):
     print("当前连接: {}".format(describe_telegram_connection(telegram)))
     if config.get("force_ipv4", True):
         guard.enable_ipv4_only()
-    node_latency_ms = test_selected_node_latency(telegram)
-    print("正在发送测试消息...")
     try:
-        username = guard.test_telegram(
-            telegram,
-            node_latency_ms=node_latency_ms,
-        )
+        username = run_telegram_connection_test(telegram)
         print("Telegram 测试成功，Bot: @{}".format(username))
         return True
     except Exception as exc:
