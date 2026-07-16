@@ -2126,8 +2126,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.5"
-LOCAL_RELEASE_ID = "67be1f287a17942ba33d13b20cb4bea4065c343273c823a83717d2bcf341a741"
+APP_VERSION = "1.2.6"
+LOCAL_RELEASE_ID = "206d9a32db4b471e59f86a0a9db326d2dfb75072c6e6595462dd561ecaa38ca9"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2635,8 +2635,16 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 9) 测试并保存")
         choice = prompt_int("请选择", 9, 1, 9)
         if choice == 1:
+            previous = json.loads(json.dumps(candidate, ensure_ascii=False))
             candidate["connection_mode"] = "direct"
-            print("已选择 Telegram 直连。")
+            print("正在检测 Telegram 直连，检测通过后将直接切换并保存...")
+            if test_telegram_connection(candidate, force_ipv4=force_ipv4):
+                candidate["node_urls"] = guard.telegram_node_urls(candidate)
+                print("Telegram 直连检测通过，已直接切换并保存。")
+                return candidate, True
+            candidate.clear()
+            candidate.update(previous)
+            print("Telegram 直连检测失败，未切换，原连接配置保持不变。")
         elif choice == 2:
             candidate["connection_mode"] = "socks5"
             candidate["proxy_url"] = prompt(
@@ -2657,7 +2665,11 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             if node_action == "added":
                 print("正在检测新节点，检测通过后将自动保存...")
                 if test_telegram_connection(candidate, force_ipv4=force_ipv4):
-                    print("新节点延迟检测通过，已自动保存并切换到该节点。")
+                    saved_nodes = guard.telegram_node_urls(candidate)
+                    candidate.clear()
+                    candidate.update(previous)
+                    candidate["node_urls"] = saved_nodes
+                    print("新节点延迟检测通过，已保存到节点列表，当前连接方式保持不变。")
                     return candidate, True
                 candidate.clear()
                 candidate.update(previous)

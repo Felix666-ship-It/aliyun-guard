@@ -722,12 +722,19 @@ class InstallerTemplateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
-    def test_new_node_is_tested_and_auto_saved(self):
+    def test_new_node_is_tested_and_saved_without_switching(self):
         candidate = dict(guard.DEFAULT_CONFIG["telegram"])
         node_url = (
             "vless://11111111-1111-1111-1111-111111111111@example.com:443"
             "?security=tls&type=ws&path=%2Ftelegram"
         )
+        tested = {}
+
+        def test_node(telegram, latency_attempts, result_details):
+            tested.update(json.loads(json.dumps(telegram)))
+            result_details.update({"latency_ms": 42.4, "latency_attempts": 3})
+            return "test_bot"
+
         output = io.StringIO()
         with mock.patch.object(manager, "prompt_int", return_value=4), mock.patch.object(
             manager, "prompt_secret", return_value=node_url
@@ -736,18 +743,42 @@ class FirstSetupFlowTests(unittest.TestCase):
         ), mock.patch.object(
             manager.guard,
             "test_telegram",
-            side_effect=lambda telegram, latency_attempts, result_details: (
-                result_details.update({"latency_ms": 42.4, "latency_attempts": 3})
-                or "test_bot"
-            ),
+            side_effect=test_node,
         ) as test, mock.patch("sys.stdout", output):
             result, test_ok = manager.configure_telegram_connection(candidate, force_ipv4=False)
         self.assertTrue(test_ok)
-        self.assertEqual(result["connection_mode"], "node")
-        self.assertEqual(result["node_url"], node_url)
+        self.assertEqual(tested["connection_mode"], "node")
+        self.assertEqual(tested["node_url"], node_url)
+        self.assertEqual(result["connection_mode"], "direct")
+        self.assertEqual(result["node_url"], "")
         self.assertEqual(result["node_urls"], [node_url])
-        test.assert_called_once_with(result, latency_attempts=3, result_details=mock.ANY)
-        self.assertIn("新节点延迟检测通过，已自动保存", output.getvalue())
+        test.assert_called_once_with(mock.ANY, latency_attempts=3, result_details=mock.ANY)
+        self.assertIn("已保存到节点列表，当前连接方式保持不变", output.getvalue())
+
+    def test_new_node_does_not_replace_existing_active_node(self):
+        first = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#First"
+        )
+        second = "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@ss.example.com:8388#Second"
+        candidate = dict(guard.DEFAULT_CONFIG["telegram"])
+        candidate.update(
+            {"connection_mode": "node", "node_url": first, "node_urls": [first]}
+        )
+        with mock.patch.object(manager, "prompt_int", side_effect=[4, 2]), mock.patch.object(
+            manager, "prompt_secret", return_value=second
+        ), mock.patch.object(
+            manager, "test_telegram_connection", return_value=True
+        ) as detect:
+            result, test_ok = manager.configure_telegram_connection(
+                candidate,
+                force_ipv4=False,
+            )
+        self.assertTrue(test_ok)
+        self.assertEqual(result["connection_mode"], "node")
+        self.assertEqual(result["node_url"], first)
+        self.assertEqual(result["node_urls"], [first, second])
+        detect.assert_called_once()
 
     def test_connection_menu_cancel_returns_without_save(self):
         candidate = dict(guard.DEFAULT_CONFIG["telegram"])
@@ -965,7 +996,7 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertIn("本次测试方式: 节点链接", output.getvalue())
         self.assertIn("Telegram 往返延迟: 89 ms（3 次平均）", output.getvalue())
 
-    def test_switching_node_to_direct_preserves_node_and_requires_confirmation(self):
+    def test_switching_node_to_direct_tests_and_auto_saves(self):
         node_url = (
             "vless://11111111-1111-1111-1111-111111111111@example.com:443"
             "?security=tls#Hong%20Kong%2001"
@@ -974,16 +1005,9 @@ class FirstSetupFlowTests(unittest.TestCase):
         active.update({"connection_mode": "node", "node_url": node_url})
         candidate = dict(active)
         output = io.StringIO()
-        with mock.patch.object(manager, "prompt_int", side_effect=[1, 9]), mock.patch.object(
-            manager, "yes_no", return_value=True
-        ) as confirm, mock.patch.object(
-            manager.guard,
-            "test_telegram",
-            side_effect=lambda selected, latency_attempts, result_details: (
-                result_details.update({"latency_ms": 35.0, "latency_attempts": 3})
-                or "test_bot"
-            ),
-        ) as test, mock.patch("sys.stdout", output):
+        with mock.patch.object(manager, "prompt_int", return_value=1), mock.patch.object(
+            manager, "test_telegram_connection", return_value=True
+        ) as detect, mock.patch("sys.stdout", output):
             result, test_ok = manager.configure_telegram_connection(
                 candidate,
                 force_ipv4=False,
@@ -992,19 +1016,19 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertTrue(test_ok)
         self.assertEqual(result["connection_mode"], "direct")
         self.assertEqual(result["node_url"], node_url)
-        self.assertIn("原节点链接仍会保留", confirm.call_args.args[0])
-        tested = test.call_args.args[0]
-        self.assertEqual(tested["connection_mode"], "direct")
-        self.assertIn("本次测试方式: 直连", output.getvalue())
+        self.assertEqual(result["node_urls"], [node_url])
+        detect.assert_called_once_with(candidate, force_ipv4=False)
+        self.assertIn("直连检测通过，已直接切换并保存", output.getvalue())
 
-    def test_rejected_connection_switch_is_not_tested_or_saved(self):
+    def test_failed_direct_detection_restores_active_node(self):
         node_url = "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@example.com:8388#saved"
         active = dict(guard.DEFAULT_CONFIG["telegram"])
         active.update({"connection_mode": "node", "node_url": node_url})
         candidate = dict(active)
-        with mock.patch.object(manager, "prompt_int", side_effect=[1, 9, 7]), mock.patch.object(
-            manager, "yes_no", return_value=False
-        ), mock.patch.object(manager.guard, "test_telegram") as test:
+        output = io.StringIO()
+        with mock.patch.object(manager, "prompt_int", side_effect=[1, 7]), mock.patch.object(
+            manager, "test_telegram_connection", return_value=False
+        ) as detect, mock.patch("sys.stdout", output):
             result = manager.configure_telegram_connection(
                 candidate,
                 force_ipv4=False,
@@ -1013,7 +1037,10 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(active["connection_mode"], "node")
         self.assertEqual(active["node_url"], node_url)
-        test.assert_not_called()
+        self.assertEqual(candidate["connection_mode"], "node")
+        self.assertEqual(candidate["node_url"], node_url)
+        detect.assert_called_once()
+        self.assertIn("直连检测失败，未切换", output.getvalue())
 
     def test_update_notice_is_yellow_in_terminal(self):
         class TtyOutput(io.StringIO):
