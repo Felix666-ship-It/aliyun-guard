@@ -44,6 +44,16 @@ class NodeParserTests(unittest.TestCase):
         self.assertEqual(outbound["transport"]["path"], "/telegram")
         self.assertEqual(outbound["transport"]["headers"]["Host"], "cdn.example.com")
 
+    def test_describes_vless_node_with_safe_remark(self):
+        link = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Hong%20Kong%0A01"
+        )
+        self.assertEqual(
+            telegram_proxy.describe_node_link(link),
+            "VLESS 节点（Hong Kong 01）",
+        )
+
     def test_parses_vmess_websocket(self):
         payload = {
             "v": "2",
@@ -65,6 +75,12 @@ class NodeParserTests(unittest.TestCase):
         self.assertEqual(outbound["server_port"], 443)
         self.assertEqual(outbound["transport"]["type"], "ws")
         self.assertEqual(outbound["tls"]["server_name"], "edge.example.com")
+        self.assertEqual(
+            telegram_proxy.describe_node_link(
+                "vmess://{}".format(encoded(json.dumps(payload)))
+            ),
+            "VMESS 节点（test）",
+        )
 
     def test_parses_vmess_grpc_service_name_from_path(self):
         payload = {
@@ -102,6 +118,15 @@ class NodeParserTests(unittest.TestCase):
         self.assertEqual(outbound["method"], "aes-256-gcm")
         self.assertEqual(outbound["password"], "secret-password")
         self.assertEqual(outbound["server_port"], 8388)
+
+    def test_node_description_falls_back_to_server(self):
+        link = "ss://{}@ss.example.com:8388".format(
+            encoded("aes-256-gcm:secret-password")
+        )
+        self.assertEqual(
+            telegram_proxy.describe_node_link(link),
+            "SHADOWSOCKS 节点（ss.example.com:8388）",
+        )
 
     def test_builds_loopback_only_sing_box_config(self):
         link = "ss://{}@ss.example.com:8388".format(encoded("aes-128-gcm:password"))

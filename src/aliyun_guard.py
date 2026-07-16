@@ -509,6 +509,52 @@ def telegram_connection(config):
     return base_url, proxies
 
 
+def _safe_connection_endpoint(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        if parsed.port:
+            return "{}:{}".format(host, parsed.port)
+        return host
+    except ValueError:
+        return "地址无效"
+
+
+def telegram_connection_description(config):
+    mode = str(config.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode == "socks5":
+        return "SOCKS5 代理（{}）".format(
+            _safe_connection_endpoint(config.get("proxy_url"))
+        )
+    if mode == "http":
+        return "HTTP/HTTPS 代理（{}）".format(
+            _safe_connection_endpoint(config.get("proxy_url"))
+        )
+    if mode == "node":
+        try:
+            return telegram_proxy.describe_node_link(config.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            return "节点代理（配置无效）"
+    if mode == "api_proxy":
+        return "Telegram API 反向代理（{}）".format(
+            _safe_connection_endpoint(config.get("api_base_url"))
+        )
+    return "直连"
+
+
+def append_telegram_connection_notice(telegram, text):
+    mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
+    text = str(text or "").rstrip()
+    if mode == "direct":
+        return text
+    return "{}\n\nTelegram 连接：{}".format(
+        text,
+        telegram_connection_description(telegram),
+    )
+
+
 def _telegram_post(url, data, timeout, proxies):
     if REQUESTS_IMPORT_ERROR is not None:
         raise GuardError("Telegram HTTP 依赖未安装: {}".format(REQUESTS_IMPORT_ERROR))
@@ -586,6 +632,7 @@ def send_telegram_message(telegram, text):
     chat_id = str(telegram.get("chat_id", "")).strip()
     if not chat_id:
         raise GuardError("Telegram Chat ID 未配置")
+    text = append_telegram_connection_notice(telegram, text)
     results = []
     for chunk in split_message(text):
         results.append(telegram_api(telegram, "sendMessage", {"chat_id": chat_id, "text": chunk}))

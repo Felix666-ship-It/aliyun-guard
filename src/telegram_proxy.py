@@ -286,9 +286,37 @@ def parse_node_link(link):
     raise ProxyError("节点链接必须以 vless://、vmess:// 或 ss:// 开头")
 
 
+def _clean_display_label(value, limit=80):
+    value = "".join(char if char.isprintable() else " " for char in str(value or ""))
+    return " ".join(value.split())[:limit]
+
+
+def _node_remark(link, outbound):
+    parsed = urllib.parse.urlsplit(link)
+    remark = _clean_display_label(urllib.parse.unquote(parsed.fragment))
+    if not remark and outbound.get("type") == "vmess":
+        encoded = link[len("vmess://"):].split("#", 1)[0].strip()
+        try:
+            data = json.loads(_decode_base64(encoded))
+            if isinstance(data, dict):
+                remark = _clean_display_label(data.get("ps"))
+        except (ProxyError, ValueError):
+            pass
+    if remark:
+        return remark
+    server = _clean_display_label(outbound.get("server"))
+    port = outbound.get("server_port")
+    if ":" in server:
+        server = "[{}]".format(server)
+    return "{}:{}".format(server, port) if server and port else server
+
+
 def describe_node_link(link):
     outbound = parse_node_link(link)
-    return "{} 节点（已配置）".format(outbound["type"].upper())
+    remark = _node_remark(str(link or "").strip(), outbound)
+    if remark:
+        return "{} 节点（{}）".format(outbound["type"].upper(), remark)
+    return "{} 节点".format(outbound["type"].upper())
 
 
 def build_sing_box_config(node_link, listen_port):

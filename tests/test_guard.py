@@ -286,6 +286,43 @@ class GuardNotificationTests(unittest.TestCase):
         ensure.assert_called_once_with(telegram["node_url"])
         self.assertEqual(post.call_args.args[3]["https"], "socks5h://127.0.0.1:19001")
 
+    def test_proxy_notification_identifies_endpoint_without_credentials(self):
+        telegram = {
+            "chat_id": "123",
+            "connection_mode": "socks5",
+            "proxy_url": "socks5h://user:secret@proxy.example.com:1080",
+        }
+        with mock.patch.object(guard, "telegram_api", return_value={}) as api:
+            guard.send_telegram_message(telegram, "保活检测完成")
+        message = api.call_args.args[2]["text"]
+        self.assertIn("Telegram 连接：SOCKS5 代理（proxy.example.com:1080）", message)
+        self.assertNotIn("user", message)
+        self.assertNotIn("secret", message)
+
+    def test_node_notification_identifies_remark_without_node_secret(self):
+        node_uuid = "11111111-1111-1111-1111-111111111111"
+        telegram = {
+            "chat_id": "123",
+            "connection_mode": "node",
+            "node_url": (
+                "vless://{}@example.com:443?security=tls#Hong%20Kong%2001".format(
+                    node_uuid
+                )
+            ),
+        }
+        with mock.patch.object(guard, "telegram_api", return_value={}) as api:
+            guard.send_telegram_message(telegram, "保活检测完成")
+        message = api.call_args.args[2]["text"]
+        self.assertIn("Telegram 连接：VLESS 节点（Hong Kong 01）", message)
+        self.assertNotIn(node_uuid, message)
+        self.assertNotIn("vless://", message)
+
+    def test_direct_notification_has_no_connection_suffix(self):
+        telegram = {"chat_id": "123", "connection_mode": "direct"}
+        with mock.patch.object(guard, "telegram_api", return_value={}) as api:
+            guard.send_telegram_message(telegram, "保活检测完成")
+        self.assertEqual(api.call_args.args[2]["text"], "保活检测完成")
+
     def test_node_proxy_start_error_redacts_node_credentials(self):
         node_uuid = "11111111-1111-1111-1111-111111111111"
         node_url = "vless://{}@example.com:443?security=tls".format(node_uuid)
@@ -621,6 +658,16 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager.configure_telegram_connection(candidate, force_ipv4=False)
             )
 
+    def test_standalone_connection_cancel_keeps_config(self):
+        config = make_config()
+        original = json.loads(json.dumps(config["telegram"]))
+        with mock.patch.object(
+            manager, "configure_telegram_connection", return_value=None
+        ):
+            result = manager.configure_telegram_connection_settings(config)
+        self.assertIsNone(result)
+        self.assertEqual(config["telegram"], original)
+
     def test_update_notice_is_yellow_in_terminal(self):
         class TtyOutput(io.StringIO):
             def isatty(self):
@@ -645,7 +692,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager,
                 "check_for_github_update",
                 return_value={"available": True, "version": "1.3.0", "release_id": "b" * 64},
-            ) as check, mock.patch.object(manager, "prompt_int", return_value=14), mock.patch(
+            ) as check, mock.patch.object(manager, "prompt_int", return_value=15), mock.patch(
                 "sys.stdout", output
             ):
                 result = manager.menu()
@@ -654,9 +701,34 @@ class FirstSetupFlowTests(unittest.TestCase):
             "阿里云保活与通知 v{} - 管理面板".format(manager.APP_VERSION),
             output.getvalue(),
         )
-        self.assertIn("发现新版本: v1.3.0（请选择 13 更新）", output.getvalue())
-        self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
+        self.assertIn("发现新版本: v1.3.0（请选择 14 更新）", output.getvalue())
+        self.assertIn(" 5) Telegram 连接方式", output.getvalue())
+        self.assertIn("14) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
         check.assert_called_once_with()
+
+    def test_menu_test_action_does_not_open_connection_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            config = make_config()
+            config["force_ipv4"] = False
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(
+                manager, "check_for_github_update", return_value=None
+            ), mock.patch.object(
+                manager, "prompt_int", side_effect=[4, 15]
+            ), mock.patch.object(
+                manager, "prompt", return_value=""
+            ), mock.patch.object(
+                manager, "test_current_telegram", return_value=True
+            ) as test, mock.patch.object(
+                manager, "configure_telegram_connection_settings"
+            ) as connection:
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        test.assert_called_once_with(config)
+        connection.assert_not_called()
 
     def test_first_manual_open_runs_setup_then_starts_backend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -666,7 +738,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup", return_value=0
             ) as setup, mock.patch.object(manager, "run_control", return_value=0) as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=14):
+            ), mock.patch.object(manager, "prompt_int", return_value=15):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_called_once_with(force=False)
@@ -681,7 +753,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup"
             ) as setup, mock.patch.object(manager, "run_control") as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=14):
+            ), mock.patch.object(manager, "prompt_int", return_value=15):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_not_called()

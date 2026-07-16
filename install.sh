@@ -565,9 +565,37 @@ def parse_node_link(link):
     raise ProxyError("节点链接必须以 vless://、vmess:// 或 ss:// 开头")
 
 
+def _clean_display_label(value, limit=80):
+    value = "".join(char if char.isprintable() else " " for char in str(value or ""))
+    return " ".join(value.split())[:limit]
+
+
+def _node_remark(link, outbound):
+    parsed = urllib.parse.urlsplit(link)
+    remark = _clean_display_label(urllib.parse.unquote(parsed.fragment))
+    if not remark and outbound.get("type") == "vmess":
+        encoded = link[len("vmess://"):].split("#", 1)[0].strip()
+        try:
+            data = json.loads(_decode_base64(encoded))
+            if isinstance(data, dict):
+                remark = _clean_display_label(data.get("ps"))
+        except (ProxyError, ValueError):
+            pass
+    if remark:
+        return remark
+    server = _clean_display_label(outbound.get("server"))
+    port = outbound.get("server_port")
+    if ":" in server:
+        server = "[{}]".format(server)
+    return "{}:{}".format(server, port) if server and port else server
+
+
 def describe_node_link(link):
     outbound = parse_node_link(link)
-    return "{} 节点（已配置）".format(outbound["type"].upper())
+    remark = _node_remark(str(link or "").strip(), outbound)
+    if remark:
+        return "{} 节点（{}）".format(outbound["type"].upper(), remark)
+    return "{} 节点".format(outbound["type"].upper())
 
 
 def build_sing_box_config(node_link, listen_port):
@@ -1341,6 +1369,52 @@ def telegram_connection(config):
     return base_url, proxies
 
 
+def _safe_connection_endpoint(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        if parsed.port:
+            return "{}:{}".format(host, parsed.port)
+        return host
+    except ValueError:
+        return "地址无效"
+
+
+def telegram_connection_description(config):
+    mode = str(config.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode == "socks5":
+        return "SOCKS5 代理（{}）".format(
+            _safe_connection_endpoint(config.get("proxy_url"))
+        )
+    if mode == "http":
+        return "HTTP/HTTPS 代理（{}）".format(
+            _safe_connection_endpoint(config.get("proxy_url"))
+        )
+    if mode == "node":
+        try:
+            return telegram_proxy.describe_node_link(config.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            return "节点代理（配置无效）"
+    if mode == "api_proxy":
+        return "Telegram API 反向代理（{}）".format(
+            _safe_connection_endpoint(config.get("api_base_url"))
+        )
+    return "直连"
+
+
+def append_telegram_connection_notice(telegram, text):
+    mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
+    text = str(text or "").rstrip()
+    if mode == "direct":
+        return text
+    return "{}\n\nTelegram 连接：{}".format(
+        text,
+        telegram_connection_description(telegram),
+    )
+
+
 def _telegram_post(url, data, timeout, proxies):
     if REQUESTS_IMPORT_ERROR is not None:
         raise GuardError("Telegram HTTP 依赖未安装: {}".format(REQUESTS_IMPORT_ERROR))
@@ -1418,6 +1492,7 @@ def send_telegram_message(telegram, text):
     chat_id = str(telegram.get("chat_id", "")).strip()
     if not chat_id:
         raise GuardError("Telegram Chat ID 未配置")
+    text = append_telegram_connection_notice(telegram, text)
     results = []
     for chunk in split_message(text):
         results.append(telegram_api(telegram, "sendMessage", {"chat_id": chat_id, "text": chunk}))
@@ -1953,8 +2028,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.0"
-LOCAL_RELEASE_ID = "4c4ec660a2a2b24a70f491697b5b6ac4ad259a4600c0f640b3dcd666cb41161e"
+APP_VERSION = "1.2.1"
+LOCAL_RELEASE_ID = "e89043a8c2ed69be06c1e970ee746f5e7b0b1c74655bf3a75904a5bc6cf6d6ae"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2362,6 +2437,43 @@ def configure_telegram(config, initial=False):
     return test_ok
 
 
+def test_current_telegram(config):
+    title("测试 Telegram 通知")
+    telegram = config.get("telegram", {})
+    print("当前连接: {}".format(describe_telegram_connection(telegram)))
+    if config.get("force_ipv4", True):
+        guard.enable_ipv4_only()
+    print("正在发送测试消息...")
+    try:
+        username = guard.test_telegram(telegram)
+        print("Telegram 测试成功，Bot: @{}".format(username))
+        return True
+    except Exception as exc:
+        print(
+            "Telegram 测试失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            )
+        )
+        return False
+
+
+def configure_telegram_connection_settings(config):
+    current = config.setdefault("telegram", {})
+    candidate = json.loads(json.dumps(current, ensure_ascii=False))
+    result = configure_telegram_connection(
+        candidate,
+        force_ipv4=bool(config.get("force_ipv4", True)),
+        initial=False,
+    )
+    if result is None:
+        print("已取消 Telegram 连接方式修改。")
+        return None
+    selected, test_ok = result
+    current.clear()
+    current.update(selected)
+    return test_ok
+
+
 def collect_user(existing=None):
     existing = dict(existing or {})
     title("{}监控实例".format("编辑" if existing else "添加"))
@@ -2758,25 +2870,26 @@ def menu():
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         if update_info and update_info.get("available"):
-            print(yellow_text("发现新版本: v{}（请选择 13 更新）".format(update_info["version"])))
+            print(yellow_text("发现新版本: v{}（请选择 14 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
         print(" 4) 测试 Telegram 通知")
-        print(" 5) 查看监控实例")
-        print(" 6) 添加监控实例")
-        print(" 7) 编辑监控实例")
-        print(" 8) 暂停/恢复监控实例")
-        print(" 9) 删除监控实例")
-        print("10) 修改全局设置")
-        print("11) 查看最近日志")
-        print("12) 重启后台服务")
+        print(" 5) Telegram 连接方式")
+        print(" 6) 查看监控实例")
+        print(" 7) 添加监控实例")
+        print(" 8) 编辑监控实例")
+        print(" 9) 暂停/恢复监控实例")
+        print("10) 删除监控实例")
+        print("11) 修改全局设置")
+        print("12) 查看最近日志")
+        print("13) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
-        print("13) 更新 GitHub 版本{}".format(update_hint))
-        print("14) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 14)
+        print("14) 更新 GitHub 版本{}".format(update_hint))
+        print("15) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 15)
         try:
             if choice == 1:
                 show_status(config)
@@ -2785,32 +2898,34 @@ def menu():
             elif choice == 3:
                 run_once(True)
             elif choice == 4:
-                configure_telegram(config)
-                save_config(config)
+                test_current_telegram(config)
             elif choice == 5:
-                list_users(config)
+                if configure_telegram_connection_settings(config) is not None:
+                    save_config(config)
             elif choice == 6:
-                add_user(config)
+                list_users(config)
             elif choice == 7:
-                edit_user(config)
+                add_user(config)
             elif choice == 8:
-                toggle_user(config)
+                edit_user(config)
             elif choice == 9:
-                delete_user(config)
+                toggle_user(config)
             elif choice == 10:
-                edit_settings(config)
+                delete_user(config)
             elif choice == 11:
-                show_logs()
+                edit_settings(config)
             elif choice == 12:
-                run_control("restart")
+                show_logs()
             elif choice == 13:
+                run_control("restart")
+            elif choice == 14:
                 if update_from_github(release_info=update_info) is True:
                     return 0
-            elif choice == 14:
+            elif choice == 15:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 14:
+        if choice != 15:
             prompt("按回车返回菜单")
 
 
