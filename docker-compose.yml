@@ -3,16 +3,19 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "1.4.0"
-    image: aliyun-guard:1.4.0
+        APP_VERSION: "1.4.1"
+    image: aliyun-guard:1.4.1
     container_name: aliyun-guard
     restart: unless-stopped
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       ALIYUN_GUARD_CONTAINER: "1"
       ALIYUN_GUARD_CONTAINER_WEB_PORT: "8765"
+      ALIYUN_GUARD_HOST_BIND_IP: "${ALIYUN_GUARD_BIND_IP:-127.0.0.1}"
+      ALIYUN_GUARD_PUBLIC_WEB_PORT: "${ALIYUN_GUARD_WEB_PORT:-8765}"
+      ALIYUN_GUARD_PUBLIC_IP: "${ALIYUN_GUARD_PUBLIC_IP:-}"
     ports:
-      - "127.0.0.1:${ALIYUN_GUARD_WEB_PORT:-8765}:8765"
+      - "${ALIYUN_GUARD_BIND_IP:-127.0.0.1}:${ALIYUN_GUARD_WEB_PORT:-8765}:8765"
     volumes:
       - ./docker-data:/data
       - aliyun-guard-bin:/opt/aliyun-guard/bin

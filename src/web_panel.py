@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -155,12 +155,45 @@ def detect_primary_ipv4():
     return ""
 
 
+def container_public_ipv4():
+    candidate = str(os.environ.get("ALIYUN_GUARD_PUBLIC_IP", "") or "").strip()
+    return candidate if _usable_ipv4(candidate) else ""
+
+
+def container_public_web_port(default):
+    try:
+        port = int(os.environ.get("ALIYUN_GUARD_PUBLIC_WEB_PORT", default))
+    except (TypeError, ValueError):
+        return int(default)
+    return port if 1 <= port <= 65535 else int(default)
+
+
+def container_host_bind_ip():
+    candidate = str(
+        os.environ.get("ALIYUN_GUARD_HOST_BIND_IP", "0.0.0.0") or "0.0.0.0"
+    ).strip()
+    if candidate == "127.0.0.1":
+        return candidate
+    return candidate if _usable_ipv4(candidate) else "0.0.0.0"
+
+
 def browser_access_url(web, local_ip=None):
     host = str(web.get("host", "127.0.0.1"))
+    port = int(web.get("port", 8765))
     if host == "0.0.0.0":
-        host = detect_primary_ipv4() if local_ip is None else local_ip
-        host = host or "服务器IP"
-    return "http://{}:{}".format(host, int(web.get("port", 8765)))
+        if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+            bind_ip = container_host_bind_ip()
+            if bind_ip == "127.0.0.1":
+                host = bind_ip
+            elif bind_ip != "0.0.0.0":
+                host = bind_ip
+            else:
+                host = container_public_ipv4() or "服务器公网IP"
+            port = container_public_web_port(port)
+        else:
+            host = detect_primary_ipv4() if local_ip is None else local_ip
+            host = host or "服务器IP"
+    return "http://{}:{}".format(host, port)
 
 
 def service_backend():
@@ -295,7 +328,13 @@ def management_payload(guard):
     payload = web_actions.management_payload(guard, service_backend())
     payload["version"] = APP_VERSION
     web = payload["web"]
-    web["local_ip"] = detect_primary_ipv4()
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        bind_ip = container_host_bind_ip()
+        web["local_ip"] = (
+            bind_ip if bind_ip != "0.0.0.0" else container_public_ipv4()
+        )
+    else:
+        web["local_ip"] = detect_primary_ipv4()
     web["browser_url"] = browser_access_url(web, web["local_ip"])
     web["http_warning"] = web["host"] == "0.0.0.0"
     return payload

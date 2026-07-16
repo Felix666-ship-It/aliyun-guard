@@ -29,12 +29,18 @@ class DockerArtifactTests(unittest.TestCase):
         self.assertNotIn("COPY state.json", dockerfile)
         self.assertIn('VOLUME ["/data", "/opt/aliyun-guard/bin"]', dockerfile)
 
-    def test_compose_persists_data_and_defaults_to_loopback(self):
+    def test_compose_new_install_is_public_and_legacy_fallback_is_loopback(self):
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
         self.assertIn("restart: unless-stopped", compose)
         self.assertIn(
-            '"127.0.0.1:${ALIYUN_GUARD_WEB_PORT:-8765}:8765"', compose
+            '"${ALIYUN_GUARD_BIND_IP:-127.0.0.1}:${ALIYUN_GUARD_WEB_PORT:-8765}:8765"',
+            compose,
         )
+        self.assertIn("ALIYUN_GUARD_BIND_IP=0.0.0.0", env_example)
+        self.assertIn('ALIYUN_GUARD_PUBLIC_IP: "${ALIYUN_GUARD_PUBLIC_IP:-}"', compose)
+        self.assertIn("ALIYUN_GUARD_HOST_BIND_IP:", compose)
+        self.assertIn("ALIYUN_GUARD_PUBLIC_WEB_PORT:", compose)
         self.assertIn("./docker-data:/data", compose)
         self.assertIn("aliyun-guard-bin:/opt/aliyun-guard/bin", compose)
         self.assertIn("no-new-privileges:true", compose)
@@ -59,6 +65,8 @@ class DockerArtifactTests(unittest.TestCase):
         self.assertIn("docker compose run --rm aliyun-guard setup", entrypoint)
         self.assertIn('web["host"] = "0.0.0.0"', entrypoint)
         self.assertIn("normalize_web_panel", entrypoint)
+        self.assertIn("detect_public_ip", entrypoint)
+        self.assertIn("Docker 网页面板访问地址", entrypoint)
         self.assertIn("exec \"$PYTHON\" \"$APP_DIR/aliyun_guard.py\" daemon", entrypoint)
 
 

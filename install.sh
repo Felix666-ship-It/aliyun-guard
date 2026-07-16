@@ -1654,7 +1654,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -1779,12 +1779,45 @@ def detect_primary_ipv4():
     return ""
 
 
+def container_public_ipv4():
+    candidate = str(os.environ.get("ALIYUN_GUARD_PUBLIC_IP", "") or "").strip()
+    return candidate if _usable_ipv4(candidate) else ""
+
+
+def container_public_web_port(default):
+    try:
+        port = int(os.environ.get("ALIYUN_GUARD_PUBLIC_WEB_PORT", default))
+    except (TypeError, ValueError):
+        return int(default)
+    return port if 1 <= port <= 65535 else int(default)
+
+
+def container_host_bind_ip():
+    candidate = str(
+        os.environ.get("ALIYUN_GUARD_HOST_BIND_IP", "0.0.0.0") or "0.0.0.0"
+    ).strip()
+    if candidate == "127.0.0.1":
+        return candidate
+    return candidate if _usable_ipv4(candidate) else "0.0.0.0"
+
+
 def browser_access_url(web, local_ip=None):
     host = str(web.get("host", "127.0.0.1"))
+    port = int(web.get("port", 8765))
     if host == "0.0.0.0":
-        host = detect_primary_ipv4() if local_ip is None else local_ip
-        host = host or "服务器IP"
-    return "http://{}:{}".format(host, int(web.get("port", 8765)))
+        if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+            bind_ip = container_host_bind_ip()
+            if bind_ip == "127.0.0.1":
+                host = bind_ip
+            elif bind_ip != "0.0.0.0":
+                host = bind_ip
+            else:
+                host = container_public_ipv4() or "服务器公网IP"
+            port = container_public_web_port(port)
+        else:
+            host = detect_primary_ipv4() if local_ip is None else local_ip
+            host = host or "服务器IP"
+    return "http://{}:{}".format(host, port)
 
 
 def service_backend():
@@ -1919,7 +1952,13 @@ def management_payload(guard):
     payload = web_actions.management_payload(guard, service_backend())
     payload["version"] = APP_VERSION
     web = payload["web"]
-    web["local_ip"] = detect_primary_ipv4()
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        bind_ip = container_host_bind_ip()
+        web["local_ip"] = (
+            bind_ip if bind_ip != "0.0.0.0" else container_public_ipv4()
+        )
+    else:
+        web["local_ip"] = detect_primary_ipv4()
     web["browser_url"] = browser_access_url(web, web["local_ip"])
     web["http_warning"] = web["host"] == "0.0.0.0"
     return payload
@@ -3468,7 +3507,7 @@ __AG_WEB_PY_EOF__
             <div class="panel-head"><div><h2>运行环境</h2><p>当前安装实例</p></div></div>
             <div class="panel-body system-list">
               <div class="system-row"><span>调度后端</span><strong id="systemBackend">--</strong></div>
-              <div class="system-row"><span>本机 IPv4</span><strong id="systemLocalIp">--</strong></div>
+              <div class="system-row"><span>访问 IPv4</span><strong id="systemLocalIp">--</strong></div>
               <div class="system-row"><span>浏览器地址</span><strong id="systemBrowserUrl">--</strong></div>
               <div class="system-row"><span>当前版本</span><strong id="systemCurrentVersion">--</strong></div>
             </div>
@@ -5770,8 +5809,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.4.0"
-LOCAL_RELEASE_ID = "9029a356a19582c441bb81c3e9cf0b60da43add9d64f523ab7f73d83a0a7f6f3"
+APP_VERSION = "1.4.1"
+LOCAL_RELEASE_ID = "6fe12372528c533e98949e5802c43e29dc273d934958ec8f6a78078f95b2b226"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -6697,16 +6736,25 @@ def configure_web_panel(config, initial=False, restart=True):
         print("网页控制面板已关闭。")
         return False
 
-    print("\n监听方式：")
-    print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
-    print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
-    default_host = 2 if current["host"] == "0.0.0.0" else 1
-    host_choice = prompt_int("监听方式序号", default_host, 1, 2)
-    if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
-        print("已改为仅本机监听。")
-        host_choice = 1
-    candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
-    candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        candidate["host"] = "0.0.0.0"
+        candidate["port"] = int(
+            os.environ.get("ALIYUN_GUARD_CONTAINER_WEB_PORT", "8765")
+        )
+        print("Docker 内部网页固定监听 0.0.0.0:{}。".format(candidate["port"]))
+        print("公网 IP 和宿主机端口由 .env 与 Compose 映射控制。")
+        print("公网 HTTP 会明文传输登录信息，建议限制来源并配置 HTTPS。")
+    else:
+        print("\n监听方式：")
+        print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
+        print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
+        default_host = 2 if current["host"] == "0.0.0.0" else 1
+        host_choice = prompt_int("监听方式序号", default_host, 1, 2)
+        if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
+            print("已改为仅本机监听。")
+            host_choice = 1
+        candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
+        candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
     candidate["username"] = prompt(
         "网页登录用户名", current["username"] or "admin", required=True
     )

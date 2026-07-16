@@ -983,6 +983,47 @@ class InstallerTemplateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_docker_web_setup_uses_fixed_internal_listener(self):
+        config = make_config()
+        config["web_panel"] = {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 9000,
+            "username": "admin",
+            "password_hash": "pbkdf2_sha256$1000$00$00",
+            "cookie_secure": False,
+        }
+        output = io.StringIO()
+        with mock.patch.dict(
+            manager.os.environ,
+            {
+                "ALIYUN_GUARD_CONTAINER": "1",
+                "ALIYUN_GUARD_CONTAINER_WEB_PORT": "8765",
+                "ALIYUN_GUARD_HOST_BIND_IP": "0.0.0.0",
+                "ALIYUN_GUARD_PUBLIC_IP": "8.8.4.4",
+                "ALIYUN_GUARD_PUBLIC_WEB_PORT": "9876",
+            },
+        ), mock.patch.object(
+            manager, "yes_no", side_effect=[True, False]
+        ), mock.patch.object(
+            manager, "prompt", return_value="admin"
+        ), mock.patch.object(
+            manager, "prompt_int"
+        ) as prompt_int, mock.patch.object(
+            manager, "save_config"
+        ) as save, mock.patch(
+            "sys.stdout", output
+        ):
+            result = manager.configure_web_panel(
+                config, initial=True, restart=False
+            )
+        self.assertTrue(result)
+        self.assertEqual(config["web_panel"]["host"], "0.0.0.0")
+        self.assertEqual(config["web_panel"]["port"], 8765)
+        self.assertIn("浏览器访问: http://8.8.4.4:9876", output.getvalue())
+        prompt_int.assert_not_called()
+        save.assert_called_once_with(config)
+
     def test_new_node_is_tested_and_saved_without_switching(self):
         candidate = dict(guard.DEFAULT_CONFIG["telegram"])
         node_url = (

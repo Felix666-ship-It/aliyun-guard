@@ -28,7 +28,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -955,16 +955,25 @@ def configure_web_panel(config, initial=False, restart=True):
         print("网页控制面板已关闭。")
         return False
 
-    print("\n监听方式：")
-    print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
-    print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
-    default_host = 2 if current["host"] == "0.0.0.0" else 1
-    host_choice = prompt_int("监听方式序号", default_host, 1, 2)
-    if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
-        print("已改为仅本机监听。")
-        host_choice = 1
-    candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
-    candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        candidate["host"] = "0.0.0.0"
+        candidate["port"] = int(
+            os.environ.get("ALIYUN_GUARD_CONTAINER_WEB_PORT", "8765")
+        )
+        print("Docker 内部网页固定监听 0.0.0.0:{}。".format(candidate["port"]))
+        print("公网 IP 和宿主机端口由 .env 与 Compose 映射控制。")
+        print("公网 HTTP 会明文传输登录信息，建议限制来源并配置 HTTPS。")
+    else:
+        print("\n监听方式：")
+        print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
+        print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
+        default_host = 2 if current["host"] == "0.0.0.0" else 1
+        host_choice = prompt_int("监听方式序号", default_host, 1, 2)
+        if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
+            print("已改为仅本机监听。")
+            host_choice = 1
+        candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
+        candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
     candidate["username"] = prompt(
         "网页登录用户名", current["username"] or "admin", required=True
     )

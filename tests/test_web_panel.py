@@ -103,6 +103,52 @@ class WebAddressTests(unittest.TestCase):
         web = {"host": "127.0.0.1", "port": 9000}
         self.assertEqual(web_panel.browser_access_url(web), "http://127.0.0.1:9000")
 
+    def test_container_listener_uses_public_ip_and_host_port(self):
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "ALIYUN_GUARD_CONTAINER": "1",
+                "ALIYUN_GUARD_HOST_BIND_IP": "0.0.0.0",
+                "ALIYUN_GUARD_PUBLIC_IP": "8.8.4.4",
+                "ALIYUN_GUARD_PUBLIC_WEB_PORT": "9876",
+            },
+        ):
+            self.assertEqual(
+                web_panel.browser_access_url(web), "http://8.8.4.4:9876"
+            )
+
+    def test_container_listener_has_clear_public_ip_fallback(self):
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "ALIYUN_GUARD_CONTAINER": "1",
+                "ALIYUN_GUARD_HOST_BIND_IP": "0.0.0.0",
+                "ALIYUN_GUARD_PUBLIC_IP": "",
+                "ALIYUN_GUARD_PUBLIC_WEB_PORT": "8765",
+            },
+        ):
+            self.assertEqual(
+                web_panel.browser_access_url(web),
+                "http://服务器公网IP:8765",
+            )
+
+    def test_container_loopback_override_does_not_report_public_ip(self):
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "ALIYUN_GUARD_CONTAINER": "1",
+                "ALIYUN_GUARD_HOST_BIND_IP": "127.0.0.1",
+                "ALIYUN_GUARD_PUBLIC_IP": "8.8.4.4",
+                "ALIYUN_GUARD_PUBLIC_WEB_PORT": "9876",
+            },
+        ):
+            self.assertEqual(
+                web_panel.browser_access_url(web), "http://127.0.0.1:9876"
+            )
+
     def test_manager_prints_detected_browser_address(self):
         output = io.StringIO()
         web = {"host": "0.0.0.0", "port": 8765, "cookie_secure": True}
