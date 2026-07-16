@@ -900,7 +900,9 @@ class FirstSetupFlowTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(manager, "prompt_int", side_effect=[8, 7]), mock.patch.object(
             manager, "test_telegram_connection", return_value=True
-        ) as detect, mock.patch("sys.stdout", output):
+        ) as detect, mock.patch.object(
+            manager, "prompt", return_value=""
+        ) as wait, mock.patch("sys.stdout", output):
             result = manager.configure_telegram_connection(
                 candidate,
                 force_ipv4=False,
@@ -909,6 +911,7 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(active["connection_mode"], "direct")
         detect.assert_called_once_with(candidate, force_ipv4=False)
+        wait.assert_called_once_with("按回车返回连接方式菜单")
         self.assertIn("单独检测完成，本次配置未保存", output.getvalue())
 
     def test_failed_new_node_detection_restores_original_configuration(self):

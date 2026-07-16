@@ -26,7 +26,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -593,6 +593,7 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             print("开始单独检测，本次检测不会保存配置...")
             if test_telegram_connection(candidate, force_ipv4=force_ipv4):
                 print("单独检测完成，本次配置未保存。")
+            prompt("按回车返回连接方式菜单")
         elif choice == 9:
             if not confirm_connection_change(candidate, active):
                 print("已取消切换，当前连接方式和节点保持不变。")
