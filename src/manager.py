@@ -28,7 +28,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -931,11 +931,12 @@ def _set_web_password(web):
 
 def print_web_panel_access(web):
     print("网页监听: http://{}:{}".format(web["host"], web["port"]))
+    if web.get("cookie_secure", False):
+        print("浏览器访问: 请使用已配置的 HTTPS 反向代理地址（Secure Cookie 已启用）")
+        return
     if web["host"] == "127.0.0.1":
         print("SSH 隧道: ssh -L {0}:127.0.0.1:{0} root@服务器IP".format(web["port"]))
-        print("浏览器访问: http://127.0.0.1:{}".format(web["port"]))
-    else:
-        print("浏览器访问: http://服务器IP:{}".format(web["port"]))
+    print("浏览器访问: {}".format(web_panel.browser_access_url(web)))
 
 
 def configure_web_panel(config, initial=False, restart=True):
@@ -970,7 +971,7 @@ def configure_web_panel(config, initial=False, restart=True):
         "网页登录用户名", current["username"] or "admin", required=True
     )
     candidate["cookie_secure"] = yes_no(
-        "浏览器入口已经配置 HTTPS（启用 Secure Cookie）",
+        "浏览器实际使用 HTTPS 访问（启用 Secure Cookie）",
         bool(current.get("cookie_secure", False)),
     )
     if not current.get("password_hash") or yes_no("修改网页登录密码", False):

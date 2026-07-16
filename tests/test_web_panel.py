@@ -1,5 +1,6 @@
 import copy
 import http.client
+import io
 import json
 from pathlib import Path
 import sys
@@ -79,6 +80,38 @@ class PasswordTests(unittest.TestCase):
         config["web_panel"]["password_hash"] = ""
         with self.assertRaises(web_panel.WebPanelError):
             web_panel.validate_web_config(config)
+
+
+class WebAddressTests(unittest.TestCase):
+    def test_public_listener_uses_detected_local_ipv4(self):
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.object(
+            web_panel, "detect_primary_ipv4", return_value="192.0.2.25"
+        ):
+            self.assertEqual(
+                web_panel.browser_access_url(web), "http://192.0.2.25:8765"
+            )
+
+    def test_public_listener_falls_back_when_ipv4_cannot_be_detected(self):
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.object(web_panel, "detect_primary_ipv4", return_value=""):
+            self.assertEqual(
+                web_panel.browser_access_url(web), "http://服务器IP:8765"
+            )
+
+    def test_loopback_listener_keeps_loopback_address(self):
+        web = {"host": "127.0.0.1", "port": 9000}
+        self.assertEqual(web_panel.browser_access_url(web), "http://127.0.0.1:9000")
+
+    def test_manager_prints_detected_browser_address(self):
+        output = io.StringIO()
+        web = {"host": "0.0.0.0", "port": 8765}
+        with mock.patch.object(
+            web_panel, "detect_primary_ipv4", return_value="10.20.30.40"
+        ), mock.patch("sys.stdout", output):
+            manager.print_web_panel_access(web)
+        self.assertIn("网页监听: http://0.0.0.0:8765", output.getvalue())
+        self.assertIn("浏览器访问: http://10.20.30.40:8765", output.getvalue())
 
 
 class PayloadTests(unittest.TestCase):
@@ -169,9 +202,10 @@ class WebApiTests(unittest.TestCase):
             setattr(guard, name, value)
         self.temp.cleanup()
 
-    def request(self, method, path, body=None, cookie=None, csrf=None):
+    def request(self, method, path, body=None, cookie=None, csrf=None, extra_headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         headers = {"Accept": "application/json"}
+        headers.update(extra_headers or {})
         encoded = None
         if body is not None:
             encoded = json.dumps(body).encode("utf-8")
@@ -202,6 +236,11 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+
+    def test_session_reports_secure_cookie_requirement(self):
+        status, data, _headers = self.request("GET", "/api/session")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["secure_cookie"])
 
     def test_login_dashboard_and_session_do_not_leak_credentials(self):
         cookie, _csrf = self.login()
@@ -241,6 +280,32 @@ class WebApiTests(unittest.TestCase):
         saved = guard.load_config()
         self.assertEqual(saved["interval_seconds"], 600)
         self.assertEqual(saved["notification_mode"], "events")
+
+    def test_secure_cookie_rejects_direct_http_login_with_clear_error(self):
+        self.config["web_panel"]["cookie_secure"] = True
+        guard.atomic_write_json(guard.CONFIG_FILE, self.config)
+        status, data, headers = self.request(
+            "POST",
+            "/api/login",
+            {"username": "admin", "password": "correct-horse"},
+            extra_headers={"Origin": "http://127.0.0.1:{}".format(self.port)},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("Secure Cookie", data["error"])
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_secure_cookie_allows_https_reverse_proxy_origin(self):
+        self.config["web_panel"]["cookie_secure"] = True
+        guard.atomic_write_json(guard.CONFIG_FILE, self.config)
+        status, data, headers = self.request(
+            "POST",
+            "/api/login",
+            {"username": "admin", "password": "correct-horse"},
+            extra_headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["secure_cookie"])
+        self.assertIn("; Secure", headers["Set-Cookie"])
 
     def test_run_endpoint_starts_and_finishes_one_cycle(self):
         cookie, csrf = self.login()

@@ -9,11 +9,13 @@ import hashlib
 import hmac
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 from pathlib import Path
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -26,7 +28,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -112,6 +114,51 @@ def validate_web_config(config):
         ):
             raise WebPanelError("网页面板尚未设置有效登录密码")
     return web
+
+
+def _usable_ipv4(value):
+    try:
+        address = ipaddress.ip_address(str(value or ""))
+    except ValueError:
+        return False
+    return (
+        isinstance(address, ipaddress.IPv4Address)
+        and not address.is_loopback
+        and not address.is_unspecified
+        and not address.is_link_local
+        and not address.is_multicast
+    )
+
+
+def detect_primary_ipv4():
+    for destination in (("1.1.1.1", 80), ("8.8.8.8", 80)):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+                connection.connect(destination)
+                candidate = connection.getsockname()[0]
+            if _usable_ipv4(candidate):
+                return candidate
+        except OSError:
+            continue
+    try:
+        addresses = socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+        )
+    except OSError:
+        addresses = []
+    for address in addresses:
+        candidate = address[4][0]
+        if _usable_ipv4(candidate):
+            return candidate
+    return ""
+
+
+def browser_access_url(web, local_ip=None):
+    host = str(web.get("host", "127.0.0.1"))
+    if host == "0.0.0.0":
+        host = detect_primary_ipv4() if local_ip is None else local_ip
+        host = host or "服务器IP"
+    return "http://{}:{}".format(host, int(web.get("port", 8765)))
 
 
 def mask_key(value):
@@ -590,11 +637,13 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "session"]:
                 session = self.server.get_session(self._session_id())
+                web = get_web_config(self.server.guard.load_config())
                 self._json(
                     {
                         "authenticated": bool(session),
                         "csrf": session.get("csrf") if session else None,
                         "version": APP_VERSION,
+                        "secure_cookie": web["cookie_secure"],
                     }
                 )
                 return
@@ -686,6 +735,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.server.record_login_failure(address)
             raise WebPanelError("用户名或密码错误", 401)
         self.server.clear_login_failures(address)
+        if web["cookie_secure"] and not self._browser_uses_https():
+            raise WebPanelError(
+                "当前使用 HTTP 访问，但配置启用了 Secure Cookie。请改用 HTTPS，"
+                "或在终端进入网页控制面板设置并关闭 HTTPS 选项。",
+                409,
+            )
         session_id, session = self.server.create_session()
         cookie = "ag_session={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
             session_id, SESSION_SECONDS
@@ -693,9 +748,23 @@ class PanelHandler(BaseHTTPRequestHandler):
         if web["cookie_secure"]:
             cookie += "; Secure"
         self._json(
-            {"ok": True, "csrf": session["csrf"]},
+            {
+                "ok": True,
+                "csrf": session["csrf"],
+                "secure_cookie": web["cookie_secure"],
+            },
             extra=[("Set-Cookie", cookie)],
         )
+
+    def _browser_uses_https(self):
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "")
+        if forwarded_proto.split(",", 1)[0].strip().lower() == "https":
+            return True
+        for name in ("Origin", "Referer"):
+            value = self.headers.get(name, "")
+            if value and urllib.parse.urlsplit(value).scheme.lower() == "https":
+                return True
+        return False
 
 
 def create_server(guard, config=None, host=None, port=None, html=None):
@@ -867,6 +936,10 @@ def show_status():
     web = get_web_config(config)
     print("网页面板: {}".format("已启用" if web["enabled"] else "已关闭"))
     print("监听地址: http://{}:{}".format(web["host"], web["port"]))
+    if web["cookie_secure"]:
+        print("浏览器访问: 请使用已配置的 HTTPS 反向代理地址（Secure Cookie 已启用）")
+    else:
+        print("浏览器访问: {}".format(browser_access_url(web)))
     backend = BACKEND_FILE.read_text(encoding="utf-8").strip() if BACKEND_FILE.exists() else "unknown"
     if backend == "cron":
         print("进程状态: {}".format("运行中" if _pid_is_web_process(_read_pid()) else "未运行"))
