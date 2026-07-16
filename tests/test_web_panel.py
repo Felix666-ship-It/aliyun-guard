@@ -150,6 +150,38 @@ class PayloadTests(unittest.TestCase):
         self.assertNotIn(config["telegram"]["bot_token"], serialized)
         self.assertEqual(payload["users"][0]["status"], "Running")
         self.assertEqual(len(payload["users"][0]["history"]), 2)
+        self.assertEqual(payload["users"][0]["history"][0]["action"], "none")
+        self.assertFalse(payload["users"][0]["history"][0]["action_performed"])
+
+    def test_dashboard_history_returns_action_details(self):
+        config = make_config()
+        state = {
+            "instances": {},
+            "history": [
+                {
+                    "at": "2026-07-16T12:00:00+08:00",
+                    "instances": {
+                        "i-webtest123": {
+                            "traffic_gb": 180.5,
+                            "status_before": "Running",
+                            "status_after": "Stopped",
+                            "action": "stop",
+                            "action_performed": True,
+                            "message": "流量达到阈值，已停止实例",
+                            "level": "action",
+                        }
+                    },
+                }
+            ],
+        }
+        point = web_panel.dashboard_payload(guard, config, state)["users"][0][
+            "history"
+        ][0]
+        self.assertEqual(point["status_before"], "Running")
+        self.assertEqual(point["status"], "Stopped")
+        self.assertEqual(point["action"], "stop")
+        self.assertTrue(point["action_performed"])
+        self.assertIn("已停止", point["message"])
 
 
 class WebApiTests(unittest.TestCase):
@@ -251,6 +283,22 @@ class WebApiTests(unittest.TestCase):
         self.assertNotIn("test-access-key-private", serialized)
         self.assertNotIn("test-secret-key-private", serialized)
         self.assertNotIn("test-bot-token-private", serialized)
+        self.assertNotIn("access_key", data["users"][0])
+
+    def test_management_payload_is_authenticated_and_redacted(self):
+        status, _data, _headers = self.request("GET", "/api/management")
+        self.assertEqual(status, 401)
+        cookie, _csrf = self.login()
+        status, data, _headers = self.request(
+            "GET", "/api/management", cookie=cookie
+        )
+        self.assertEqual(status, 200)
+        serialized = json.dumps(data, ensure_ascii=False)
+        self.assertNotIn("test-access-key-private", serialized)
+        self.assertNotIn("test-secret-key-private", serialized)
+        self.assertNotIn("test-bot-token-private", serialized)
+        self.assertTrue(data["telegram"]["bot_token_configured"])
+        self.assertTrue(data["instances"][0]["secret_key_configured"])
 
     def test_schedule_update_requires_csrf_then_persists(self):
         cookie, csrf = self.login()
@@ -341,7 +389,48 @@ class WebApiTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertFalse(job["running"])
             self.assertIsNone(job["error"])
-        run_cycle.assert_called_once_with()
+        run_cycle.assert_called_once_with(dry_run=False)
+
+    def test_run_endpoint_supports_dry_run(self):
+        cookie, csrf = self.login()
+        with mock.patch.object(guard, "run_cycle", return_value=0) as run_cycle:
+            status, _data, _headers = self.request(
+                "POST",
+                "/api/run",
+                {"dry_run": True},
+                cookie=cookie,
+                csrf=csrf,
+            )
+            self.assertEqual(status, 202)
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                _status, job, _headers = self.request(
+                    "GET", "/api/job", cookie=cookie
+                )
+                if not job["running"]:
+                    break
+                time.sleep(0.02)
+        run_cycle.assert_called_once_with(dry_run=True)
+
+    def test_telegram_identity_blank_token_preserves_secret(self):
+        cookie, csrf = self.login()
+        status, data, _headers = self.request(
+            "POST",
+            "/api/telegram/identity",
+            {
+                "bot_token": "",
+                "chat_id": "456",
+                "timeout_seconds": 15,
+                "retries": 2,
+            },
+            cookie=cookie,
+            csrf=csrf,
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("bot_token", data["telegram"])
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["bot_token"], "test-bot-token-private")
+        self.assertEqual(saved["chat_id"], "456")
 
 
 class ManualControlTests(unittest.TestCase):
@@ -365,10 +454,16 @@ class ManualControlTests(unittest.TestCase):
             guard, "query_instance_status", return_value="Running"
         ), mock.patch.object(guard, "stop_instance") as stop, mock.patch.object(
             guard, "wait_for_status", return_value=("Stopped", None)
-        ), mock.patch.object(guard, "send_telegram_message") as send:
+        ), mock.patch.object(guard, "send_telegram_message") as send, mock.patch.object(
+            guard, "load_state", return_value={"instances": {}, "history": []}
+        ), mock.patch.object(guard, "save_state") as save_state:
             result = web_panel.control_instance(guard, 0, "stop")
         stop.assert_called_once()
         send.assert_called_once()
+        saved_state = save_state.call_args.args[0]
+        event = saved_state["history"][0]["instances"]["i-webtest123"]
+        self.assertEqual(event["action"], "manual_stop")
+        self.assertTrue(event["action_performed"])
         self.assertEqual(result["after"], "Stopped")
 
     def test_manual_stop_requires_pausing_active_keepalive(self):
@@ -382,6 +477,16 @@ class ManualControlTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 409)
         stop.assert_not_called()
 
+
+class WebHtmlTests(unittest.TestCase):
+    def test_sensitive_fields_use_leave_blank_guidance(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertGreaterEqual(html.count("已保存，留空不修改"), 5)
+        self.assertIn("当时流量", html)
+        self.assertIn("执行动作", html)
+        self.assertIn("仅检测，无动作", html)
+        self.assertIn("单机设置", html)
+        self.assertIn("删除监控实例", html)
 
 if __name__ == "__main__":
     unittest.main()

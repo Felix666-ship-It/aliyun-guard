@@ -1247,7 +1247,13 @@ def update_state(
                     item["instance_id"]: {
                         "traffic_gb": item.get("traffic_gb"),
                         "status": item.get("status_after"),
+                        "status_before": item.get("status_before"),
+                        "status_after": item.get("status_after"),
                         "bill_amount": item.get("bill_amount"),
+                        "action": item.get("action", "none"),
+                        "action_performed": bool(item.get("action_performed", False)),
+                        "message": item.get("message", ""),
+                        "level": item.get("level", "unknown"),
                     }
                     for item in results
                 },

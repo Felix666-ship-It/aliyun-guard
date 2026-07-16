@@ -1,0 +1,16 @@
+.git
+.github
+.playwright-cli
+__pycache__
+*.py[cod]
+*.log
+*.pid
+cycle.lock
+config.json
+state.json
+docker-data
+docs
+output
+tests
+install.sh
+install.sh.sha256

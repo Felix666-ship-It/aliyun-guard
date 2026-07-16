@@ -9,5 +9,6 @@ state.json
 cycle.lock
 .playwright-cli/
 output/
+docker-data/
 *.pid
 web-panel-supervisor.lock

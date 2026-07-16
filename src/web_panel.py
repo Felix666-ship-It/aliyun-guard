@@ -22,13 +22,15 @@ import threading
 import time
 import urllib.parse
 
+import web_actions
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -161,11 +163,14 @@ def browser_access_url(web, local_ip=None):
     return "http://{}:{}".format(host, int(web.get("port", 8765)))
 
 
-def mask_key(value):
-    value = str(value or "")
-    if len(value) <= 8:
-        return "*" * len(value)
-    return "{}...{}".format(value[:4], value[-4:])
+def service_backend():
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        return "docker"
+    try:
+        value = BACKEND_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = "unknown"
+    return value or "unknown"
 
 
 def _safe_instances(state):
@@ -201,7 +206,18 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             value = values.get(instance_id, {}) if isinstance(values, dict) else {}
             if isinstance(value, dict) and value.get("traffic_gb") is not None:
                 points.append(
-                    {"at": sample.get("at"), "value": value.get("traffic_gb")}
+                    {
+                        "at": sample.get("at"),
+                        "value": value.get("traffic_gb"),
+                        "status": value.get("status_after") or value.get("status"),
+                        "status_before": value.get("status_before"),
+                        "action": value.get("action", "none"),
+                        "action_performed": bool(
+                            value.get("action_performed", False)
+                        ),
+                        "message": value.get("message", ""),
+                        "level": value.get("level", "unknown"),
+                    }
                 )
         traffic = current.get("traffic_gb")
         limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -214,7 +230,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "name": str(user.get("name") or instance_id),
                 "instance_id": instance_id,
                 "region": str(user.get("region", "")),
-                "access_key": mask_key(user.get("ak")),
                 "paused": bool(user.get("paused", False)),
                 "actions_enabled": bool(user.get("actions_enabled", True)),
                 "traffic_gb": traffic,
@@ -274,6 +289,16 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         },
         "job": dict(job or {}),
     }
+
+
+def management_payload(guard):
+    payload = web_actions.management_payload(guard, service_backend())
+    payload["version"] = APP_VERSION
+    web = payload["web"]
+    web["local_ip"] = detect_primary_ipv4()
+    web["browser_url"] = browser_access_url(web, web["local_ip"])
+    web["http_warning"] = web["host"] == "0.0.0.0"
+    return payload
 
 
 def read_recent_logs(guard, limit=200):
@@ -377,6 +402,8 @@ def control_instance(guard, index, action):
             )
         try:
             before = guard.query_instance_status(user)
+            traffic = None
+            performed = False
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -389,6 +416,7 @@ def control_instance(guard, index, action):
                     )
                 if before != "Running":
                     guard.start_instance(user)
+                    performed = True
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Running",
@@ -400,6 +428,7 @@ def control_instance(guard, index, action):
             else:
                 if before != "Stopped":
                     guard.stop_instance(user)
+                    performed = True
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Stopped",
@@ -434,6 +463,46 @@ def control_instance(guard, index, action):
             notify_error = guard.compact_error(
                 exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
             )
+        checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        state = guard.load_state()
+        instances = state.setdefault("instances", {})
+        previous = instances.get(str(user.get("instance_id", "")), {})
+        if not isinstance(previous, dict):
+            previous = {}
+        if traffic is None:
+            traffic = previous.get("traffic_gb")
+        level = "action" if performed else "ok"
+        instances[str(user.get("instance_id", ""))] = dict(
+            previous,
+            name=name,
+            traffic_gb=traffic,
+            status_after=after or before or "Unknown",
+            level=level,
+            message=message.replace("\n", "；"),
+            checked_at=checked_at,
+        )
+        history = state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "at": checked_at,
+                "instances": {
+                    str(user.get("instance_id", "")): {
+                        "traffic_gb": traffic,
+                        "status": after or before or "Unknown",
+                        "status_before": before,
+                        "status_after": after or before or "Unknown",
+                        "action": "manual_{}".format(action),
+                        "action_performed": performed,
+                        "message": message.replace("\n", "；"),
+                        "level": level,
+                    }
+                },
+            }
+        )
+        state["history"] = history[-576:]
+        guard.save_state(state)
         return {
             "before": before,
             "after": after or "Unknown",
@@ -457,6 +526,20 @@ class PanelServer(ThreadingHTTPServer):
         self.login_attempt_lock = threading.Lock()
         self.job_lock = threading.Lock()
         self.job = {"running": False, "started_at": None, "finished_at": None, "error": None}
+
+    def delayed_restart(self, delay=0.6):
+        def restart():
+            try:
+                web_actions.service_command("restart")
+            except Exception as exc:
+                try:
+                    self.guard.LOGGER.error("Web requested restart failed: %s", exc)
+                except Exception:
+                    pass
+
+        timer = threading.Timer(delay, restart)
+        timer.daemon = True
+        timer.start()
 
     def create_session(self):
         session_id = secrets.token_urlsafe(32)
@@ -510,7 +593,9 @@ class PanelServer(ThreadingHTTPServer):
         with self.login_attempt_lock:
             self.login_attempts.pop(address, None)
 
-    def start_cycle_job(self):
+    def start_cycle_job(self, dry_run=False):
+        if not isinstance(dry_run, bool):
+            raise WebPanelError("dry_run 必须是布尔值")
         with self.job_lock:
             if self.job.get("running"):
                 raise WebPanelError("检测任务已经在运行", 409)
@@ -519,6 +604,7 @@ class PanelServer(ThreadingHTTPServer):
                 "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                 "finished_at": None,
                 "error": None,
+                "dry_run": dry_run,
             }
 
         def worker():
@@ -527,7 +613,7 @@ class PanelServer(ThreadingHTTPServer):
                 with self.guard.cycle_lock() as locked:
                     if not locked:
                         raise WebPanelError("其他检测任务正在运行", 409)
-                    self.guard.run_cycle()
+                    self.guard.run_cycle(dry_run=dry_run)
             except Exception as exc:
                 error = self.guard.compact_error(exc)
             with self.job_lock:
@@ -664,6 +750,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                     job = dict(self.server.job)
                 self._json(dashboard_payload(self.server.guard, job=job))
                 return
+            if parts == ["api", "management"]:
+                self._json(management_payload(self.server.guard))
+                return
+            if parts == ["api", "update"]:
+                self._json(web_actions.check_update())
+                return
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
@@ -674,6 +766,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json(dict(self.server.job))
                 return
             raise WebPanelError("接口不存在", 404)
+        except web_actions.ManagementError as exc:
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except WebPanelError as exc:
             self._json({"ok": False, "error": str(exc)}, exc.status)
         except Exception as exc:
@@ -695,11 +792,93 @@ class PanelHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts == ["api", "run"]:
-                self._json({"ok": True, "job": self.server.start_cycle_job()}, 202)
+                data = self._read_json()
+                self._json(
+                    {
+                        "ok": True,
+                        "job": self.server.start_cycle_job(
+                            data.get("dry_run", False)
+                        ),
+                    },
+                    202,
+                )
                 return
             if parts == ["api", "settings"]:
-                result = update_settings(self.server.guard, self._read_json())
+                result = web_actions.update_global_settings(
+                    self.server.guard, self._read_json()
+                )
                 self._json({"ok": True, "settings": result})
+                return
+            if parts == ["api", "web-settings"]:
+                result = web_actions.update_web_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "web": result})
+                if result.get("restart_required"):
+                    self.server.delayed_restart()
+                return
+            if parts == ["api", "telegram", "identity"]:
+                result = web_actions.update_telegram_identity(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "telegram": result})
+                return
+            if parts == ["api", "telegram", "test"]:
+                self._read_json()
+                result = web_actions.test_current_telegram(self.server.guard)
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "telegram", "connection"]:
+                result = web_actions.configure_telegram_connection(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "telegram", "nodes"]:
+                result = web_actions.add_telegram_node(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "telegram", "nodes"]
+            ):
+                try:
+                    node_index = int(parts[3])
+                except ValueError:
+                    raise WebPanelError("节点序号无效")
+                self._read_json()
+                result = web_actions.telegram_node_action(
+                    self.server.guard, node_index, parts[4]
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "instances"]:
+                result = web_actions.save_instance(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if len(parts) == 3 and parts[:2] == ["api", "instances"]:
+                try:
+                    index = int(parts[2])
+                except ValueError:
+                    raise WebPanelError("实例序号无效")
+                result = web_actions.save_instance(
+                    self.server.guard, self._read_json(), index
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "service", "restart"]:
+                self._read_json()
+                self.server.delayed_restart()
+                self._json({"ok": True, "message": "后台服务重启已安排"}, 202)
+                return
+            if parts == ["api", "update", "install"]:
+                self._read_json()
+                pid = web_actions.install_update()
+                self._json({"ok": True, "pid": pid}, 202)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "instances"]:
                 try:
@@ -707,6 +886,16 @@ class PanelHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     raise WebPanelError("实例序号无效")
                 data = self._read_json()
+                if parts[3] == "validate":
+                    result = web_actions.validate_instance(self.server.guard, index)
+                    self._json({"ok": True, "result": result})
+                    return
+                if parts[3] == "delete":
+                    result = web_actions.delete_instance(
+                        self.server.guard, index, data.get("instance_id")
+                    )
+                    self._json({"ok": True, "result": result})
+                    return
                 if parts[3] == "schedule":
                     result = update_schedule(self.server.guard, index, data)
                     self._json({"ok": True, "schedule": result})
@@ -720,6 +909,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "result": result})
                     return
             raise WebPanelError("接口不存在", 404)
+        except web_actions.ManagementError as exc:
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except WebPanelError as exc:
             self._json({"ok": False, "error": str(exc)}, exc.status)
         except Exception as exc:

@@ -28,7 +28,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -1102,10 +1102,25 @@ def parse_version_manifest(payload):
     }
 
 
+def local_release_id():
+    try:
+        return parse_release_id(LOCAL_RELEASE_ID)
+    except Exception:
+        pass
+    for path in (APP_DIR / "version.json", APP_DIR.parent / "version.json"):
+        try:
+            return parse_version_manifest(path.read_text(encoding="utf-8"))[
+                "release_id"
+            ]
+        except (OSError, ValueError, guard.GuardError):
+            continue
+    raise guard.GuardError("本地版本构建标识无效")
+
+
 def check_for_github_update():
     """Return remote release details, or None when the startup check is unavailable."""
     try:
-        local_release_id = parse_release_id(LOCAL_RELEASE_ID)
+        current_release_id = local_release_id()
     except Exception:
         return None
     try:
@@ -1117,11 +1132,16 @@ def check_for_github_update():
         remote = parse_version_manifest(payload)
     except Exception:
         return None
-    remote["available"] = remote["release_id"] != local_release_id
+    remote["available"] = remote["release_id"] != current_release_id
     return remote
 
 
 def update_from_github(confirm_update=True, release_info=None):
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        title("更新 GitHub 版本")
+        print("Docker 部署请在宿主机执行：")
+        print("git pull && docker compose up -d --build")
+        return False
     title("更新 GitHub 版本")
     print("当前版本: v{}".format(APP_VERSION))
     try:
@@ -1328,7 +1348,8 @@ def parse_args(argv=None):
     subparsers.add_parser("menu", help="打开管理面板")
     subparsers.add_parser("status", help="显示状态")
     subparsers.add_parser("add", help="添加实例")
-    subparsers.add_parser("update", help="从 GitHub 更新程序")
+    update = subparsers.add_parser("update", help="从 GitHub 更新程序")
+    update.add_argument("--yes", action="store_true", help="无需交互确认")
     subparsers.add_parser("version", help="显示当前版本")
     subparsers.add_parser("web", help="显示网页控制面板状态")
     return parser.parse_args(argv)
@@ -1348,7 +1369,7 @@ def main(argv=None):
             add_user(config)
             return 0
         if args.command == "update":
-            result = update_from_github()
+            result = update_from_github(confirm_update=not args.yes)
             return 1 if result is False else 0
         if args.command == "version":
             print("Aliyun Guard v{}".format(APP_VERSION))

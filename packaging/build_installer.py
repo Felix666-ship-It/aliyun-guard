@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "packaging" / "install.template.sh"
 PAYLOADS = [
     (ROOT / "src" / "telegram_proxy.py", "telegram_proxy.py", "__AG_PROXY_PY_EOF__"),
+    (ROOT / "src" / "web_actions.py", "web_actions.py", "__AG_WEB_ACTIONS_PY_EOF__"),
     (ROOT / "src" / "web_panel.py", "web_panel.py", "__AG_WEB_PY_EOF__"),
     (ROOT / "src" / "web_panel.html", "web_panel.html", "__AG_WEB_HTML_EOF__"),
     (ROOT / "src" / "aliyun_guard.py", "aliyun_guard.py", "__AG_APP_PY_EOF__"),

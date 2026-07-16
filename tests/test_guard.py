@@ -898,6 +898,27 @@ class UpdateTests(unittest.TestCase):
             result = manager.check_for_github_update()
         self.assertFalse(result["available"])
 
+    def test_source_build_reads_local_version_manifest(self):
+        release_id = "c" * 64
+        remote = json.dumps(
+            {"version": manager.APP_VERSION, "release_id": release_id}
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "version.json"
+            manifest.write_text(
+                json.dumps(
+                    {"version": manager.APP_VERSION, "release_id": release_id}
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(manager, "LOCAL_RELEASE_ID", "__AG_RELEASE_ID__"), mock.patch.object(
+                manager, "APP_DIR", Path(directory)
+            ), mock.patch.object(
+                manager, "download_update_file", return_value=remote
+            ):
+                result = manager.check_for_github_update()
+        self.assertFalse(result["available"])
+
     def test_startup_check_failure_does_not_block_menu(self):
         with mock.patch.object(manager, "LOCAL_RELEASE_ID", "a" * 64), mock.patch.object(
             manager, "download_update_file", side_effect=OSError("offline")

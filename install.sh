@@ -905,6 +905,722 @@ def ensure_node_proxy(node_link, startup_timeout=12):
 
 atexit.register(stop_node_proxy)
 __AG_PROXY_PY_EOF__
+    cat > "$APP_DIR/web_actions.py" <<'__AG_WEB_ACTIONS_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Management operations exposed by the authenticated web panel."""
+
+import copy
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import telegram_proxy
+
+
+APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+
+CONNECTION_LABELS = {
+    "direct": "直连",
+    "socks5": "SOCKS5 代理",
+    "http": "HTTP/HTTPS 代理",
+    "node": "节点链接",
+    "api_proxy": "Telegram API 反向代理",
+}
+
+BILLING_PRESETS = {
+    "china": {
+        "enabled": True,
+        "site": "china",
+        "endpoint": "business.aliyuncs.com",
+        "region": "cn-hangzhou",
+        "currency_code": "CNY",
+        "currency_symbol": "¥",
+    },
+    "international": {
+        "enabled": True,
+        "site": "international",
+        "endpoint": "business.ap-southeast-1.aliyuncs.com",
+        "region": "ap-southeast-1",
+        "currency_code": "USD",
+        "currency_symbol": "$",
+    },
+}
+
+
+class ManagementError(RuntimeError):
+    def __init__(self, message, status=400, details=None):
+        super().__init__(message)
+        self.status = status
+        self.details = details
+
+
+def _copy(value):
+    return copy.deepcopy(value)
+
+
+def _required_text(data, name, current="", label=None):
+    value = data.get(name, current)
+    value = str(value or "").strip()
+    if not value:
+        raise ManagementError("{}不能为空".format(label or name))
+    return value
+
+
+def _optional_secret(data, name, current="", label=None):
+    value = str(data.get(name, "") or "").strip()
+    if value:
+        return value
+    current = str(current or "").strip()
+    if not current:
+        raise ManagementError("{}不能为空".format(label or name))
+    return current
+
+
+def _boolean(data, name, current=False):
+    value = data.get(name, current)
+    if not isinstance(value, bool):
+        raise ManagementError("{}必须是布尔值".format(name))
+    return value
+
+
+def _integer(data, name, current, minimum, maximum):
+    try:
+        value = int(data.get(name, current))
+    except (TypeError, ValueError):
+        raise ManagementError("{}必须是整数".format(name))
+    if value < minimum or value > maximum:
+        raise ManagementError(
+            "{}必须在 {} 到 {} 之间".format(name, minimum, maximum)
+        )
+    return value
+
+
+def _number(data, name, current, minimum):
+    try:
+        value = float(data.get(name, current))
+    except (TypeError, ValueError):
+        raise ManagementError("{}必须是数字".format(name))
+    if value < minimum:
+        raise ManagementError("{}不能小于 {}".format(name, minimum))
+    return value
+
+
+def _save_config(guard, config):
+    try:
+        guard.validate_config(config)
+        config["telegram"]["node_urls"] = guard.telegram_node_urls(
+            config.get("telegram", {})
+        )
+        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
+    except ManagementError:
+        raise
+    except Exception as exc:
+        raise ManagementError(guard.compact_error(exc))
+
+
+def _node_description(node_url):
+    try:
+        return telegram_proxy.describe_node_link(node_url)
+    except telegram_proxy.ProxyError:
+        return "无效节点"
+
+
+def _billing_payload(guard, user):
+    billing = guard.get_billing_config(user)
+    return {
+        "enabled": bool(billing.get("enabled", True)),
+        "site": str(billing.get("site", "china")),
+        "endpoint": str(billing.get("endpoint", "")),
+        "region": str(billing.get("region", "")),
+        "currency_code": str(billing.get("currency_code", "")),
+        "currency_symbol": str(billing.get("currency_symbol", "")),
+    }
+
+
+def _instance_payload(guard, user, index):
+    schedule = guard.get_schedule_config(user)
+    return {
+        "index": index,
+        "name": str(user.get("name", "")),
+        "access_key_configured": bool(str(user.get("ak", "")).strip()),
+        "secret_key_configured": bool(str(user.get("sk", "")).strip()),
+        "region": str(user.get("region", "")),
+        "instance_id": str(user.get("instance_id", "")),
+        "traffic_limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
+        "actions_enabled": bool(user.get("actions_enabled", True)),
+        "paused": bool(user.get("paused", False)),
+        "billing": _billing_payload(guard, user),
+        "schedule": {
+            "enabled": schedule["enabled"],
+            "start_time": schedule["start_time"],
+            "stop_time": schedule["stop_time"],
+        },
+    }
+
+
+def telegram_payload(guard, telegram):
+    nodes = guard.telegram_node_urls(telegram)
+    active = str(telegram.get("node_url", "") or "").strip()
+    mode = str(telegram.get("connection_mode", "direct") or "direct")
+    return {
+        "bot_token_configured": bool(str(telegram.get("bot_token", "")).strip()),
+        "chat_id": str(telegram.get("chat_id", "")),
+        "timeout_seconds": int(telegram.get("timeout_seconds", 12)),
+        "retries": int(telegram.get("retries", 3)),
+        "connection_mode": mode,
+        "connection_label": CONNECTION_LABELS.get(mode, "未知"),
+        "connection_description": guard.telegram_connection_description(telegram),
+        "proxy_configured": bool(str(telegram.get("proxy_url", "")).strip()),
+        "api_base_configured": bool(str(telegram.get("api_base_url", "")).strip()),
+        "nodes": [
+            {
+                "index": index,
+                "description": _node_description(node_url),
+                "active": mode == "node" and node_url == active,
+            }
+            for index, node_url in enumerate(nodes)
+        ],
+    }
+
+
+def management_payload(guard, backend="unknown"):
+    config = guard.load_config()
+    raw_web = config.get("web_panel", {})
+    web = raw_web if isinstance(raw_web, dict) else {}
+    return {
+        "instances": [
+            _instance_payload(guard, user, index)
+            for index, user in enumerate(config.get("users", []))
+        ],
+        "telegram": telegram_payload(guard, config.get("telegram", {})),
+        "settings": {
+            "interval_seconds": int(config.get("interval_seconds", 300)),
+            "notification_mode": str(config.get("notification_mode", "always")),
+            "force_ipv4": bool(config.get("force_ipv4", True)),
+            "notify_on_daemon_start": bool(config.get("notify_on_daemon_start", False)),
+            "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
+            "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
+            "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+        },
+        "web": {
+            "enabled": bool(web.get("enabled", False)),
+            "host": str(web.get("host", "127.0.0.1")),
+            "port": int(web.get("port", 8765)),
+            "username": str(web.get("username", "admin")),
+            "password_configured": bool(str(web.get("password_hash", "")).strip()),
+        },
+        "backend": backend,
+    }
+
+
+def _normalize_billing(guard, raw, existing):
+    raw = raw if isinstance(raw, dict) else {}
+    current = guard.get_billing_config(existing)
+    enabled = _boolean(raw, "enabled", bool(current.get("enabled", True)))
+    site = str(raw.get("site", current.get("site", "china")) or "china")
+    if not enabled:
+        result = _copy(current)
+        result["enabled"] = False
+        return result
+    if site in BILLING_PRESETS:
+        return _copy(BILLING_PRESETS[site])
+    if site != "custom":
+        raise ManagementError("账单站点无效")
+    return {
+        "enabled": True,
+        "site": "custom",
+        "endpoint": _required_text(raw, "endpoint", current.get("endpoint"), "BSS Endpoint"),
+        "region": _required_text(raw, "region", current.get("region"), "BSS 签名 Region"),
+        "currency_code": _required_text(
+            raw, "currency_code", current.get("currency_code"), "币种代码"
+        ).upper(),
+        "currency_symbol": _required_text(
+            raw, "currency_symbol", current.get("currency_symbol"), "币种符号"
+        ),
+    }
+
+
+def _normalize_schedule(guard, raw, existing):
+    raw = raw if isinstance(raw, dict) else {}
+    current = guard.get_schedule_config(existing)
+    enabled = _boolean(raw, "enabled", current["enabled"])
+    try:
+        start_time = guard.normalize_schedule_time(
+            raw.get("start_time", current["start_time"]), "开机时间"
+        )
+        stop_time = guard.normalize_schedule_time(
+            raw.get("stop_time", current["stop_time"]), "关机时间"
+        )
+    except Exception as exc:
+        raise ManagementError(str(exc))
+    if enabled and start_time == stop_time:
+        raise ManagementError("开机时间和关机时间不能相同")
+    return {
+        "enabled": enabled,
+        "start_time": start_time,
+        "stop_time": stop_time,
+    }
+
+
+def build_instance_candidate(guard, data, existing=None):
+    if not isinstance(data, dict):
+        raise ManagementError("实例配置格式无效")
+    existing = _copy(existing or {})
+    candidate = _copy(existing)
+    candidate["name"] = _required_text(data, "name", existing.get("name"), "备注名称")
+    candidate["ak"] = _optional_secret(
+        data, "ak", existing.get("ak"), "AccessKey ID"
+    )
+    candidate["sk"] = _optional_secret(
+        data, "sk", existing.get("sk"), "AccessKey Secret"
+    )
+    candidate["region"] = _required_text(
+        data, "region", existing.get("region"), "Region ID"
+    )
+    candidate["instance_id"] = _required_text(
+        data, "instance_id", existing.get("instance_id"), "实例 ID"
+    )
+    candidate["traffic_limit_gb"] = _number(
+        data, "traffic_limit_gb", existing.get("traffic_limit_gb", 180), 0.01
+    )
+    candidate["actions_enabled"] = _boolean(
+        data, "actions_enabled", bool(existing.get("actions_enabled", True))
+    )
+    candidate["paused"] = bool(existing.get("paused", False))
+    candidate["billing"] = _normalize_billing(
+        guard, data.get("billing"), existing
+    )
+    candidate["schedule"] = _normalize_schedule(
+        guard, data.get("schedule"), existing
+    )
+    for legacy in ("bill_endpoint", "currency", "billing_enabled"):
+        candidate.pop(legacy, None)
+    return candidate
+
+
+def _validate_candidate_config(guard, config):
+    try:
+        guard.validate_config(config)
+    except Exception as exc:
+        raise ManagementError(guard.compact_error(exc))
+
+
+def save_instance(guard, data, index=None):
+    config = guard.load_config()
+    users = config.setdefault("users", [])
+    if index is None:
+        existing = None
+    elif index < 0 or index >= len(users):
+        raise ManagementError("实例不存在", 404)
+    else:
+        existing = users[index]
+    candidate = build_instance_candidate(guard, data, existing)
+    candidate_config = _copy(config)
+    if index is None:
+        candidate_config["users"].append(candidate)
+        candidate_index = len(candidate_config["users"]) - 1
+    else:
+        candidate_config["users"][index] = candidate
+        candidate_index = index
+    _validate_candidate_config(guard, candidate_config)
+    try:
+        result = guard.validate_user_connection(
+            candidate, bool(config.get("force_ipv4", True))
+        )
+    except Exception as exc:
+        raise ManagementError(
+            "实例校验失败: {}".format(
+                guard.compact_error(exc, secrets=(candidate.get("ak"), candidate.get("sk")))
+            ),
+            502,
+        )
+    force_save = data.get("force_save", False)
+    if not isinstance(force_save, bool):
+        raise ManagementError("force_save 必须是布尔值")
+    if not result.get("ok") and not force_save:
+        raise ManagementError("实例校验未通过，配置尚未保存", 422, result)
+    _save_config(guard, candidate_config)
+    return {
+        "saved": True,
+        "index": candidate_index,
+        "validation": result,
+        "instance": _instance_payload(guard, candidate, candidate_index),
+    }
+
+
+def validate_instance(guard, index):
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise ManagementError("实例不存在", 404)
+    user = users[index]
+    try:
+        return guard.validate_user_connection(
+            user, bool(config.get("force_ipv4", True))
+        )
+    except Exception as exc:
+        raise ManagementError(
+            guard.compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            502,
+        )
+
+
+def delete_instance(guard, index, instance_id):
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise ManagementError("实例不存在", 404)
+    current_id = str(users[index].get("instance_id", ""))
+    if str(instance_id or "") != current_id:
+        raise ManagementError("删除确认信息不匹配", 409)
+    deleted = users.pop(index)
+    _save_config(guard, config)
+    return {"name": deleted.get("name"), "instance_id": current_id}
+
+
+def update_global_settings(guard, data):
+    config = guard.load_config()
+    mode = str(data.get("notification_mode", config.get("notification_mode", "always")))
+    if mode not in ("always", "events", "errors"):
+        raise ManagementError("通知模式无效")
+    config["interval_seconds"] = _integer(
+        data, "interval_seconds", config.get("interval_seconds", 300), 60, 86400
+    )
+    config["notification_mode"] = mode
+    config["force_ipv4"] = _boolean(
+        data, "force_ipv4", bool(config.get("force_ipv4", True))
+    )
+    config["notify_on_daemon_start"] = _boolean(
+        data,
+        "notify_on_daemon_start",
+        bool(config.get("notify_on_daemon_start", False)),
+    )
+    config["start_wait_seconds"] = _integer(
+        data, "start_wait_seconds", config.get("start_wait_seconds", 90), 0, 600
+    )
+    config["stop_wait_seconds"] = _integer(
+        data, "stop_wait_seconds", config.get("stop_wait_seconds", 45), 0, 600
+    )
+    config["start_poll_seconds"] = _integer(
+        data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
+    )
+    _save_config(guard, config)
+    return management_payload(guard)["settings"]
+
+
+def update_web_settings(guard, data):
+    import web_panel
+
+    config = guard.load_config()
+    current = web_panel.get_web_config(config)
+    enabled = _boolean(data, "enabled", current["enabled"])
+    host = str(data.get("host", current["host"]) or "").strip()
+    if host not in ("127.0.0.1", "0.0.0.0"):
+        raise ManagementError("网页监听地址无效")
+    container = os.environ.get("ALIYUN_GUARD_CONTAINER") == "1"
+    container_port = int(
+        os.environ.get("ALIYUN_GUARD_CONTAINER_WEB_PORT", "8765")
+    )
+    requested_port = _integer(data, "port", current["port"], 1024, 65535)
+    if container and (host != "0.0.0.0" or requested_port != container_port):
+        raise ManagementError(
+            "Docker 内网页固定监听 0.0.0.0:{}；外部端口请修改 Compose 映射".format(
+                container_port
+            ),
+            409,
+        )
+    if (
+        host == "0.0.0.0"
+        and current["host"] != "0.0.0.0"
+        and data.get("confirm_public") is not True
+    ):
+        raise ManagementError("监听所有网卡需要确认 HTTP 明文传输风险", 409)
+    candidate = dict(current)
+    candidate.update(
+        {
+            "enabled": enabled,
+            "host": host,
+            "port": requested_port,
+            "username": _required_text(
+                data, "username", current["username"], "网页登录用户名"
+            ),
+            "cookie_secure": False,
+        }
+    )
+    password = str(data.get("password", "") or "")
+    confirmation = str(data.get("password_confirm", "") or "")
+    if password or confirmation:
+        if password != confirmation:
+            raise ManagementError("两次输入的网页登录密码不一致")
+        try:
+            candidate["password_hash"] = web_panel.hash_password(password)
+        except ValueError as exc:
+            raise ManagementError(str(exc))
+    if enabled and not str(candidate.get("password_hash", "")).strip():
+        raise ManagementError("启用网页面板前必须设置登录密码")
+    config["web_panel"] = candidate
+    _save_config(guard, config)
+    return {
+        "enabled": candidate["enabled"],
+        "host": candidate["host"],
+        "port": candidate["port"],
+        "username": candidate["username"],
+        "password_configured": bool(candidate.get("password_hash")),
+        "restart_required": any(
+            candidate.get(field) != current.get(field)
+            for field in ("enabled", "host", "port", "username", "password_hash")
+        ),
+    }
+
+
+def update_telegram_identity(guard, data):
+    config = guard.load_config()
+    telegram = config.setdefault("telegram", {})
+    token = str(data.get("bot_token", "") or "").strip()
+    if token:
+        telegram["bot_token"] = token
+    if not str(telegram.get("bot_token", "")).strip():
+        raise ManagementError("Telegram Bot Token 不能为空")
+    telegram["chat_id"] = _required_text(
+        data, "chat_id", telegram.get("chat_id"), "Telegram Chat ID"
+    )
+    telegram["timeout_seconds"] = _integer(
+        data, "timeout_seconds", telegram.get("timeout_seconds", 12), 3, 60
+    )
+    telegram["retries"] = _integer(
+        data, "retries", telegram.get("retries", 3), 1, 5
+    )
+    _save_config(guard, config)
+    return telegram_payload(guard, telegram)
+
+
+def _telegram_test(guard, telegram, force_ipv4=True, install_core=True):
+    try:
+        guard.validate_telegram_config(telegram)
+        if telegram.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
+            if not install_core:
+                raise ManagementError("节点模式需要先安装 sing-box", 409)
+            telegram_proxy.install_sing_box()
+        if force_ipv4:
+            guard.enable_ipv4_only()
+        details = {}
+        username = guard.test_telegram(
+            telegram, latency_attempts=3, result_details=details
+        )
+        return {
+            "username": username,
+            "latency_ms": round(float(details.get("latency_ms", 0)), 1),
+            "latency_attempts": int(details.get("latency_attempts", 3)),
+            "connection": guard.telegram_connection_description(telegram),
+        }
+    except ManagementError:
+        raise
+    except Exception as exc:
+        raise ManagementError(
+            "Telegram 测试失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            ),
+            502,
+        )
+
+
+def test_current_telegram(guard):
+    config = guard.load_config()
+    return _telegram_test(
+        guard,
+        config.get("telegram", {}),
+        bool(config.get("force_ipv4", True)),
+    )
+
+
+def _connection_candidate(guard, data, config):
+    telegram = _copy(config.get("telegram", {}))
+    mode = str(data.get("connection_mode", "") or "").strip()
+    if mode not in CONNECTION_LABELS:
+        raise ManagementError("Telegram 连接方式无效")
+    telegram["connection_mode"] = mode
+    if mode in ("socks5", "http"):
+        proxy_url = str(data.get("proxy_url", "") or "").strip()
+        if proxy_url:
+            telegram["proxy_url"] = proxy_url
+    elif mode == "api_proxy":
+        api_base_url = str(data.get("api_base_url", "") or "").strip()
+        if api_base_url:
+            telegram["api_base_url"] = api_base_url.rstrip("/")
+    elif mode == "node":
+        try:
+            index = int(data.get("node_index"))
+        except (TypeError, ValueError):
+            raise ManagementError("请选择节点")
+        nodes = guard.telegram_node_urls(telegram)
+        if index < 0 or index >= len(nodes):
+            raise ManagementError("节点不存在", 404)
+        telegram["node_url"] = nodes[index]
+    telegram["node_urls"] = guard.telegram_node_urls(telegram)
+    return telegram
+
+
+def configure_telegram_connection(guard, data):
+    config = guard.load_config()
+    candidate = _connection_candidate(guard, data, config)
+    result = _telegram_test(
+        guard,
+        candidate,
+        bool(config.get("force_ipv4", True)),
+        bool(data.get("install_core", True)),
+    )
+    save = data.get("save", True)
+    if not isinstance(save, bool):
+        raise ManagementError("save 必须是布尔值")
+    if save:
+        config["telegram"] = candidate
+        _save_config(guard, config)
+    result["saved"] = save
+    result["telegram"] = telegram_payload(guard, candidate)
+    return result
+
+
+def add_telegram_node(guard, data):
+    node_url = str(data.get("node_url", "") or "").strip()
+    if not node_url:
+        raise ManagementError("节点链接不能为空")
+    try:
+        description = telegram_proxy.describe_node_link(node_url)
+    except telegram_proxy.ProxyError as exc:
+        raise ManagementError("节点链接无效: {}".format(exc))
+    config = guard.load_config()
+    current = config.setdefault("telegram", {})
+    nodes = guard.telegram_node_urls(current)
+    if node_url in nodes:
+        raise ManagementError("该节点已经保存", 409)
+    candidate = _copy(current)
+    candidate["node_url"] = node_url
+    candidate["node_urls"] = nodes + [node_url]
+    candidate["connection_mode"] = "node"
+    result = _telegram_test(
+        guard,
+        candidate,
+        bool(config.get("force_ipv4", True)),
+        bool(data.get("install_core", True)),
+    )
+    current["node_urls"] = nodes + [node_url]
+    config["telegram"] = current
+    _save_config(guard, config)
+    telegram_proxy.stop_node_proxy()
+    result.update({"saved": True, "description": description})
+    return result
+
+
+def telegram_node_action(guard, index, action):
+    config = guard.load_config()
+    telegram = config.setdefault("telegram", {})
+    nodes = guard.telegram_node_urls(telegram)
+    if index < 0 or index >= len(nodes):
+        raise ManagementError("节点不存在", 404)
+    node_url = nodes[index]
+    if action == "delete":
+        remaining = [value for value in nodes if value != node_url]
+        telegram["node_urls"] = remaining
+        if str(telegram.get("node_url", "")) == node_url:
+            telegram["node_url"] = ""
+            telegram["connection_mode"] = "direct"
+        _save_config(guard, config)
+        telegram_proxy.stop_node_proxy()
+        return {"deleted": _node_description(node_url)}
+    if action not in ("test", "select"):
+        raise ManagementError("节点操作无效")
+    candidate = _copy(telegram)
+    candidate["node_url"] = node_url
+    candidate["connection_mode"] = "node"
+    result = _telegram_test(
+        guard, candidate, bool(config.get("force_ipv4", True)), True
+    )
+    if action == "select":
+        config["telegram"] = candidate
+        _save_config(guard, config)
+        result["saved"] = True
+    else:
+        result["saved"] = False
+        telegram_proxy.stop_node_proxy()
+    return result
+
+
+def check_update():
+    try:
+        import manager
+
+        remote = manager.check_for_github_update()
+    except Exception as exc:
+        raise ManagementError("无法检查 GitHub 更新: {}".format(exc), 502)
+    return {
+        "current_version": manager.APP_VERSION,
+        "available": bool(remote and remote.get("available")),
+        "latest_version": remote.get("version") if remote else None,
+        "deployment": "docker"
+        if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1"
+        else "native",
+    }
+
+
+def detached_process(command, log_name):
+    log_path = APP_DIR / "logs" / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("ab", buffering=0)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception:
+        raise
+    finally:
+        log_handle.close()
+    return process.pid
+
+
+def service_command(action):
+    if action != "restart":
+        raise ManagementError("服务操作无效")
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        try:
+            return detached_process(
+                ["/bin/sh", "-c", "sleep 1; kill -TERM 1"],
+                "web-service.log",
+            )
+        except Exception as exc:
+            raise ManagementError("容器重启请求失败: {}".format(exc), 500)
+    control = APP_DIR / "control.sh"
+    if not control.exists():
+        raise ManagementError("控制脚本不存在", 500)
+    try:
+        return detached_process([str(control), action], "web-service.log")
+    except Exception as exc:
+        raise ManagementError("服务重启失败: {}".format(exc), 500)
+
+
+def install_update():
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        raise ManagementError(
+            "Docker 部署请在宿主机执行 git pull && docker compose up -d --build",
+            409,
+        )
+    manager_path = APP_DIR / "manager.py"
+    if not manager_path.exists():
+        raise ManagementError("更新程序不存在", 500)
+    try:
+        return detached_process(
+            [sys.executable, str(manager_path), "update", "--yes"],
+            "web-update.log",
+        )
+    except Exception as exc:
+        raise ManagementError("启动更新失败: {}".format(exc), 500)
+__AG_WEB_ACTIONS_PY_EOF__
     cat > "$APP_DIR/web_panel.py" <<'__AG_WEB_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -930,13 +1646,15 @@ import threading
 import time
 import urllib.parse
 
+import web_actions
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -1069,11 +1787,14 @@ def browser_access_url(web, local_ip=None):
     return "http://{}:{}".format(host, int(web.get("port", 8765)))
 
 
-def mask_key(value):
-    value = str(value or "")
-    if len(value) <= 8:
-        return "*" * len(value)
-    return "{}...{}".format(value[:4], value[-4:])
+def service_backend():
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        return "docker"
+    try:
+        value = BACKEND_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = "unknown"
+    return value or "unknown"
 
 
 def _safe_instances(state):
@@ -1109,7 +1830,18 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             value = values.get(instance_id, {}) if isinstance(values, dict) else {}
             if isinstance(value, dict) and value.get("traffic_gb") is not None:
                 points.append(
-                    {"at": sample.get("at"), "value": value.get("traffic_gb")}
+                    {
+                        "at": sample.get("at"),
+                        "value": value.get("traffic_gb"),
+                        "status": value.get("status_after") or value.get("status"),
+                        "status_before": value.get("status_before"),
+                        "action": value.get("action", "none"),
+                        "action_performed": bool(
+                            value.get("action_performed", False)
+                        ),
+                        "message": value.get("message", ""),
+                        "level": value.get("level", "unknown"),
+                    }
                 )
         traffic = current.get("traffic_gb")
         limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -1122,7 +1854,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "name": str(user.get("name") or instance_id),
                 "instance_id": instance_id,
                 "region": str(user.get("region", "")),
-                "access_key": mask_key(user.get("ak")),
                 "paused": bool(user.get("paused", False)),
                 "actions_enabled": bool(user.get("actions_enabled", True)),
                 "traffic_gb": traffic,
@@ -1182,6 +1913,16 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         },
         "job": dict(job or {}),
     }
+
+
+def management_payload(guard):
+    payload = web_actions.management_payload(guard, service_backend())
+    payload["version"] = APP_VERSION
+    web = payload["web"]
+    web["local_ip"] = detect_primary_ipv4()
+    web["browser_url"] = browser_access_url(web, web["local_ip"])
+    web["http_warning"] = web["host"] == "0.0.0.0"
+    return payload
 
 
 def read_recent_logs(guard, limit=200):
@@ -1285,6 +2026,8 @@ def control_instance(guard, index, action):
             )
         try:
             before = guard.query_instance_status(user)
+            traffic = None
+            performed = False
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -1297,6 +2040,7 @@ def control_instance(guard, index, action):
                     )
                 if before != "Running":
                     guard.start_instance(user)
+                    performed = True
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Running",
@@ -1308,6 +2052,7 @@ def control_instance(guard, index, action):
             else:
                 if before != "Stopped":
                     guard.stop_instance(user)
+                    performed = True
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Stopped",
@@ -1342,6 +2087,46 @@ def control_instance(guard, index, action):
             notify_error = guard.compact_error(
                 exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
             )
+        checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        state = guard.load_state()
+        instances = state.setdefault("instances", {})
+        previous = instances.get(str(user.get("instance_id", "")), {})
+        if not isinstance(previous, dict):
+            previous = {}
+        if traffic is None:
+            traffic = previous.get("traffic_gb")
+        level = "action" if performed else "ok"
+        instances[str(user.get("instance_id", ""))] = dict(
+            previous,
+            name=name,
+            traffic_gb=traffic,
+            status_after=after or before or "Unknown",
+            level=level,
+            message=message.replace("\n", "；"),
+            checked_at=checked_at,
+        )
+        history = state.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "at": checked_at,
+                "instances": {
+                    str(user.get("instance_id", "")): {
+                        "traffic_gb": traffic,
+                        "status": after or before or "Unknown",
+                        "status_before": before,
+                        "status_after": after or before or "Unknown",
+                        "action": "manual_{}".format(action),
+                        "action_performed": performed,
+                        "message": message.replace("\n", "；"),
+                        "level": level,
+                    }
+                },
+            }
+        )
+        state["history"] = history[-576:]
+        guard.save_state(state)
         return {
             "before": before,
             "after": after or "Unknown",
@@ -1365,6 +2150,20 @@ class PanelServer(ThreadingHTTPServer):
         self.login_attempt_lock = threading.Lock()
         self.job_lock = threading.Lock()
         self.job = {"running": False, "started_at": None, "finished_at": None, "error": None}
+
+    def delayed_restart(self, delay=0.6):
+        def restart():
+            try:
+                web_actions.service_command("restart")
+            except Exception as exc:
+                try:
+                    self.guard.LOGGER.error("Web requested restart failed: %s", exc)
+                except Exception:
+                    pass
+
+        timer = threading.Timer(delay, restart)
+        timer.daemon = True
+        timer.start()
 
     def create_session(self):
         session_id = secrets.token_urlsafe(32)
@@ -1418,7 +2217,9 @@ class PanelServer(ThreadingHTTPServer):
         with self.login_attempt_lock:
             self.login_attempts.pop(address, None)
 
-    def start_cycle_job(self):
+    def start_cycle_job(self, dry_run=False):
+        if not isinstance(dry_run, bool):
+            raise WebPanelError("dry_run 必须是布尔值")
         with self.job_lock:
             if self.job.get("running"):
                 raise WebPanelError("检测任务已经在运行", 409)
@@ -1427,6 +2228,7 @@ class PanelServer(ThreadingHTTPServer):
                 "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                 "finished_at": None,
                 "error": None,
+                "dry_run": dry_run,
             }
 
         def worker():
@@ -1435,7 +2237,7 @@ class PanelServer(ThreadingHTTPServer):
                 with self.guard.cycle_lock() as locked:
                     if not locked:
                         raise WebPanelError("其他检测任务正在运行", 409)
-                    self.guard.run_cycle()
+                    self.guard.run_cycle(dry_run=dry_run)
             except Exception as exc:
                 error = self.guard.compact_error(exc)
             with self.job_lock:
@@ -1572,6 +2374,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                     job = dict(self.server.job)
                 self._json(dashboard_payload(self.server.guard, job=job))
                 return
+            if parts == ["api", "management"]:
+                self._json(management_payload(self.server.guard))
+                return
+            if parts == ["api", "update"]:
+                self._json(web_actions.check_update())
+                return
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
@@ -1582,6 +2390,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json(dict(self.server.job))
                 return
             raise WebPanelError("接口不存在", 404)
+        except web_actions.ManagementError as exc:
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except WebPanelError as exc:
             self._json({"ok": False, "error": str(exc)}, exc.status)
         except Exception as exc:
@@ -1603,11 +2416,93 @@ class PanelHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts == ["api", "run"]:
-                self._json({"ok": True, "job": self.server.start_cycle_job()}, 202)
+                data = self._read_json()
+                self._json(
+                    {
+                        "ok": True,
+                        "job": self.server.start_cycle_job(
+                            data.get("dry_run", False)
+                        ),
+                    },
+                    202,
+                )
                 return
             if parts == ["api", "settings"]:
-                result = update_settings(self.server.guard, self._read_json())
+                result = web_actions.update_global_settings(
+                    self.server.guard, self._read_json()
+                )
                 self._json({"ok": True, "settings": result})
+                return
+            if parts == ["api", "web-settings"]:
+                result = web_actions.update_web_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "web": result})
+                if result.get("restart_required"):
+                    self.server.delayed_restart()
+                return
+            if parts == ["api", "telegram", "identity"]:
+                result = web_actions.update_telegram_identity(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "telegram": result})
+                return
+            if parts == ["api", "telegram", "test"]:
+                self._read_json()
+                result = web_actions.test_current_telegram(self.server.guard)
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "telegram", "connection"]:
+                result = web_actions.configure_telegram_connection(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "telegram", "nodes"]:
+                result = web_actions.add_telegram_node(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "telegram", "nodes"]
+            ):
+                try:
+                    node_index = int(parts[3])
+                except ValueError:
+                    raise WebPanelError("节点序号无效")
+                self._read_json()
+                result = web_actions.telegram_node_action(
+                    self.server.guard, node_index, parts[4]
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "instances"]:
+                result = web_actions.save_instance(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if len(parts) == 3 and parts[:2] == ["api", "instances"]:
+                try:
+                    index = int(parts[2])
+                except ValueError:
+                    raise WebPanelError("实例序号无效")
+                result = web_actions.save_instance(
+                    self.server.guard, self._read_json(), index
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "service", "restart"]:
+                self._read_json()
+                self.server.delayed_restart()
+                self._json({"ok": True, "message": "后台服务重启已安排"}, 202)
+                return
+            if parts == ["api", "update", "install"]:
+                self._read_json()
+                pid = web_actions.install_update()
+                self._json({"ok": True, "pid": pid}, 202)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "instances"]:
                 try:
@@ -1615,6 +2510,16 @@ class PanelHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     raise WebPanelError("实例序号无效")
                 data = self._read_json()
+                if parts[3] == "validate":
+                    result = web_actions.validate_instance(self.server.guard, index)
+                    self._json({"ok": True, "result": result})
+                    return
+                if parts[3] == "delete":
+                    result = web_actions.delete_instance(
+                        self.server.guard, index, data.get("instance_id")
+                    )
+                    self._json({"ok": True, "result": result})
+                    return
                 if parts[3] == "schedule":
                     result = update_schedule(self.server.guard, index, data)
                     self._json({"ok": True, "schedule": result})
@@ -1628,6 +2533,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "result": result})
                     return
             raise WebPanelError("接口不存在", 404)
+        except web_actions.ManagementError as exc:
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except WebPanelError as exc:
             self._json({"ok": False, "error": str(exc)}, exc.status)
         except Exception as exc:
@@ -1910,7 +2820,7 @@ __AG_WEB_PY_EOF__
       line-height: 1.5;
       letter-spacing: 0;
     }
-    button, input, select { font: inherit; letter-spacing: 0; }
+    button, input, select, textarea { font: inherit; letter-spacing: 0; }
     button { cursor: pointer; }
     [hidden] { display: none !important; }
     .icon { width: 18px; height: 18px; flex: 0 0 18px; stroke-width: 2; }
@@ -1972,7 +2882,7 @@ __AG_WEB_PY_EOF__
     .field { display: grid; gap: 7px; margin-bottom: 17px; }
     .field label { font-size: 13px; font-weight: 650; color: #3d4944; }
     .input-wrap { position: relative; }
-    input, select {
+    input, select, textarea {
       width: 100%;
       min-height: 42px;
       border: 1px solid #cbd5cf;
@@ -1982,7 +2892,8 @@ __AG_WEB_PY_EOF__
       padding: 9px 11px;
       outline: none;
     }
-    input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(8, 119, 90, .12); }
+    textarea { min-height: 82px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(8, 119, 90, .12); }
     .input-wrap input { padding-right: 44px; }
     .input-icon {
       position: absolute;
@@ -2093,6 +3004,7 @@ __AG_WEB_PY_EOF__
     }
     .section-heading h1 { font-size: 20px; margin: 0; }
     .section-heading p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
     .summary-band {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2131,6 +3043,7 @@ __AG_WEB_PY_EOF__
       box-shadow: var(--shadow);
       overflow: hidden;
     }
+    .instance-card:only-child { grid-column: 1 / -1; }
     .card-head {
       min-height: 66px;
       padding: 14px 16px;
@@ -2142,6 +3055,7 @@ __AG_WEB_PY_EOF__
     }
     .instance-name { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
     .instance-meta { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .card-head-tools { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
     .status-badge {
       flex: 0 0 auto;
       min-width: 82px;
@@ -2161,6 +3075,41 @@ __AG_WEB_PY_EOF__
     .status-badge.stopped, .status-badge.error { color: #96352f; border-color: #e3bab7; background: #fff3f2; }
     .status-badge.transition { color: #865006; border-color: #ead09f; background: #fff9ed; }
     .status-badge.unknown { color: #58645f; border-color: #d0d8d3; background: #f4f6f5; }
+    .instance-tools { position: relative; }
+    .instance-tools summary { list-style: none; }
+    .instance-tools summary::-webkit-details-marker { display: none; }
+    .instance-tools[open] summary { color: var(--brand); background: var(--surface-alt); }
+    .instance-menu {
+      position: absolute;
+      z-index: 24;
+      top: 44px;
+      right: 0;
+      width: 196px;
+      padding: 6px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      box-shadow: 0 14px 34px rgba(17, 36, 30, .18);
+    }
+    .instance-menu .menu-button {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 9px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .instance-menu .menu-button:hover, .instance-menu .menu-button:focus-visible { background: var(--surface-alt); outline: none; }
+    .instance-menu .menu-button.warning { color: #8b4e07; }
+    .instance-menu .menu-button.danger { color: var(--red); border-top: 1px solid var(--line); border-radius: 0 0 4px 4px; margin-top: 4px; padding-top: 10px; }
+    .instance-menu .menu-button:disabled { opacity: .5; cursor: not-allowed; }
     .card-body { padding: 15px 16px 12px; }
     .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
     .metric { min-width: 0; }
@@ -2171,11 +3120,32 @@ __AG_WEB_PY_EOF__
     .progress > span { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
     .progress > span.warn { background: var(--amber); }
     .progress > span.danger { background: var(--red); }
-    .sparkline { height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
+    .sparkline { position: relative; height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
     .sparkline svg { width: 100%; height: 58px; display: block; overflow: visible; }
+    .chart-hit { fill: transparent; stroke: transparent; cursor: crosshair; outline: none; }
+    .chart-hit:focus { fill: #fff; stroke: var(--cyan); stroke-width: 2px; }
+    .chart-point { fill: #fff; stroke: var(--cyan); stroke-width: 2px; pointer-events: none; }
+    .chart-tooltip {
+      position: absolute;
+      z-index: 12;
+      bottom: 64px;
+      width: min(286px, calc(100% - 8px));
+      padding: 10px 11px;
+      color: #effaf6;
+      background: #17372e;
+      border: 1px solid #31564a;
+      border-radius: 5px;
+      box-shadow: 0 10px 28px rgba(17, 36, 30, .22);
+      pointer-events: none;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .chart-tooltip::after { content: ""; position: absolute; bottom: -6px; left: var(--tip-arrow, 50%); width: 10px; height: 10px; background: #17372e; border-right: 1px solid #31564a; border-bottom: 1px solid #31564a; transform: translateX(-50%) rotate(45deg); }
+    .tooltip-title { font-size: 12px; font-weight: 750; margin-bottom: 5px; }
+    .tooltip-row { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 7px; }
+    .tooltip-row span:first-child { color: #9fc2b6; }
+    .tooltip-row strong { font-weight: 600; overflow-wrap: anywhere; }
     .result-line { min-height: 40px; padding: 10px 16px; color: #53605b; background: #fafbfa; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
-    .card-actions { min-height: 56px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); overflow-x: auto; }
-    .card-actions .button { min-height: 35px; padding: 7px 10px; font-size: 12px; }
     .empty {
       grid-column: 1 / -1;
       min-height: 260px;
@@ -2204,6 +3174,41 @@ __AG_WEB_PY_EOF__
     .settings-panel { max-width: 720px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
     .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
     .settings-actions { margin-top: 4px; display: flex; justify-content: flex-end; }
+    .panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    .panel { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+    .panel.full { grid-column: 1 / -1; }
+    .panel-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .panel-head h2 { margin: 0; font-size: 15px; }
+    .panel-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+    .panel-body { padding: 16px; }
+    .panel-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+    .form-grid .wide { grid-column: 1 / -1; }
+    .check-row { min-height: 42px; display: flex; align-items: center; gap: 9px; }
+    .check-row input { width: 18px; min-height: 18px; margin: 0; accent-color: var(--brand); }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .mode-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; }
+    .mode-option { position: relative; min-width: 0; }
+    .mode-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .mode-option span { min-height: 54px; display: grid; place-items: center; text-align: center; padding: 7px; border: 1px solid var(--line); border-radius: 5px; color: #45534d; background: #fff; font-size: 11px; cursor: pointer; overflow-wrap: anywhere; }
+    .mode-option input:checked + span { color: var(--brand-dark); border-color: var(--brand); background: #edf8f4; box-shadow: inset 0 0 0 1px var(--brand); }
+    .connection-fields { margin-top: 16px; }
+    .node-list { display: grid; border-top: 1px solid var(--line); }
+    .node-row { min-width: 0; padding: 11px 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+    .node-row:last-child { border-bottom: 0; }
+    .node-name { font-weight: 650; overflow-wrap: anywhere; }
+    .node-actions { display: flex; gap: 6px; }
+    .node-actions .button { min-height: 32px; padding: 5px 8px; font-size: 11px; }
+    .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
+    .inline-result { min-height: 40px; margin-top: 12px; padding: 10px 11px; border-left: 3px solid var(--cyan); background: #eef7f8; color: #30545c; border-radius: 3px; overflow-wrap: anywhere; }
+    .inline-result.error { border-left-color: var(--red); background: #fff3f2; color: #7f302c; }
+    .system-list { display: grid; gap: 10px; }
+    .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #edf1ee; }
+    .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
+    .system-row strong { text-align: right; overflow-wrap: anywhere; }
+    .warning-text { color: #8b4e07; }
+    .danger-text { color: var(--red); }
     dialog {
       width: min(460px, calc(100vw - 28px));
       border: 1px solid var(--line);
@@ -2212,6 +3217,7 @@ __AG_WEB_PY_EOF__
       color: var(--ink);
       box-shadow: 0 24px 70px rgba(17, 28, 24, .24);
     }
+    dialog.wide-dialog { width: min(760px, calc(100vw - 28px)); }
     dialog::backdrop { background: rgba(17, 28, 24, .48); }
     .dialog-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .dialog-head h2 { margin: 0; font-size: 16px; }
@@ -2250,6 +3256,7 @@ __AG_WEB_PY_EOF__
       .summary-item:nth-child(2) { border-right: 0; }
       .summary-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
       .metric-grid { grid-template-columns: 1fr 1fr; }
+      .mode-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
     @media (max-width: 760px) {
       .auth-shell { display: block; background: var(--bg); padding: 0; }
@@ -2260,13 +3267,19 @@ __AG_WEB_PY_EOF__
       .brand-mark { width: 34px; height: 34px; flex-basis: 34px; }
       .brand-name { font-size: 17px; }
       .brand-sub, .service-chip { display: none; }
-      .app-nav { padding: 0 14px; gap: 20px; }
+      .app-nav { padding: 0 14px; gap: 12px; }
+      .tab-button { font-size: 12px; }
       .main { padding: 18px 14px 34px; }
       .section-heading { align-items: flex-start; }
       .instances { grid-template-columns: 1fr; }
       .settings-grid { grid-template-columns: 1fr; }
+      .form-grid, .panel-grid { grid-template-columns: 1fr; }
+      .panel.full { grid-column: auto; }
+      .section-heading { flex-wrap: wrap; }
+      .section-actions { width: 100%; justify-content: flex-start; }
       .card-head { align-items: flex-start; }
-      .card-actions { padding: 9px; }
+      .card-head-tools { gap: 6px; }
+      .status-badge { min-width: 74px; padding: 0 8px; }
       .log-view { min-height: 440px; max-height: calc(100vh - 215px); }
     }
     @media (max-width: 430px) {
@@ -2276,6 +3289,9 @@ __AG_WEB_PY_EOF__
       .metric-grid { gap: 12px 8px; }
       .button .optional-label { display: none; }
       .section-heading h1 { font-size: 18px; }
+      .mode-grid { grid-template-columns: 1fr 1fr; }
+      .node-row { grid-template-columns: 1fr; }
+      .node-actions { overflow-x: auto; }
     }
   </style>
 </head>
@@ -2330,14 +3346,20 @@ __AG_WEB_PY_EOF__
     </header>
     <nav class="app-nav" aria-label="控制台视图">
       <button class="tab-button active" data-tab="dashboard"><span data-icon="layout-dashboard"></span>实例</button>
+      <button class="tab-button" data-tab="telegram"><span data-icon="send"></span>Telegram</button>
       <button class="tab-button" data-tab="logs"><span data-icon="terminal"></span>日志</button>
       <button class="tab-button" data-tab="settings"><span data-icon="settings"></span>设置</button>
+      <button class="tab-button" data-tab="system"><span data-icon="wrench"></span>系统</button>
     </nav>
     <main class="main">
       <section id="dashboardTab" class="tab-panel">
         <div class="section-heading">
           <div><h1>实例总览</h1><p id="lastUpdated">尚未刷新</p></div>
-          <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
+          <div class="section-actions">
+            <button id="dryRunButton" class="button secondary" type="button"><span data-icon="flask-conical"></span>演练检测</button>
+            <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
+            <button id="addInstanceButton" class="button secondary" type="button"><span data-icon="plus"></span>添加实例</button>
+          </div>
         </div>
         <div class="summary-band">
           <div class="summary-item"><div class="summary-label"><span data-icon="server"></span>实例</div><div class="summary-value" id="summaryInstances">0</div></div>
@@ -2349,25 +3371,152 @@ __AG_WEB_PY_EOF__
         <div id="instances" class="instances"></div>
       </section>
 
+      <section id="telegramTab" class="tab-panel" hidden>
+        <div class="section-heading">
+          <div><h1>Telegram</h1><p id="telegramCurrent">正在读取当前连接方式</p></div>
+          <button id="telegramTestButton" class="button primary" type="button"><span data-icon="send"></span>发送测试消息</button>
+        </div>
+        <div class="panel-grid">
+          <form id="telegramIdentityForm" class="panel">
+            <div class="panel-head"><div><h2>机器人身份</h2><p>密钥留空时保留原配置</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field wide"><label for="tgToken">Bot Token</label><input id="tgToken" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
+              <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
+              <div class="field"><label for="tgTimeout">请求超时（秒）</label><input id="tgTimeout" type="number" min="3" max="60" required></div>
+              <div class="field"><label for="tgRetries">重试次数</label><input id="tgRetries" type="number" min="1" max="5" required></div>
+            </div>
+            <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
+          </form>
+
+          <form id="connectionForm" class="panel">
+            <div class="panel-head"><div><h2>连接方式</h2><p id="connectionDescription">直连</p></div></div>
+            <div class="panel-body">
+              <div class="mode-grid" role="radiogroup" aria-label="Telegram 连接方式">
+                <label class="mode-option"><input type="radio" name="connectionMode" value="direct"><span>直连</span></label>
+                <label class="mode-option"><input type="radio" name="connectionMode" value="socks5"><span>SOCKS5</span></label>
+                <label class="mode-option"><input type="radio" name="connectionMode" value="http"><span>HTTP/HTTPS</span></label>
+                <label class="mode-option"><input type="radio" name="connectionMode" value="node"><span>节点链接</span></label>
+                <label class="mode-option"><input type="radio" name="connectionMode" value="api_proxy"><span>API 反代</span></label>
+              </div>
+              <div class="connection-fields">
+                <div id="proxyField" class="field" hidden><label for="proxyUrl">代理地址</label><input id="proxyUrl" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
+                <div id="nodeField" class="field" hidden><label for="nodeSelect">已保存节点</label><select id="nodeSelect"></select></div>
+                <div id="apiProxyField" class="field" hidden><label for="apiBaseUrl">Telegram API 基础地址</label><input id="apiBaseUrl" autocomplete="off" placeholder="https://example.com"></div>
+              </div>
+              <div id="connectionResult" class="inline-result" hidden></div>
+            </div>
+            <div class="panel-actions">
+              <button id="connectionTestButton" class="button secondary" type="button"><span data-icon="gauge"></span>单独检测</button>
+              <button class="button primary" type="submit"><span data-icon="save"></span>测试并保存</button>
+            </div>
+          </form>
+
+          <div class="panel full">
+            <div class="panel-head"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks；测试可达后才会保存</p></div><strong id="nodeCount">0 个节点</strong></div>
+            <form id="nodeAddForm" class="panel-body">
+              <div class="field"><label for="nodeUrl">节点链接</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess:// 或 ss://" required></textarea></div>
+              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>测试并保存节点</button></div>
+              <div id="nodeResult" class="inline-result" hidden></div>
+            </form>
+            <div id="nodeList" class="node-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section id="logsTab" class="tab-panel" hidden>
         <div class="section-heading"><div><h1>运行日志</h1><p>最近 200 行</p></div><button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button></div>
         <pre id="logView" class="log-view">正在读取...</pre>
       </section>
 
       <section id="settingsTab" class="tab-panel" hidden>
-        <div class="section-heading"><div><h1>全局设置</h1><p>后台调度参数</p></div></div>
-        <form id="settingsForm" class="settings-panel">
-          <div class="settings-grid">
-            <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
-            <div class="field"><label for="notificationMode">Telegram 通知模式</label><select id="notificationMode"><option value="always">每轮通知</option><option value="events">仅事件与变化</option><option value="errors">仅错误</option></select></div>
-            <div class="field"><label>网页监听</label><input id="webEndpoint" readonly></div>
-            <div class="field"><label>网络策略</label><input id="networkPolicy" readonly></div>
+        <div class="section-heading"><div><h1>设置</h1><p>后台检测与网页入口</p></div></div>
+        <div class="panel-grid">
+          <form id="settingsForm" class="panel">
+            <div class="panel-head"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
+              <div class="field"><label for="notificationMode">Telegram 通知模式</label><select id="notificationMode"><option value="always">每轮通知</option><option value="events">仅事件与变化</option><option value="errors">仅错误</option></select></div>
+              <label class="check-row"><input id="forceIpv4" type="checkbox">网络请求优先使用 IPv4</label>
+              <label class="check-row"><input id="notifyOnStart" type="checkbox">服务启动时发送通知</label>
+              <div class="field"><label for="startWait">开机确认等待（秒）</label><input id="startWait" type="number" min="0" max="600" required></div>
+              <div class="field"><label for="stopWait">关机确认等待（秒）</label><input id="stopWait" type="number" min="0" max="600" required></div>
+              <div class="field"><label for="pollSeconds">状态轮询间隔（秒）</label><input id="pollSeconds" type="number" min="1" max="60" required></div>
+            </div>
+            <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存全局设置</button></div>
+          </form>
+
+          <form id="webSettingsForm" class="panel">
+            <div class="panel-head"><div><h2>网页控制面板</h2><p>支持 HTTP 与 HTTPS 反向代理访问</p></div></div>
+            <div class="panel-body form-grid">
+              <label class="check-row wide"><input id="webEnabled" type="checkbox">启用网页控制面板</label>
+              <div class="field"><label for="webHost">监听方式</label><select id="webHost"><option value="127.0.0.1">仅本机 127.0.0.1</option><option value="0.0.0.0">所有 IPv4 网卡</option></select></div>
+              <div class="field"><label for="webPort">端口</label><input id="webPort" type="number" min="1024" max="65535" required></div>
+              <div class="field wide"><label for="webUsername">登录用户名</label><input id="webUsername" autocomplete="username" required></div>
+              <div class="field"><label for="webPassword">新密码</label><input id="webPassword" type="password" autocomplete="new-password" placeholder="已保存，留空不修改"></div>
+              <div class="field"><label for="webPasswordConfirm">确认新密码</label><input id="webPasswordConfirm" type="password" autocomplete="new-password" placeholder="再次输入新密码"></div>
+              <p id="webWarning" class="wide muted small"></p>
+            </div>
+            <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存并应用</button></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="systemTab" class="tab-panel" hidden>
+        <div class="section-heading"><div><h1>系统</h1><p>服务状态与 GitHub 版本</p></div></div>
+        <div class="panel-grid">
+          <div class="panel">
+            <div class="panel-head"><div><h2>运行环境</h2><p>当前安装实例</p></div></div>
+            <div class="panel-body system-list">
+              <div class="system-row"><span>调度后端</span><strong id="systemBackend">--</strong></div>
+              <div class="system-row"><span>本机 IPv4</span><strong id="systemLocalIp">--</strong></div>
+              <div class="system-row"><span>浏览器地址</span><strong id="systemBrowserUrl">--</strong></div>
+              <div class="system-row"><span>当前版本</span><strong id="systemCurrentVersion">--</strong></div>
+            </div>
+            <div class="panel-actions"><button id="restartServiceButton" class="button warning" type="button"><span data-icon="refresh-cw"></span>重启后台服务</button></div>
           </div>
-          <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
-        </form>
+          <div class="panel">
+            <div class="panel-head"><div><h2>GitHub 更新</h2><p>从正式发布版本更新</p></div></div>
+            <div class="panel-body system-list">
+              <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
+              <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
+              <div id="updateResult" class="inline-result" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
+
+  <dialog id="instanceDialog" class="wide-dialog">
+    <form id="instanceForm">
+      <div class="dialog-head"><h2 id="instanceDialogTitle">添加监控实例</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
+      <div class="dialog-body">
+        <div class="form-grid">
+          <div class="field"><label for="instanceName">备注名称</label><input id="instanceName" required></div>
+          <div class="field"><label for="instanceRegion">Region ID</label><input id="instanceRegion" placeholder="cn-hongkong" required></div>
+          <div class="field wide"><label for="instanceId">ECS 实例 ID</label><input id="instanceId" placeholder="i-xxxxxxxx" required></div>
+          <div class="field"><label for="instanceAk">AccessKey ID</label><input id="instanceAk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
+          <div class="field"><label for="instanceSk">AccessKey Secret</label><input id="instanceSk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
+          <div class="field"><label for="trafficLimit">CDT 关机阈值（GB）</label><input id="trafficLimit" type="number" min="0.01" step="0.01" required></div>
+          <label class="check-row"><input id="actionsEnabled" type="checkbox">允许自动开机与关机</label>
+          <label class="check-row"><input id="billingEnabled" type="checkbox">查询本月实例账单</label>
+          <div id="billingSiteField" class="field"><label for="billingSite">账单站点</label><select id="billingSite"><option value="china">阿里云中国站</option><option value="international">阿里云国际站</option><option value="custom">自定义</option></select></div>
+          <div id="billingCustomFields" class="wide form-grid" hidden>
+            <div class="field"><label for="billingEndpoint">BSS Endpoint</label><input id="billingEndpoint"></div>
+            <div class="field"><label for="billingRegion">BSS 签名 Region</label><input id="billingRegion"></div>
+            <div class="field"><label for="billingCurrencyCode">币种代码</label><input id="billingCurrencyCode" maxlength="8"></div>
+            <div class="field"><label for="billingCurrencySymbol">币种符号</label><input id="billingCurrencySymbol" maxlength="8"></div>
+          </div>
+          <label class="check-row wide"><input id="instanceScheduleEnabled" type="checkbox">启用每日定时开关机</label>
+          <div class="field"><label for="instanceStartTime">每日开机时间</label><input id="instanceStartTime" type="time" required></div>
+          <div class="field"><label for="instanceStopTime">每日关机时间</label><input id="instanceStopTime" type="time" required></div>
+        </div>
+        <div id="instanceValidation" class="inline-result" hidden></div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><span data-icon="save"></span>校验并保存</button></div>
+    </form>
+  </dialog>
 
   <dialog id="scheduleDialog">
     <form id="scheduleForm">
@@ -2404,6 +3553,16 @@ __AG_WEB_PY_EOF__
       "power": '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
       "pause": '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
       "calendar-clock": '<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/>',
+      "send": '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+      "wrench": '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/>',
+      "flask-conical": '<path d="M10 2v7.31"/><path d="M14 9.3V2"/><path d="M8.5 2h7"/><path d="M14 9.3 19.6 19a2 2 0 0 1-1.73 3H6.13a2 2 0 0 1-1.73-3L10 9.3"/><path d="M6.5 16h11"/>',
+      "plus": '<path d="M5 12h14"/><path d="M12 5v14"/>',
+      "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+      "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+      "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+      "pencil": '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+      "trash-2": '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+      "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
       "save": '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
       "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
       "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>'
@@ -2411,7 +3570,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null };
+    const state = { csrf: null, dashboard: null, management: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -2428,7 +3587,12 @@ __AG_WEB_PY_EOF__
       let data;
       try { data = await response.json(); } catch (_) { data = { error: `HTTP ${response.status}` }; }
       if (response.status === 401 && path !== "/api/login") showLogin();
-      if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+      if (!response.ok) {
+        const error = new Error(data.error || `请求失败 (${response.status})`);
+        error.status = response.status;
+        error.details = data.details;
+        throw error;
+      }
       return data;
     }
 
@@ -2454,6 +3618,8 @@ __AG_WEB_PY_EOF__
       $("loginView").hidden = true;
       $("appView").hidden = false;
       loadDashboard();
+      loadManagement();
+      checkForUpdate(false);
       clearInterval(state.timer);
       state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
     }
@@ -2467,11 +3633,17 @@ __AG_WEB_PY_EOF__
     }
 
     function sparkline(points) {
-      if (!points || points.length < 2) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待更多流量样本</text></svg></div>`;
+      if (!points || !points.length) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待流量样本</text></svg></div>`;
       const values = points.map(p => Number(p.value));
       const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, .01);
-      const coords = values.map((value, i) => `${(i / (values.length - 1) * 316 + 2).toFixed(1)},${(53 - ((value - min) / span) * 45).toFixed(1)}`).join(" ");
-      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M2 53 H318" stroke="#e1e7e3" stroke-width="1"/><polyline points="${coords}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/></svg></div>`;
+      const coords = values.map((value, i) => {
+        const x = values.length === 1 ? 160 : i / (values.length - 1) * 316 + 2;
+        return { x: Number(x.toFixed(1)), y: Number((53 - ((value - min) / span) * 45).toFixed(1)) };
+      });
+      const polyline = coords.map(point => `${point.x},${point.y}`).join(" ");
+      const hits = coords.map((point, index) => `<circle class="chart-hit" cx="${point.x}" cy="${point.y}" r="9" tabindex="0" data-point="${index}" data-x="${point.x}" aria-label="查看第 ${index + 1} 个检测样本"></circle>`).join("");
+      const latest = coords[coords.length - 1];
+      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M2 53 H318" stroke="#e1e7e3" stroke-width="1"/>${coords.length > 1 ? `<polyline points="${polyline}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>` : ""}<circle class="chart-point" cx="${latest.x}" cy="${latest.y}" r="3"></circle>${hits}</svg><div class="chart-tooltip" role="tooltip" hidden></div></div>`;
     }
 
     function instanceCard(item) {
@@ -2484,7 +3656,23 @@ __AG_WEB_PY_EOF__
       const powerAction = item.status === "Running" ? "stop" : "start";
       const powerLabel = powerAction === "start" ? "开机" : "关机";
       return `<article class="instance-card" data-index="${item.index}">
-        <div class="card-head"><div><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div><div class="status-badge ${status.cls}"><span class="dot ${status.cls === "stopped" || status.cls === "error" ? "bad" : ""}"></span>${esc(status.label)}</div></div>
+        <div class="card-head">
+          <div><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div>
+          <div class="card-head-tools">
+            <div class="status-badge ${status.cls}"><span class="dot ${status.cls === "stopped" || status.cls === "error" ? "bad" : ""}"></span>${esc(status.label)}</div>
+            <details class="instance-tools">
+              <summary class="icon-button" title="单机设置" aria-label="${esc(item.name)} 单机设置">${icon("settings")}</summary>
+              <div class="instance-menu" role="menu" aria-label="${esc(item.name)} 单机操作">
+                <button class="menu-button" type="button" role="menuitem" data-action="power" data-power="${powerAction}" ${["Starting","Stopping","Pending"].includes(item.status) ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
+                <button class="menu-button" type="button" role="menuitem" data-action="schedule">${icon("calendar-clock")}<span>定时计划</span></button>
+                <button class="menu-button ${item.paused ? "" : "warning"}" type="button" role="menuitem" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复监控" : "暂停监控"}</span></button>
+                <button class="menu-button" type="button" role="menuitem" data-action="edit">${icon("pencil")}<span>编辑配置</span></button>
+                <button class="menu-button" type="button" role="menuitem" data-action="validate">${icon("shield-check")}<span>只读校验</span></button>
+                <button class="menu-button danger" type="button" role="menuitem" data-action="delete">${icon("trash-2")}<span>删除监控实例</span></button>
+              </div>
+            </details>
+          </div>
+        </div>
         <div class="card-body">
           <div class="metric-grid">
             <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
@@ -2498,11 +3686,6 @@ __AG_WEB_PY_EOF__
           <div class="instance-meta">下一动作：${esc(next)}</div>
         </div>
         <div class="result-line">${esc(item.message)}</div>
-        <div class="card-actions">
-          <button class="button ${powerAction === "stop" ? "danger" : "primary"}" data-action="power" data-power="${powerAction}" ${["Starting","Stopping","Pending"].includes(item.status) ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
-          <button class="button secondary" data-action="schedule">${icon("calendar-clock")}<span>计划</span></button>
-          <button class="button ${item.paused ? "secondary" : "warning"}" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复" : "暂停"}</span></button>
-        </div>
       </article>`;
     }
 
@@ -2524,16 +3707,70 @@ __AG_WEB_PY_EOF__
       $("notice").hidden = !notices.length;
       $("noticeText").textContent = notices.join("；");
       $("runButton").disabled = Boolean(data.job && data.job.running);
+      $("dryRunButton").disabled = Boolean(data.job && data.job.running);
       $("runButton").innerHTML = data.job && data.job.running ? `${icon("refresh-cw", "spin")}检测中` : `${icon("play")}立即检测`;
       $("instances").innerHTML = data.users.length ? data.users.map(instanceCard).join("") : `<div class="empty"><div>${icon("server")}<p>暂无监控实例</p></div></div>`;
-      $("intervalSeconds").value = data.settings.interval_seconds;
-      $("notificationMode").value = data.settings.notification_mode;
-      $("webEndpoint").value = `http://${data.settings.web_host}:${data.settings.web_port}`;
-      $("networkPolicy").value = data.settings.force_ipv4 ? "IPv4 优先" : "系统默认";
+    }
+
+    function setInlineResult(element, message, isError = false) {
+      element.textContent = message;
+      element.classList.toggle("error", isError);
+      element.hidden = !message;
+    }
+
+    function renderManagement(data) {
+      state.management = data;
+      const telegram = data.telegram;
+      $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
+      $("connectionDescription").textContent = telegram.connection_description;
+      $("tgToken").value = "";
+      $("tgToken").placeholder = telegram.bot_token_configured ? "已保存，留空不修改" : "尚未保存，请输入 Bot Token";
+      $("tgChatId").value = telegram.chat_id;
+      $("tgTimeout").value = telegram.timeout_seconds;
+      $("tgRetries").value = telegram.retries;
+      const mode = document.querySelector(`input[name="connectionMode"][value="${telegram.connection_mode}"]`) || document.querySelector('input[name="connectionMode"][value="direct"]');
+      mode.checked = true;
+      $("proxyUrl").value = "";
+      $("proxyUrl").placeholder = telegram.proxy_configured ? "已保存，留空不修改" : "请输入代理地址";
+      $("apiBaseUrl").value = "";
+      $("apiBaseUrl").placeholder = telegram.api_base_configured ? "已保存，留空不修改" : "https://example.com";
+      $("nodeSelect").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<option value="${node.index}" ${node.active ? "selected" : ""}>${esc(node.description)}${node.active ? "（当前）" : ""}</option>`).join("") : '<option value="">尚未保存节点</option>';
+      $("nodeCount").textContent = `${telegram.nodes.length} 个节点`;
+      $("nodeList").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<div class="node-row" data-node-index="${node.index}"><div><div class="node-name">${esc(node.description)}</div><div class="muted small">节点 #${node.index + 1} ${node.active ? '<span class="active-mark">· 当前使用</span>' : ""}</div></div><div class="node-actions"><button class="button secondary" type="button" data-node-action="test">${icon("gauge")}测试</button><button class="button primary" type="button" data-node-action="select">${icon("shield-check")}选用</button><button class="button danger" type="button" data-node-action="delete">${icon("trash-2")}删除</button></div></div>`).join("") : '<div class="node-row muted">尚未保存节点</div>';
+      updateConnectionFields();
+
+      const settings = data.settings;
+      $("intervalSeconds").value = settings.interval_seconds;
+      $("notificationMode").value = settings.notification_mode;
+      $("forceIpv4").checked = settings.force_ipv4;
+      $("notifyOnStart").checked = settings.notify_on_daemon_start;
+      $("startWait").value = settings.start_wait_seconds;
+      $("stopWait").value = settings.stop_wait_seconds;
+      $("pollSeconds").value = settings.start_poll_seconds;
+
+      const web = data.web;
+      $("webEnabled").checked = web.enabled;
+      $("webHost").value = web.host;
+      $("webPort").value = web.port;
+      $("webUsername").value = web.username;
+      $("webPassword").value = "";
+      $("webPasswordConfirm").value = "";
+      $("webPassword").placeholder = web.password_configured ? "已保存，留空不修改" : "至少 8 个字符";
+      updateWebWarning();
+      $("systemBackend").textContent = data.backend;
+      $("systemLocalIp").textContent = web.local_ip || "未检测到";
+      $("systemBrowserUrl").textContent = web.browser_url;
+      $("systemCurrentVersion").textContent = `v${data.version}`;
+      $("updateCurrentVersion").textContent = `v${data.version}`;
     }
 
     async function loadDashboard(showErrors = true) {
       try { renderDashboard(await api("/api/dashboard")); }
+      catch (error) { if (showErrors) toast(error.message, true); }
+    }
+
+    async function loadManagement(showErrors = true) {
+      try { renderManagement(await api("/api/management")); }
       catch (error) { if (showErrors) toast(error.message, true); }
     }
 
@@ -2543,10 +3780,150 @@ __AG_WEB_PY_EOF__
       catch (error) { $("logView").textContent = error.message; }
     }
 
+    function currentConnectionMode() {
+      return document.querySelector('input[name="connectionMode"]:checked')?.value || "direct";
+    }
+
+    function updateConnectionFields() {
+      const mode = currentConnectionMode();
+      $("proxyField").hidden = !["socks5", "http"].includes(mode);
+      $("nodeField").hidden = mode !== "node";
+      $("apiProxyField").hidden = mode !== "api_proxy";
+    }
+
+    function connectionPayload(save) {
+      const mode = currentConnectionMode();
+      const body = { connection_mode: mode, save };
+      if (["socks5", "http"].includes(mode)) body.proxy_url = $("proxyUrl").value.trim();
+      if (mode === "api_proxy") body.api_base_url = $("apiBaseUrl").value.trim();
+      if (mode === "node") body.node_index = Number($("nodeSelect").value);
+      return body;
+    }
+
+    function telegramTestText(result) {
+      return `测试成功：@${result.username} · ${result.latency_ms} ms（${result.latency_attempts} 次平均）· ${result.connection}`;
+    }
+
+    function updateWebWarning() {
+      const publicHttp = $("webHost").value === "0.0.0.0";
+      $("webWarning").textContent = publicHttp ? "所有网卡监听允许直接 HTTP 访问，用户名和密码会以明文经过网络；建议配置防火墙或 HTTPS 反向代理。" : "仅本机监听适合 SSH 隧道或 HTTPS 反向代理。";
+      $("webWarning").classList.toggle("warning-text", publicHttp);
+    }
+
+    function billingFieldsVisibility() {
+      const enabled = $("billingEnabled").checked;
+      $("billingSiteField").hidden = !enabled;
+      $("billingCustomFields").hidden = !enabled || $("billingSite").value !== "custom";
+    }
+
+    function openInstanceDialog(index = null) {
+      state.instanceIndex = index;
+      const existing = index === null ? null : state.management?.instances.find(item => item.index === index);
+      $("instanceDialogTitle").textContent = existing ? `编辑 ${existing.name}` : "添加监控实例";
+      $("instanceName").value = existing?.name || "";
+      $("instanceRegion").value = existing?.region || "";
+      $("instanceId").value = existing?.instance_id || "";
+      $("instanceAk").value = "";
+      $("instanceSk").value = "";
+      $("instanceAk").placeholder = existing?.access_key_configured ? "已保存，留空不修改" : "请输入 AccessKey ID";
+      $("instanceSk").placeholder = existing?.secret_key_configured ? "已保存，留空不修改" : "请输入 AccessKey Secret";
+      $("trafficLimit").value = existing?.traffic_limit_gb ?? 180;
+      $("actionsEnabled").checked = existing?.actions_enabled ?? true;
+      $("billingEnabled").checked = existing?.billing.enabled ?? true;
+      $("billingSite").value = existing?.billing.site || "china";
+      $("billingEndpoint").value = existing?.billing.endpoint || "";
+      $("billingRegion").value = existing?.billing.region || "";
+      $("billingCurrencyCode").value = existing?.billing.currency_code || "";
+      $("billingCurrencySymbol").value = existing?.billing.currency_symbol || "";
+      $("instanceScheduleEnabled").checked = existing?.schedule.enabled ?? false;
+      $("instanceStartTime").value = existing?.schedule.start_time || "08:00";
+      $("instanceStopTime").value = existing?.schedule.stop_time || "23:00";
+      setInlineResult($("instanceValidation"), "");
+      billingFieldsVisibility();
+      $("instanceDialog").showModal();
+    }
+
+    function instancePayload(forceSave = false) {
+      return {
+        name: $("instanceName").value.trim(),
+        ak: $("instanceAk").value.trim(),
+        sk: $("instanceSk").value.trim(),
+        region: $("instanceRegion").value.trim(),
+        instance_id: $("instanceId").value.trim(),
+        traffic_limit_gb: Number($("trafficLimit").value),
+        actions_enabled: $("actionsEnabled").checked,
+        billing: {
+          enabled: $("billingEnabled").checked,
+          site: $("billingSite").value,
+          endpoint: $("billingEndpoint").value.trim(),
+          region: $("billingRegion").value.trim(),
+          currency_code: $("billingCurrencyCode").value.trim(),
+          currency_symbol: $("billingCurrencySymbol").value.trim(),
+        },
+        schedule: {
+          enabled: $("instanceScheduleEnabled").checked,
+          start_time: $("instanceStartTime").value,
+          stop_time: $("instanceStopTime").value,
+        },
+        force_save: forceSave,
+      };
+    }
+
+    function validationText(result) {
+      if (!result) return "未返回校验结果";
+      const details = [];
+      if (result.traffic_gb !== null && result.traffic_gb !== undefined) details.push(`CDT ${fmtNum(result.traffic_gb)} GB`);
+      if (result.status) details.push(`ECS ${result.status}`);
+      if (result.billing_enabled && result.bill_amount !== null && result.bill_amount !== undefined) details.push(`账单 ${fmtNum(result.bill_amount)} ${result.bill_currency || ""}`);
+      if (result.errors?.length) details.push(result.errors.join("；"));
+      return `${result.ok ? "校验成功" : "校验失败"}${details.length ? "：" + details.join(" · ") : ""}`;
+    }
+
+    function actionText(point) {
+      const labels = {
+        start: "保活开机",
+        stop: "流量阈值关机",
+        schedule_start: "定时开机",
+        schedule_stop: "定时关机",
+        manual_start: "网页手动开机",
+        manual_stop: "网页手动关机",
+      };
+      if (!point.action || point.action === "none") return "仅检测，无动作";
+      const label = labels[point.action] || point.action;
+      return point.action_performed ? `${label}（已执行）` : `${label}（未执行）`;
+    }
+
+    function showChartTooltip(target) {
+      const card = target.closest("[data-index]");
+      const item = state.dashboard?.users.find(value => value.index === Number(card?.dataset.index));
+      const point = item?.history?.[Number(target.dataset.point)];
+      const container = target.closest(".sparkline");
+      const tooltip = container?.querySelector(".chart-tooltip");
+      if (!point || !tooltip) return;
+      const before = point.status_before;
+      const after = point.status || "Unknown";
+      const status = before && before !== after ? `${before} → ${after}` : after;
+      tooltip.innerHTML = `<div class="tooltip-title">${esc(fmtDate(point.at))}</div><div class="tooltip-row"><span>当时流量</span><strong>${fmtNum(point.value)} GB</strong></div><div class="tooltip-row"><span>ECS 状态</span><strong>${esc(status)}</strong></div><div class="tooltip-row"><span>执行动作</span><strong>${esc(actionText(point))}</strong></div><div class="tooltip-row"><span>检测结果</span><strong>${esc(point.message || "历史样本无详细结果")}</strong></div>`;
+      tooltip.hidden = false;
+      requestAnimationFrame(() => {
+        const width = container.clientWidth;
+        const desired = Number(target.dataset.x) / 320 * width;
+        const left = Math.max(4, Math.min(width - tooltip.offsetWidth - 4, desired - tooltip.offsetWidth / 2));
+        tooltip.style.left = `${left}px`;
+        tooltip.style.setProperty("--tip-arrow", `${Math.max(12, Math.min(tooltip.offsetWidth - 12, desired - left))}px`);
+      });
+    }
+
+    function hideChartTooltip(target) {
+      const tooltip = target.closest(".sparkline")?.querySelector(".chart-tooltip");
+      if (tooltip) tooltip.hidden = true;
+    }
+
     document.querySelectorAll(".tab-button").forEach(button => button.addEventListener("click", () => {
       document.querySelectorAll(".tab-button").forEach(x => x.classList.toggle("active", x === button));
       document.querySelectorAll(".tab-panel").forEach(x => x.hidden = x.id !== `${button.dataset.tab}Tab`);
       if (button.dataset.tab === "logs") loadLogs();
+      if (["telegram", "settings", "system"].includes(button.dataset.tab)) loadManagement(false);
     }));
 
     $("loginForm").addEventListener("submit", async event => {
@@ -2560,18 +3937,46 @@ __AG_WEB_PY_EOF__
     });
 
     $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
-    $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await loadDashboard(); $("refreshButton").querySelector("svg").classList.remove("spin"); });
+    $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await Promise.all([loadDashboard(), loadManagement()]); $("refreshButton").querySelector("svg").classList.remove("spin"); });
     $("logsRefresh").addEventListener("click", loadLogs);
     $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
-    $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: {} }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+    $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: false } }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+    $("dryRunButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: true } }); toast("演练检测已启动，不会执行开关机"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+    $("addInstanceButton").addEventListener("click", async () => { if (!state.management) await loadManagement(); openInstanceDialog(); });
 
     $("instances").addEventListener("click", async event => {
       const button = event.target.closest("button[data-action]");
       if (!button) return;
+      button.closest(".instance-tools")?.removeAttribute("open");
       const card = button.closest("[data-index]");
       const index = Number(card.dataset.index);
       const item = state.dashboard.users.find(x => x.index === index);
       if (!item) return;
+      if (button.dataset.action === "edit") {
+        if (!state.management) await loadManagement();
+        openInstanceDialog(index);
+        return;
+      }
+      if (button.dataset.action === "validate") {
+        button.disabled = true;
+        try {
+          const data = await api(`/api/instances/${index}/validate`, { method: "POST", body: {} });
+          toast(validationText(data.result), !data.result.ok);
+        } catch (error) { toast(error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
+      if (button.dataset.action === "delete") {
+        if (!confirm(`确认删除 ${item.name} (${item.instance_id})？此操作不会删除阿里云 ECS。`)) return;
+        button.disabled = true;
+        try {
+          await api(`/api/instances/${index}/delete`, { method: "POST", body: { instance_id: item.instance_id } });
+          toast("监控实例已删除");
+          await Promise.all([loadDashboard(), loadManagement()]);
+        } catch (error) { toast(error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
       if (button.dataset.action === "schedule") {
         state.scheduleIndex = index;
         $("scheduleTitle").textContent = `${item.name} · 定时开关机`;
@@ -2596,17 +4001,165 @@ __AG_WEB_PY_EOF__
       }
     });
 
-    document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => $("scheduleDialog").close()));
+    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
+    $("instances").addEventListener("pointerout", event => { const target = event.target.closest(".chart-hit"); if (target && !target.contains(event.relatedTarget)) hideChartTooltip(target); });
+    $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
+    $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });
+    $("instances").addEventListener("pointerdown", event => { const target = event.target.closest(".chart-hit"); if (target) { event.stopPropagation(); showChartTooltip(target); } });
+    document.addEventListener("pointerdown", event => { if (!event.target.closest(".sparkline")) document.querySelectorAll(".chart-tooltip").forEach(element => { element.hidden = true; }); });
+    document.addEventListener("click", event => { document.querySelectorAll(".instance-tools[open]").forEach(element => { if (!element.contains(event.target)) element.removeAttribute("open"); }); });
+
+    document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
     $("scheduleForm").addEventListener("submit", async event => {
       event.preventDefault();
       const enabled = $("scheduleEnabled").checked, start_time = $("startTime").value, stop_time = $("stopTime").value;
       if (enabled && start_time === stop_time) { toast("开机时间和关机时间不能相同", true); return; }
-      try { await api(`/api/instances/${state.scheduleIndex}/schedule`, { method: "POST", body: { enabled, start_time, stop_time } }); $("scheduleDialog").close(); toast("定时计划已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+      try { await api(`/api/instances/${state.scheduleIndex}/schedule`, { method: "POST", body: { enabled, start_time, stop_time } }); $("scheduleDialog").close(); toast("定时计划已保存"); await Promise.all([loadDashboard(), loadManagement()]); } catch (error) { toast(error.message, true); }
+    });
+
+    $("billingEnabled").addEventListener("change", billingFieldsVisibility);
+    $("billingSite").addEventListener("change", billingFieldsVisibility);
+    $("instanceForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submit = event.currentTarget.querySelector('button[type="submit"]');
+      const save = async forceSave => {
+        const path = state.instanceIndex === null ? "/api/instances" : `/api/instances/${state.instanceIndex}`;
+        const data = await api(path, { method: "POST", body: instancePayload(forceSave) });
+        setInlineResult($("instanceValidation"), validationText(data.result.validation), !data.result.validation.ok);
+        $("instanceDialog").close();
+        toast("实例配置已保存");
+        await Promise.all([loadDashboard(), loadManagement()]);
+      };
+      submit.disabled = true;
+      try { await save(false); }
+      catch (error) {
+        setInlineResult($("instanceValidation"), error.details ? validationText(error.details) : error.message, true);
+        if (error.status === 422 && error.details && confirm("实例校验失败。仍然保存并让定时检测继续报告错误？")) {
+          try { await save(true); } catch (forceError) { setInlineResult($("instanceValidation"), forceError.message, true); }
+        }
+      } finally { submit.disabled = false; }
     });
 
     $("settingsForm").addEventListener("submit", async event => {
       event.preventDefault();
-      try { await api("/api/settings", { method: "POST", body: { interval_seconds: Number($("intervalSeconds").value), notification_mode: $("notificationMode").value } }); toast("全局设置已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+      try {
+        await api("/api/settings", { method: "POST", body: {
+          interval_seconds: Number($("intervalSeconds").value),
+          notification_mode: $("notificationMode").value,
+          force_ipv4: $("forceIpv4").checked,
+          notify_on_daemon_start: $("notifyOnStart").checked,
+          start_wait_seconds: Number($("startWait").value),
+          stop_wait_seconds: Number($("stopWait").value),
+          start_poll_seconds: Number($("pollSeconds").value),
+        } });
+        toast("全局设置已保存");
+        await Promise.all([loadDashboard(), loadManagement()]);
+      } catch (error) { toast(error.message, true); }
+    });
+
+    $("telegramIdentityForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value) } });
+        $("tgToken").value = "";
+        toast("Telegram 机器人配置已保存");
+        await loadManagement();
+      } catch (error) { toast(error.message, true); }
+    });
+
+    $("telegramTestButton").addEventListener("click", async () => {
+      $("telegramTestButton").disabled = true;
+      try { const data = await api("/api/telegram/test", { method: "POST", body: {} }); toast(telegramTestText(data.result)); }
+      catch (error) { toast(error.message, true); }
+      finally { $("telegramTestButton").disabled = false; }
+    });
+
+    document.querySelectorAll('input[name="connectionMode"]').forEach(input => input.addEventListener("change", updateConnectionFields));
+    async function submitConnection(save) {
+      const target = $("connectionResult");
+      setInlineResult(target, "正在连接 Telegram Bot API...");
+      try {
+        const data = await api("/api/telegram/connection", { method: "POST", body: connectionPayload(save) });
+        setInlineResult(target, `${telegramTestText(data.result)}${save ? " · 已保存" : " · 未修改当前配置"}`);
+        $("proxyUrl").value = "";
+        $("apiBaseUrl").value = "";
+        if (save) await loadManagement();
+      } catch (error) { setInlineResult(target, error.message, true); }
+    }
+    $("connectionTestButton").addEventListener("click", () => submitConnection(false));
+    $("connectionForm").addEventListener("submit", event => { event.preventDefault(); submitConnection(true); });
+
+    $("nodeAddForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const submit = event.currentTarget.querySelector('button[type="submit"]');
+      submit.disabled = true;
+      setInlineResult($("nodeResult"), "正在测试节点到 Telegram Bot API 的往返延迟...");
+      try {
+        const data = await api("/api/telegram/nodes", { method: "POST", body: { node_url: $("nodeUrl").value.trim() } });
+        $("nodeUrl").value = "";
+        setInlineResult($("nodeResult"), `${telegramTestText(data.result)} · 节点已保存，当前连接方式未切换`);
+        await loadManagement();
+      } catch (error) { setInlineResult($("nodeResult"), error.message, true); }
+      finally { submit.disabled = false; }
+    });
+
+    $("nodeList").addEventListener("click", async event => {
+      const button = event.target.closest("button[data-node-action]");
+      if (!button) return;
+      const row = button.closest("[data-node-index]");
+      const index = Number(row.dataset.nodeIndex), action = button.dataset.nodeAction;
+      if (action === "delete" && !confirm(`确认删除节点 #${index + 1}？`)) return;
+      button.disabled = true;
+      setInlineResult($("nodeResult"), action === "delete" ? "正在删除节点..." : "正在测试节点到 Telegram Bot API 的往返延迟...");
+      try {
+        const data = await api(`/api/telegram/nodes/${index}/${action}`, { method: "POST", body: {} });
+        const message = action === "delete" ? "节点已删除" : `${telegramTestText(data.result)}${action === "select" ? " · 已切换并保存" : " · 仅测试，未切换"}`;
+        setInlineResult($("nodeResult"), message);
+        await loadManagement();
+      } catch (error) { setInlineResult($("nodeResult"), error.message, true); }
+      finally { button.disabled = false; }
+    });
+
+    $("webHost").addEventListener("change", updateWebWarning);
+    $("webSettingsForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const publicHost = $("webHost").value === "0.0.0.0";
+      const changedToPublic = publicHost && state.management?.web.host !== "0.0.0.0";
+      const confirmed = !changedToPublic || confirm("所有网卡监听下，直接 HTTP 访问会明文传输登录密码。确认继续？");
+      if (!confirmed) return;
+      try {
+        const data = await api("/api/web-settings", { method: "POST", body: { enabled: $("webEnabled").checked, host: $("webHost").value, port: Number($("webPort").value), username: $("webUsername").value.trim(), password: $("webPassword").value, password_confirm: $("webPasswordConfirm").value, confirm_public: confirmed } });
+        toast(data.web.restart_required ? "网页配置已保存，后台服务即将重启" : "网页配置已保存");
+        $("webPassword").value = "";
+        $("webPasswordConfirm").value = "";
+      } catch (error) { toast(error.message, true); }
+    });
+
+    async function checkForUpdate(showErrors = true) {
+      $("checkUpdateButton").disabled = true;
+      try {
+        const data = await api("/api/update");
+        state.update = data;
+        const docker = data.deployment === "docker";
+        $("updateCurrentVersion").textContent = `v${data.current_version}`;
+        $("updateLatestVersion").textContent = data.latest_version ? `v${data.latest_version}` : "暂时无法获取";
+        $("installUpdateButton").disabled = !data.available || docker;
+        setInlineResult($("updateResult"), data.available ? `发现新版本 v${data.latest_version}${docker ? "；Docker 请在宿主机拉取源码并重建镜像" : ""}` : data.latest_version ? `当前 v${data.current_version} 已经是最新版本` : "GitHub 版本检查暂时不可用", !data.latest_version);
+      } catch (error) {
+        setInlineResult($("updateResult"), error.message, true);
+        if (showErrors) toast(error.message, true);
+      } finally { $("checkUpdateButton").disabled = false; }
+    }
+    $("checkUpdateButton").addEventListener("click", () => checkForUpdate(true));
+    $("installUpdateButton").addEventListener("click", async () => {
+      if (!state.update?.available || !confirm(`确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`)) return;
+      try { await api("/api/update/install", { method: "POST", body: {} }); toast("更新程序已启动，完成后后台服务会重新加载"); $("installUpdateButton").disabled = true; }
+      catch (error) { toast(error.message, true); }
+    });
+    $("restartServiceButton").addEventListener("click", async () => {
+      if (!confirm("确认重启后台服务？网页可能短暂断开。")) return;
+      try { await api("/api/service/restart", { method: "POST", body: {} }); toast("后台服务重启已安排"); }
+      catch (error) { toast(error.message, true); }
     });
 
     (async function init() {
@@ -3867,7 +5420,13 @@ def update_state(
                     item["instance_id"]: {
                         "traffic_gb": item.get("traffic_gb"),
                         "status": item.get("status_after"),
+                        "status_before": item.get("status_before"),
+                        "status_after": item.get("status_after"),
                         "bill_amount": item.get("bill_amount"),
+                        "action": item.get("action", "none"),
+                        "action_performed": bool(item.get("action_performed", False)),
+                        "message": item.get("message", ""),
+                        "level": item.get("level", "unknown"),
                     }
                     for item in results
                 },
@@ -4211,8 +5770,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.3.2"
-LOCAL_RELEASE_ID = "795382114f2112d80ee012837312f6b6ae21b70e03c7c1e4254fe8e890e21447"
+APP_VERSION = "1.4.0"
+LOCAL_RELEASE_ID = "9029a356a19582c441bb81c3e9cf0b60da43add9d64f523ab7f73d83a0a7f6f3"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -5285,10 +6844,25 @@ def parse_version_manifest(payload):
     }
 
 
+def local_release_id():
+    try:
+        return parse_release_id(LOCAL_RELEASE_ID)
+    except Exception:
+        pass
+    for path in (APP_DIR / "version.json", APP_DIR.parent / "version.json"):
+        try:
+            return parse_version_manifest(path.read_text(encoding="utf-8"))[
+                "release_id"
+            ]
+        except (OSError, ValueError, guard.GuardError):
+            continue
+    raise guard.GuardError("本地版本构建标识无效")
+
+
 def check_for_github_update():
     """Return remote release details, or None when the startup check is unavailable."""
     try:
-        local_release_id = parse_release_id(LOCAL_RELEASE_ID)
+        current_release_id = local_release_id()
     except Exception:
         return None
     try:
@@ -5300,11 +6874,16 @@ def check_for_github_update():
         remote = parse_version_manifest(payload)
     except Exception:
         return None
-    remote["available"] = remote["release_id"] != local_release_id
+    remote["available"] = remote["release_id"] != current_release_id
     return remote
 
 
 def update_from_github(confirm_update=True, release_info=None):
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        title("更新 GitHub 版本")
+        print("Docker 部署请在宿主机执行：")
+        print("git pull && docker compose up -d --build")
+        return False
     title("更新 GitHub 版本")
     print("当前版本: v{}".format(APP_VERSION))
     try:
@@ -5511,7 +7090,8 @@ def parse_args(argv=None):
     subparsers.add_parser("menu", help="打开管理面板")
     subparsers.add_parser("status", help="显示状态")
     subparsers.add_parser("add", help="添加实例")
-    subparsers.add_parser("update", help="从 GitHub 更新程序")
+    update = subparsers.add_parser("update", help="从 GitHub 更新程序")
+    update.add_argument("--yes", action="store_true", help="无需交互确认")
     subparsers.add_parser("version", help="显示当前版本")
     subparsers.add_parser("web", help="显示网页控制面板状态")
     return parser.parse_args(argv)
@@ -5531,7 +7111,7 @@ def main(argv=None):
             add_user(config)
             return 0
         if args.command == "update":
-            result = update_from_github()
+            result = update_from_github(confirm_update=not args.yes)
             return 1 if result is False else 0
         if args.command == "version":
             print("Aliyun Guard v{}".format(APP_VERSION))
@@ -5861,7 +7441,7 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -5871,6 +7451,7 @@ __AG_UNINSTALL_SH_EOF__
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
         "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/web_actions.py" \
         "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"
     sh -n "$APP_DIR/uninstall.sh"
