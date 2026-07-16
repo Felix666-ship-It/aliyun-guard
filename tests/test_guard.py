@@ -406,8 +406,34 @@ class GuardNotificationTests(unittest.TestCase):
         self.assertNotIn(base_url, text)
         self.assertNotIn("secret", text)
 
+    def test_dormant_saved_node_is_redacted_from_errors(self):
+        node_uuid = "11111111-1111-1111-1111-111111111111"
+        node_url = "vless://{}@example.com:443?security=tls#Saved".format(node_uuid)
+        text = guard.compact_error(
+            RuntimeError("request failed for {}".format(node_url)),
+            secrets=guard.telegram_secrets({"node_urls": [node_url]}),
+        )
+        self.assertNotIn(node_url, text)
+        self.assertNotIn(node_uuid, text)
+
 
 class ConfigTests(unittest.TestCase):
+    def test_load_config_migrates_legacy_node_url_to_saved_nodes(self):
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Legacy"
+        )
+        config = make_config()
+        config["telegram"].update({"connection_mode": "direct", "node_url": node_url})
+        config["telegram"].pop("node_urls", None)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with mock.patch.object(guard, "CONFIG_FILE", config_path):
+                loaded = guard.load_config()
+        self.assertEqual(loaded["telegram"]["node_url"], node_url)
+        self.assertEqual(loaded["telegram"]["node_urls"], [node_url])
+
     def test_rejects_invalid_telegram_proxy(self):
         config = make_config()
         config["telegram"].update(
@@ -720,6 +746,7 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertTrue(test_ok)
         self.assertEqual(result["connection_mode"], "node")
         self.assertEqual(result["node_url"], node_url)
+        self.assertEqual(result["node_urls"], [node_url])
         test.assert_called_once_with(result, latency_attempts=3, result_details=mock.ANY)
 
     def test_connection_menu_cancel_returns_without_save(self):
@@ -746,6 +773,96 @@ class FirstSetupFlowTests(unittest.TestCase):
             output.getvalue(),
         )
         self.assertIn("当前节点: VLESS 节点（Hong Kong 01）", output.getvalue())
+
+    def test_connection_menu_shows_legacy_saved_node_count_while_direct(self):
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Hong%20Kong%2001"
+        )
+        candidate = dict(guard.DEFAULT_CONFIG["telegram"])
+        candidate.update(
+            {"connection_mode": "direct", "node_url": node_url, "node_urls": []}
+        )
+        output = io.StringIO()
+        with mock.patch.object(manager, "prompt_int", return_value=7), mock.patch(
+            "sys.stdout", output
+        ):
+            manager.configure_telegram_connection(candidate, force_ipv4=False)
+        self.assertIn("[已保存 1 个]", output.getvalue())
+
+    def test_saved_node_menu_recovers_and_selects_legacy_node(self):
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Hong%20Kong%2001"
+        )
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {"connection_mode": "direct", "node_url": node_url, "node_urls": []}
+        )
+        output = io.StringIO()
+        with mock.patch.object(manager, "prompt_int", return_value=1), mock.patch(
+            "sys.stdout", output
+        ):
+            selected = manager.configure_telegram_nodes(telegram)
+        self.assertTrue(selected)
+        self.assertEqual(telegram["connection_mode"], "node")
+        self.assertEqual(telegram["node_url"], node_url)
+        self.assertEqual(telegram["node_urls"], [node_url])
+        self.assertIn("VLESS 节点（Hong Kong 01）", output.getvalue())
+        self.assertIn("（上次使用）", output.getvalue())
+
+    def test_saved_node_menu_adds_a_second_node(self):
+        first = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#First"
+        )
+        second = "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@ss.example.com:8388#Second"
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {"connection_mode": "direct", "node_url": first, "node_urls": [first]}
+        )
+        with mock.patch.object(manager, "prompt_int", return_value=2), mock.patch.object(
+            manager, "prompt_secret", return_value=second
+        ):
+            selected = manager.configure_telegram_nodes(telegram)
+        self.assertTrue(selected)
+        self.assertEqual(telegram["connection_mode"], "node")
+        self.assertEqual(telegram["node_url"], second)
+        self.assertEqual(telegram["node_urls"], [first, second])
+
+    def test_adding_duplicate_node_does_not_increase_count(self):
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Existing"
+        )
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {"connection_mode": "direct", "node_url": node_url, "node_urls": [node_url]}
+        )
+        with mock.patch.object(manager, "prompt_secret", return_value=node_url):
+            selected = manager.add_telegram_node(telegram)
+        self.assertTrue(selected)
+        self.assertEqual(telegram["node_urls"], [node_url])
+        self.assertEqual(telegram["node_url"], node_url)
+
+    def test_deleting_active_node_selects_remaining_node(self):
+        first = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#First"
+        )
+        second = "ss://YWVzLTEyOC1nY206cGFzc3dvcmQ@ss.example.com:8388#Second"
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {"connection_mode": "node", "node_url": first, "node_urls": [first, second]}
+        )
+        with mock.patch.object(manager, "prompt_int", return_value=1), mock.patch.object(
+            manager, "yes_no", return_value=True
+        ):
+            deleted = manager.delete_telegram_node(telegram, [first, second])
+        self.assertTrue(deleted)
+        self.assertEqual(telegram["connection_mode"], "node")
+        self.assertEqual(telegram["node_url"], second)
+        self.assertEqual(telegram["node_urls"], [second])
 
     def test_standalone_connection_cancel_keeps_config(self):
         config = make_config()

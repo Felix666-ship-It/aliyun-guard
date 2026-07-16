@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
         "connection_mode": "direct",
         "proxy_url": "",
         "node_url": "",
+        "node_urls": [],
         "api_base_url": "https://api.telegram.org",
     },
     "start_wait_seconds": 90,
@@ -121,6 +122,25 @@ def deep_merge(defaults, current):
     return result
 
 
+def telegram_node_urls(telegram):
+    """Return saved node links, including a legacy active node_url."""
+    nodes = []
+    raw_nodes = telegram.get("node_urls", []) if isinstance(telegram, dict) else []
+    if isinstance(raw_nodes, list):
+        for value in raw_nodes:
+            node_url = str(value or "").strip()
+            if node_url and node_url not in nodes:
+                nodes.append(node_url)
+    active_node = (
+        str(telegram.get("node_url", "") or "").strip()
+        if isinstance(telegram, dict)
+        else ""
+    )
+    if active_node and active_node not in nodes:
+        nodes.append(active_node)
+    return nodes
+
+
 def load_json(path, default):
     if not path.exists():
         return json.loads(json.dumps(default))
@@ -137,6 +157,7 @@ def load_json(path, default):
 def load_config():
     config = deep_merge(DEFAULT_CONFIG, load_json(CONFIG_FILE, DEFAULT_CONFIG))
     validate_config(config)
+    config["telegram"]["node_urls"] = telegram_node_urls(config["telegram"])
     return config
 
 
@@ -224,6 +245,12 @@ def validate_telegram_config(telegram):
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
+    saved_nodes = telegram.get("node_urls", [])
+    if not isinstance(saved_nodes, list):
+        raise GuardError("Telegram 已保存节点必须是数组")
+    for index, node_url in enumerate(saved_nodes, 1):
+        if not isinstance(node_url, str) or not node_url.strip():
+            raise GuardError("Telegram 第 {} 个已保存节点无效".format(index))
     if mode in ("socks5", "http"):
         proxy_url = str(telegram.get("proxy_url", "")).strip()
         parsed = urllib.parse.urlsplit(proxy_url)
@@ -461,7 +488,7 @@ def validate_user_connection(user, force_ipv4=True):
 
 def telegram_secrets(config):
     secrets = []
-    for field in ("bot_token", "proxy_url", "node_url", "api_base_url"):
+    for field in ("bot_token", "proxy_url", "api_base_url"):
         value = str(config.get(field, "") or "").strip()
         if value:
             secrets.append(value)
@@ -474,8 +501,8 @@ def telegram_secrets(config):
             )
         except ValueError:
             pass
-    node_url = str(config.get("node_url", "") or "").strip()
-    if node_url:
+    for node_url in telegram_node_urls(config):
+        secrets.append(node_url)
         try:
             outbound = telegram_proxy.parse_node_link(node_url)
             secrets.extend(

@@ -973,6 +973,7 @@ DEFAULT_CONFIG = {
         "connection_mode": "direct",
         "proxy_url": "",
         "node_url": "",
+        "node_urls": [],
         "api_base_url": "https://api.telegram.org",
     },
     "start_wait_seconds": 90,
@@ -1026,6 +1027,25 @@ def deep_merge(defaults, current):
     return result
 
 
+def telegram_node_urls(telegram):
+    """Return saved node links, including a legacy active node_url."""
+    nodes = []
+    raw_nodes = telegram.get("node_urls", []) if isinstance(telegram, dict) else []
+    if isinstance(raw_nodes, list):
+        for value in raw_nodes:
+            node_url = str(value or "").strip()
+            if node_url and node_url not in nodes:
+                nodes.append(node_url)
+    active_node = (
+        str(telegram.get("node_url", "") or "").strip()
+        if isinstance(telegram, dict)
+        else ""
+    )
+    if active_node and active_node not in nodes:
+        nodes.append(active_node)
+    return nodes
+
+
 def load_json(path, default):
     if not path.exists():
         return json.loads(json.dumps(default))
@@ -1042,6 +1062,7 @@ def load_json(path, default):
 def load_config():
     config = deep_merge(DEFAULT_CONFIG, load_json(CONFIG_FILE, DEFAULT_CONFIG))
     validate_config(config)
+    config["telegram"]["node_urls"] = telegram_node_urls(config["telegram"])
     return config
 
 
@@ -1129,6 +1150,12 @@ def validate_telegram_config(telegram):
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
+    saved_nodes = telegram.get("node_urls", [])
+    if not isinstance(saved_nodes, list):
+        raise GuardError("Telegram 已保存节点必须是数组")
+    for index, node_url in enumerate(saved_nodes, 1):
+        if not isinstance(node_url, str) or not node_url.strip():
+            raise GuardError("Telegram 第 {} 个已保存节点无效".format(index))
     if mode in ("socks5", "http"):
         proxy_url = str(telegram.get("proxy_url", "")).strip()
         parsed = urllib.parse.urlsplit(proxy_url)
@@ -1366,7 +1393,7 @@ def validate_user_connection(user, force_ipv4=True):
 
 def telegram_secrets(config):
     secrets = []
-    for field in ("bot_token", "proxy_url", "node_url", "api_base_url"):
+    for field in ("bot_token", "proxy_url", "api_base_url"):
         value = str(config.get(field, "") or "").strip()
         if value:
             secrets.append(value)
@@ -1379,8 +1406,8 @@ def telegram_secrets(config):
             )
         except ValueError:
             pass
-    node_url = str(config.get("node_url", "") or "").strip()
-    if node_url:
+    for node_url in telegram_node_urls(config):
+        secrets.append(node_url)
         try:
             outbound = telegram_proxy.parse_node_link(node_url)
             secrets.extend(
@@ -2099,8 +2126,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.3"
-LOCAL_RELEASE_ID = "c9f1dec9ea5d1fcd4db7a8a6fcefc2b0fd4f5497412cde8048c080752b47f349"
+APP_VERSION = "1.2.4"
+LOCAL_RELEASE_ID = "c58d644e5db5de57723f90ff8deb4be65d9bf76e3ee5d1e6cd810813e29b657e"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2234,6 +2261,9 @@ def load_config(allow_missing=False):
 
 
 def save_config(config):
+    telegram = config.get("telegram", {})
+    if isinstance(telegram, dict):
+        telegram["node_urls"] = guard.telegram_node_urls(telegram)
     guard.validate_config(config)
     guard.atomic_write_json(CONFIG_FILE, config, mode=0o600)
 
@@ -2386,11 +2416,113 @@ def telegram_connection_status_lines(telegram, prefix="当前"):
     return lines
 
 
+def _saved_node_description(node_url):
+    try:
+        return telegram_proxy.describe_node_link(node_url)
+    except telegram_proxy.ProxyError:
+        return "无效节点链接"
+
+
+def _sync_saved_nodes(telegram):
+    nodes = guard.telegram_node_urls(telegram)
+    telegram["node_urls"] = nodes
+    return nodes
+
+
+def add_telegram_node(telegram):
+    while True:
+        node_url = prompt_secret("节点链接（vless://、vmess:// 或 ss://）")
+        try:
+            description = telegram_proxy.describe_node_link(node_url)
+        except telegram_proxy.ProxyError as exc:
+            print("节点链接无效: {}".format(exc))
+            if yes_no("重新输入节点链接", default=True):
+                continue
+            return False
+        nodes = _sync_saved_nodes(telegram)
+        is_new = node_url not in nodes
+        if is_new:
+            nodes.append(node_url)
+        telegram["node_urls"] = nodes
+        telegram["node_url"] = node_url
+        telegram["connection_mode"] = "node"
+        if is_new:
+            print("节点已保存并选中: {}".format(description))
+        else:
+            print("节点已存在，已切换到: {}".format(description))
+        return True
+
+
+def delete_telegram_node(telegram, nodes):
+    title("删除 Telegram 节点")
+    for index, node_url in enumerate(nodes, 1):
+        print(" {:>2}) {}".format(index, _saved_node_description(node_url)))
+    selection = prompt_int("要删除的节点序号", 1, 1, len(nodes))
+    node_url = nodes[selection - 1]
+    description = _saved_node_description(node_url)
+    if not yes_no("确认删除 {}".format(description), default=False):
+        print("已取消删除。")
+        return False
+    remaining = [value for value in nodes if value != node_url]
+    telegram["node_urls"] = remaining
+    if str(telegram.get("node_url", "") or "").strip() == node_url:
+        telegram["node_url"] = remaining[0] if remaining else ""
+        if not remaining and telegram.get("connection_mode") == "node":
+            telegram["connection_mode"] = "direct"
+    print("已删除节点: {}".format(description))
+    if not remaining:
+        print("已保存节点为 0 个，连接方式已切换为直连。")
+    return True
+
+
+def configure_telegram_nodes(telegram):
+    nodes = _sync_saved_nodes(telegram)
+    if not nodes:
+        title("Telegram 节点")
+        print("尚未保存节点，将添加第一个节点。")
+        return add_telegram_node(telegram)
+    while True:
+        nodes = _sync_saved_nodes(telegram)
+        title("Telegram 节点（已保存 {} 个）".format(len(nodes)))
+        active_node = str(telegram.get("node_url", "") or "").strip()
+        for index, node_url in enumerate(nodes, 1):
+            marker = ""
+            if node_url == active_node:
+                marker = (
+                    "（当前使用）"
+                    if telegram.get("connection_mode") == "node"
+                    else "（上次使用）"
+                )
+            print(" {:>2}) {} {}".format(index, _saved_node_description(node_url), marker))
+        add_choice = len(nodes) + 1
+        delete_choice = len(nodes) + 2
+        back_choice = len(nodes) + 3
+        print(" {:>2}) 添加新节点".format(add_choice))
+        print(" {:>2}) 删除已保存节点".format(delete_choice))
+        print(" {:>2}) 返回连接方式菜单".format(back_choice))
+        default_choice = nodes.index(active_node) + 1 if active_node in nodes else 1
+        choice = prompt_int("请选择节点或操作", default_choice, 1, back_choice)
+        if choice <= len(nodes):
+            telegram["node_url"] = nodes[choice - 1]
+            telegram["connection_mode"] = "node"
+            print("已选择: {}".format(_saved_node_description(telegram["node_url"])))
+            return True
+        if choice == add_choice:
+            return add_telegram_node(telegram)
+        if choice == delete_choice:
+            delete_telegram_node(telegram, nodes)
+            if not _sync_saved_nodes(telegram):
+                return False
+            continue
+        return False
+
+
 def _telegram_connection_signature(telegram):
-    return tuple(
+    connection = tuple(
         str(telegram.get(field, "") or "").strip()
         for field in ("connection_mode", "proxy_url", "node_url", "api_base_url")
     )
+    return connection + (tuple(guard.telegram_node_urls(telegram)),)
 
 
 def run_telegram_connection_test(telegram):
@@ -2418,10 +2550,15 @@ def confirm_connection_change(candidate, active):
     pending_mode = str(candidate.get("connection_mode", "direct") or "direct")
     current_label = TELEGRAM_CONNECTION_LABELS.get(current_mode, "未知")
     pending_label = TELEGRAM_CONNECTION_LABELS.get(pending_mode, "未知")
-    question = "将从“{}”切换为“{}”，并使用待保存方式连接 Telegram Bot API 进行测试".format(
-        current_label,
-        pending_label,
-    )
+    if current_mode == pending_mode:
+        question = "将更新“{}”连接配置，并使用待保存方式连接 Telegram Bot API 进行测试".format(
+            pending_label
+        )
+    else:
+        question = "将从“{}”切换为“{}”，并使用待保存方式连接 Telegram Bot API 进行测试".format(
+            current_label,
+            pending_label,
+        )
     if current_mode == "node" and pending_mode != "node":
         question += "（原节点链接仍会保留）"
     return yes_no(question + "，确认继续", default=False)
@@ -2451,7 +2588,11 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
         print(" 3) HTTP/HTTPS 代理")
-        print(" 4) 节点链接（VLESS / VMess / Shadowsocks）")
+        print(
+            " 4) 节点链接（VLESS / VMess / Shadowsocks）  [已保存 {} 个]".format(
+                len(guard.telegram_node_urls(candidate))
+            )
+        )
         print(" 5) Telegram API 反向代理")
         print(" 6) 查看当前选择")
         print(" 7) 取消并返回")
@@ -2475,17 +2616,7 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 required=True,
             )
         elif choice == 4:
-            node_url = prompt_secret(
-                "节点链接（vless://、vmess:// 或 ss://）",
-                keep_existing=bool(candidate.get("node_url")),
-            )
-            if node_url:
-                candidate["node_url"] = node_url
-            candidate["connection_mode"] = "node"
-            try:
-                print("已识别: {}".format(telegram_proxy.describe_node_link(candidate.get("node_url"))))
-            except telegram_proxy.ProxyError as exc:
-                print("节点链接无效: {}".format(exc))
+            configure_telegram_nodes(candidate)
         elif choice == 5:
             candidate["connection_mode"] = "api_proxy"
             candidate["api_base_url"] = prompt(
