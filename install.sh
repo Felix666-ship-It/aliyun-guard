@@ -2126,8 +2126,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.4"
-LOCAL_RELEASE_ID = "c58d644e5db5de57723f90ff8deb4be65d9bf76e3ee5d1e6cd810813e29b657e"
+APP_VERSION = "1.2.5"
+LOCAL_RELEASE_ID = "67be1f287a17942ba33d13b20cb4bea4065c343273c823a83717d2bcf341a741"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2438,7 +2438,7 @@ def add_telegram_node(telegram):
             print("节点链接无效: {}".format(exc))
             if yes_no("重新输入节点链接", default=True):
                 continue
-            return False
+            return "cancelled"
         nodes = _sync_saved_nodes(telegram)
         is_new = node_url not in nodes
         if is_new:
@@ -2447,10 +2447,11 @@ def add_telegram_node(telegram):
         telegram["node_url"] = node_url
         telegram["connection_mode"] = "node"
         if is_new:
-            print("节点已保存并选中: {}".format(description))
+            print("已添加待检测节点: {}".format(description))
+            return "added"
         else:
             print("节点已存在，已切换到: {}".format(description))
-        return True
+            return "selected"
 
 
 def delete_telegram_node(telegram, nodes):
@@ -2506,15 +2507,15 @@ def configure_telegram_nodes(telegram):
             telegram["node_url"] = nodes[choice - 1]
             telegram["connection_mode"] = "node"
             print("已选择: {}".format(_saved_node_description(telegram["node_url"])))
-            return True
+            return "selected"
         if choice == add_choice:
             return add_telegram_node(telegram)
         if choice == delete_choice:
             delete_telegram_node(telegram, nodes)
             if not _sync_saved_nodes(telegram):
-                return False
+                return "changed"
             continue
-        return False
+        return "cancelled"
 
 
 def _telegram_connection_signature(telegram):
@@ -2541,6 +2542,40 @@ def run_telegram_connection_test(telegram):
         )
     )
     return username
+
+
+def test_telegram_connection(telegram, force_ipv4=True):
+    try:
+        guard.validate_telegram_config(telegram)
+    except Exception as exc:
+        print("连接配置无效: {}".format(guard.compact_error(exc)))
+        return False
+    if telegram.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
+        if not yes_no(
+            "未检测到 sing-box，是否从官方 GitHub 下载并校验安装",
+            default=True,
+        ):
+            print("节点模式需要 sing-box，检测已取消。")
+            return False
+        try:
+            path = telegram_proxy.install_sing_box(progress=print)
+            print("sing-box 已安装: {}".format(path))
+        except Exception as exc:
+            print("sing-box 安装失败: {}".format(guard.compact_error(exc)))
+            return False
+    if force_ipv4:
+        guard.enable_ipv4_only()
+    try:
+        username = run_telegram_connection_test(telegram)
+        print("Telegram 检测成功，Bot: @{}".format(username))
+        return True
+    except Exception as exc:
+        print(
+            "Telegram 检测失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            )
+        )
+        return False
 
 
 def confirm_connection_change(candidate, active):
@@ -2596,8 +2631,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 5) Telegram API 反向代理")
         print(" 6) 查看当前选择")
         print(" 7) 取消并返回")
-        print(" 8) 测试并保存")
-        choice = prompt_int("请选择", 8, 1, 8)
+        print(" 8) 单独检测当前选择（不保存）")
+        print(" 9) 测试并保存")
+        choice = prompt_int("请选择", 9, 1, 9)
         if choice == 1:
             candidate["connection_mode"] = "direct"
             print("已选择 Telegram 直连。")
@@ -2616,7 +2652,17 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 required=True,
             )
         elif choice == 4:
-            configure_telegram_nodes(candidate)
+            previous = json.loads(json.dumps(candidate, ensure_ascii=False))
+            node_action = configure_telegram_nodes(candidate)
+            if node_action == "added":
+                print("正在检测新节点，检测通过后将自动保存...")
+                if test_telegram_connection(candidate, force_ipv4=force_ipv4):
+                    print("新节点延迟检测通过，已自动保存并切换到该节点。")
+                    return candidate, True
+                candidate.clear()
+                candidate.update(previous)
+                telegram_proxy.stop_node_proxy()
+                print("新节点检测失败，未保存，原连接配置保持不变。")
         elif choice == 5:
             candidate["connection_mode"] = "api_proxy"
             candidate["api_base_url"] = prompt(
@@ -2632,39 +2678,15 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 continue
             return None
         elif choice == 8:
+            print("开始单独检测，本次检测不会保存配置...")
+            if test_telegram_connection(candidate, force_ipv4=force_ipv4):
+                print("单独检测完成，本次配置未保存。")
+        elif choice == 9:
             if not confirm_connection_change(candidate, active):
                 print("已取消切换，当前连接方式和节点保持不变。")
                 continue
-            try:
-                guard.validate_telegram_config(candidate)
-            except Exception as exc:
-                print("连接配置无效: {}".format(guard.compact_error(exc)))
-                continue
-            if candidate.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
-                if not yes_no(
-                    "未检测到 sing-box，是否从官方 GitHub 下载并校验安装",
-                    default=True,
-                ):
-                    print("节点模式需要 sing-box，未保存。")
-                    continue
-                try:
-                    path = telegram_proxy.install_sing_box(progress=print)
-                    print("sing-box 已安装: {}".format(path))
-                except Exception as exc:
-                    print("sing-box 安装失败: {}".format(guard.compact_error(exc)))
-                    continue
-            if force_ipv4:
-                guard.enable_ipv4_only()
-            try:
-                username = run_telegram_connection_test(candidate)
-                print("Telegram 测试成功，Bot: @{}".format(username))
+            if test_telegram_connection(candidate, force_ipv4=force_ipv4):
                 return candidate, True
-            except Exception as exc:
-                print(
-                    "Telegram 测试失败: {}".format(
-                        guard.compact_error(exc, secrets=guard.telegram_secrets(candidate))
-                    )
-                )
             if yes_no("重新输入 Token 或 Chat ID", default=False):
                 _set_telegram_identity(candidate)
             if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
