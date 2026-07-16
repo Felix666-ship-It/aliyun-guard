@@ -133,6 +133,233 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(result["level"], "paused")
 
 
+class ScheduleTests(unittest.TestCase):
+    @staticmethod
+    def scheduled_user(start_time="08:00", stop_time="23:00", **overrides):
+        user = make_user(
+            schedule={
+                "enabled": True,
+                "start_time": start_time,
+                "stop_time": stop_time,
+            }
+        )
+        user.update(overrides)
+        return user
+
+    def test_regular_schedule_boundaries(self):
+        user = self.scheduled_user()
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 16, 7, 59)), "stopped"
+        )
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 16, 8, 0)), "running"
+        )
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 16, 22, 59)), "running"
+        )
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 16, 23, 0)), "stopped"
+        )
+
+    def test_overnight_schedule_boundaries(self):
+        user = self.scheduled_user("22:30", "06:15")
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 16, 23, 0)), "running"
+        )
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 17, 6, 14)), "running"
+        )
+        self.assertEqual(
+            guard.schedule_target(user, dt.datetime(2026, 7, 17, 6, 15)), "stopped"
+        )
+
+    def test_rejects_equal_or_invalid_schedule_times(self):
+        config = make_config(self.scheduled_user("08:00", "08:00"))
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+        config["users"][0]["schedule"] = {
+            "enabled": "false",
+            "start_time": "08:00",
+            "stop_time": "23:00",
+        }
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+        config["users"][0]["schedule"]["stop_time"] = "24:00"
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+
+    def test_schedule_stop_runs_even_when_cdt_query_fails(self):
+        user = self.scheduled_user()
+        now = dt.datetime(2026, 7, 16, 23, 0)
+        with mock.patch.object(
+            guard, "query_cdt_traffic_gb", side_effect=RuntimeError("temporary")
+        ), mock.patch.object(
+            guard, "query_instance_status", return_value="Running"
+        ), mock.patch.object(guard, "stop_instance") as stop, mock.patch.object(
+            guard, "wait_for_status", return_value=("Stopped", None)
+        ):
+            result = guard.check_one(
+                user, make_config(user), now=now, scheduled_action="stop"
+            )
+        stop.assert_called_once_with(user)
+        self.assertTrue(result["action_performed"])
+        self.assertEqual(result["action"], "schedule_stop")
+        self.assertEqual(result["status_after"], "Stopped")
+        self.assertEqual(result["level"], "error")
+        self.assertTrue(any("CDT 流量查询失败" in item for item in result["errors"]))
+
+    def test_schedule_start_requires_safe_traffic(self):
+        user = self.scheduled_user()
+        now = dt.datetime(2026, 7, 16, 8, 0)
+        with mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=10.0
+        ), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(guard, "start_instance") as start, mock.patch.object(
+            guard, "wait_for_status", return_value=("Running", None)
+        ):
+            result = guard.check_one(
+                user, make_config(user), now=now, scheduled_action="start"
+            )
+        start.assert_called_once_with(user)
+        self.assertEqual(result["action"], "schedule_start")
+        self.assertIn("定时开机", result["message"])
+
+    def test_schedule_start_is_blocked_at_traffic_limit(self):
+        user = self.scheduled_user()
+        now = dt.datetime(2026, 7, 16, 8, 0)
+        with mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=180.0
+        ), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(guard, "start_instance") as start:
+            result = guard.check_one(
+                user, make_config(user), now=now, scheduled_action="start"
+            )
+        start.assert_not_called()
+        self.assertEqual(result["action"], "none")
+        self.assertIn("流量达到阈值", result["message"])
+
+    def test_schedule_transition_forces_boundary_and_recovery_checks(self):
+        user = self.scheduled_user()
+        config = make_config(user)
+        state = {
+            "instances": {
+                user["instance_id"]: {
+                    "schedule_signature": "08:00|23:00",
+                    "schedule_target": "stopped",
+                }
+            }
+        }
+        now = dt.datetime(2026, 7, 16, 8, 2)
+        self.assertTrue(guard.has_due_schedule(config, state, now))
+        state["instances"][user["instance_id"]]["schedule_target"] = "running"
+        self.assertFalse(guard.has_due_schedule(config, state, now))
+
+    def test_dry_run_does_not_consume_schedule_transition(self):
+        user = self.scheduled_user()
+        old = {
+            "instances": {
+                user["instance_id"]: {
+                    "schedule_signature": "08:00|23:00",
+                    "schedule_target": "stopped",
+                }
+            }
+        }
+        result = {
+            "name": "HK",
+            "instance_id": user["instance_id"],
+            "traffic_gb": 10.0,
+            "limit_gb": 180.0,
+            "status_after": "Stopped",
+            "bill_amount": None,
+            "bill_currency": None,
+            "bill_error": None,
+            "level": "action",
+            "message": "演练",
+            "schedule_enabled": True,
+            "schedule_start_time": "08:00",
+            "schedule_stop_time": "23:00",
+            "schedule_target": "running",
+        }
+        guard.update_state(
+            old,
+            [result],
+            dt.datetime(2026, 7, 16, 8, 0),
+            0.1,
+            "演练",
+            0,
+            dry_run=True,
+        )
+        saved = old["instances"][user["instance_id"]]
+        self.assertEqual(saved["schedule_target"], "stopped")
+        self.assertNotIn("last_cycle_epoch", old)
+
+    def test_paused_cycle_does_not_consume_schedule_transition(self):
+        old = {
+            "instances": {
+                "i-test123": {
+                    "schedule_signature": "08:00|23:00",
+                    "schedule_target": "stopped",
+                }
+            }
+        }
+        result = {
+            "name": "HK",
+            "instance_id": "i-test123",
+            "traffic_gb": None,
+            "limit_gb": 180.0,
+            "status_after": None,
+            "bill_amount": None,
+            "bill_currency": None,
+            "bill_error": None,
+            "level": "paused",
+            "message": "监控已暂停",
+            "paused": True,
+            "schedule_enabled": True,
+            "schedule_start_time": "08:00",
+            "schedule_stop_time": "23:00",
+            "schedule_target": "running",
+        }
+        guard.update_state(
+            old,
+            [result],
+            dt.datetime(2026, 7, 16, 8, 0),
+            0.1,
+            "暂停",
+            0,
+        )
+        saved = old["instances"]["i-test123"]
+        self.assertEqual(saved["schedule_target"], "stopped")
+
+    def test_scheduled_runner_bypasses_interval_for_schedule_transition(self):
+        user = self.scheduled_user()
+        config = make_config(user)
+        state = {"last_cycle_epoch": 1000.0, "instances": {}}
+        lock = mock.MagicMock()
+        lock.__enter__.return_value = True
+        lock.__exit__.return_value = False
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            guard, "APP_DIR", Path(directory)
+        ), mock.patch.object(
+            guard, "cycle_lock", return_value=lock
+        ), mock.patch.object(
+            guard, "load_config", return_value=config
+        ), mock.patch.object(
+            guard, "load_state", return_value=state
+        ), mock.patch.object(
+            guard, "is_due", return_value=False
+        ), mock.patch.object(
+            guard, "has_due_schedule", return_value=True
+        ), mock.patch.object(
+            guard, "run_cycle", return_value=0
+        ) as run:
+            code = guard.run_scheduled()
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertIn("started_at", run.call_args.kwargs)
+
+
 class GuardNotificationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1056,6 +1283,22 @@ class FirstSetupFlowTests(unittest.TestCase):
             result = manager.yellow_text("发现新版本")
         self.assertEqual(result, "\033[33m发现新版本\033[0m")
 
+    def test_schedule_menu_saves_selected_daily_times(self):
+        config = make_config()
+        with mock.patch.object(manager, "choose_user", return_value=0), mock.patch.object(
+            manager, "prompt_int", return_value=1
+        ), mock.patch.object(
+            manager, "prompt_schedule_time", side_effect=["22:30", "06:15"]
+        ), mock.patch.object(
+            manager, "yes_no", return_value=True
+        ), mock.patch.object(manager, "save_config") as save:
+            manager.edit_user_schedule(config)
+        self.assertEqual(
+            config["users"][0]["schedule"],
+            {"enabled": True, "start_time": "22:30", "stop_time": "06:15"},
+        )
+        save.assert_called_once_with(config)
+
     def test_menu_marks_available_version(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
@@ -1069,7 +1312,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager,
                 "check_for_github_update",
                 return_value={"available": True, "version": "1.3.0", "release_id": "b" * 64},
-            ) as check, mock.patch.object(manager, "prompt_int", return_value=15), mock.patch(
+            ) as check, mock.patch.object(manager, "prompt_int", return_value=16), mock.patch(
                 "sys.stdout", output
             ):
                 result = manager.menu()
@@ -1078,9 +1321,10 @@ class FirstSetupFlowTests(unittest.TestCase):
             "阿里云保活与通知 v{} - 管理面板".format(manager.APP_VERSION),
             output.getvalue(),
         )
-        self.assertIn("发现新版本: v1.3.0（请选择 14 更新）", output.getvalue())
+        self.assertIn("发现新版本: v1.3.0（请选择 15 更新）", output.getvalue())
         self.assertIn(" 5) Telegram 连接方式", output.getvalue())
-        self.assertIn("14) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
+        self.assertIn(" 9) 定时开关机设置", output.getvalue())
+        self.assertIn("15) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
         check.assert_called_once_with()
 
     def test_menu_test_action_does_not_open_connection_settings(self):
@@ -1094,7 +1338,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             ), mock.patch.object(
                 manager, "check_for_github_update", return_value=None
             ), mock.patch.object(
-                manager, "prompt_int", side_effect=[4, 15]
+                manager, "prompt_int", side_effect=[4, 16]
             ), mock.patch.object(
                 manager, "prompt", return_value=""
             ), mock.patch.object(
@@ -1115,7 +1359,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup", return_value=0
             ) as setup, mock.patch.object(manager, "run_control", return_value=0) as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=15):
+            ), mock.patch.object(manager, "prompt_int", return_value=16):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_called_once_with(force=False)
@@ -1130,7 +1374,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup"
             ) as setup, mock.patch.object(manager, "run_control") as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=15):
+            ), mock.patch.object(manager, "prompt_int", return_value=16):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_not_called()

@@ -3,6 +3,7 @@
 """Interactive configuration manager for Aliyun Guard."""
 
 import argparse
+import datetime as dt
 import getpass
 import hashlib
 import json
@@ -26,7 +27,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -146,6 +147,15 @@ def prompt_float(text, default, minimum=None):
             print("不能小于 {}。".format(minimum))
             continue
         return number
+
+
+def prompt_schedule_time(text, default):
+    while True:
+        value = prompt(text, default, required=True)
+        try:
+            return guard.normalize_schedule_time(value, text)
+        except guard.GuardError as exc:
+            print(exc)
 
 
 def default_config():
@@ -669,6 +679,75 @@ def configure_telegram_connection_settings(config):
     return test_ok
 
 
+def schedule_text(user):
+    schedule = guard.get_schedule_config(user)
+    if not schedule["enabled"]:
+        return "关闭"
+    suffix = " (+1日)" if schedule["start_time"] > schedule["stop_time"] else ""
+    return "{}-{}{}".format(
+        schedule["start_time"], schedule["stop_time"], suffix
+    )
+
+
+def print_schedule_details(user):
+    schedule = guard.get_schedule_config(user)
+    now = dt.datetime.now().astimezone()
+    print(
+        "服务器时间: {} ({})".format(
+            now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Z%z")
+        )
+    )
+    if not schedule["enabled"]:
+        print("当前计划: 已关闭")
+        return
+    target = guard.schedule_target(user, now)
+    print("每日开机: {}".format(schedule["start_time"]))
+    print("每日关机: {}".format(schedule["stop_time"]))
+    if schedule["start_time"] > schedule["stop_time"]:
+        print("运行时段: 跨午夜，关机时间属于次日")
+    print("当前时段: {}".format("计划运行" if target == "running" else "计划关机"))
+    next_event = guard.next_schedule_event(user, now)
+    if next_event:
+        event_at, action = next_event
+        print(
+            "下一动作: {} {}".format(
+                event_at.strftime("%Y-%m-%d %H:%M"),
+                "开机" if action == "start" else "关机",
+            )
+        )
+
+
+def collect_schedule(existing_user=None, ask_enabled=True):
+    existing_user = existing_user or {}
+    current = guard.get_schedule_config(existing_user)
+    title("每日定时开关机")
+    print("计划按服务器本地时间执行；流量达到阈值时不会执行计划开机。")
+    enabled = True
+    if ask_enabled:
+        enabled = yes_no("启用该实例的每日定时开关机", current["enabled"])
+    if not enabled:
+        return {
+            "enabled": False,
+            "start_time": current["start_time"],
+            "stop_time": current["stop_time"],
+        }
+    while True:
+        start_time = prompt_schedule_time("每日开机时间 (HH:MM)", current["start_time"])
+        stop_time = prompt_schedule_time("每日关机时间 (HH:MM)", current["stop_time"])
+        if start_time == stop_time:
+            print("开机时间和关机时间不能相同。")
+            continue
+        schedule = {
+            "enabled": True,
+            "start_time": start_time,
+            "stop_time": stop_time,
+        }
+        preview = dict(existing_user)
+        preview["schedule"] = schedule
+        print_schedule_details(preview)
+        return schedule
+
+
 def collect_user(existing=None):
     existing = dict(existing or {})
     title("{}监控实例".format("编辑" if existing else "添加"))
@@ -690,6 +769,7 @@ def collect_user(existing=None):
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
+    user["schedule"] = collect_schedule(existing)
     user["paused"] = bool(existing.get("paused", False))
     return user
 
@@ -752,7 +832,7 @@ def list_users(config):
     if not users:
         print("当前没有监控实例。")
         return
-    print("序号  状态    名称                  Region                实例 ID                 账单       AccessKey")
+    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单       AccessKey")
     line("-")
     for index, user in enumerate(users, 1):
         status = "暂停" if user.get("paused") else "运行"
@@ -763,12 +843,13 @@ def list_users(config):
             "custom": "自定义",
         }.get(billing.get("site"), "自定义") if billing.get("enabled", True) else "关闭"
         print(
-            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<10} {}".format(
+            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {}".format(
                 index,
                 status,
                 str(user.get("name", ""))[:20],
                 str(user.get("region", ""))[:20],
                 str(user.get("instance_id", ""))[:22],
+                schedule_text(user),
                 bill_site,
                 mask_key(user.get("ak")),
             )
@@ -794,6 +875,43 @@ def edit_user(config):
         config["users"][index] = candidate
         save_config(config)
         print("实例配置已更新。")
+
+
+def edit_user_schedule(config):
+    index = choose_user(config, "设置定时开关机")
+    if index is None:
+        return
+    user = config["users"][index]
+    title("{} - 定时开关机".format(user.get("name") or user.get("instance_id")))
+    print_schedule_details(user)
+    print("\n 1) 启用或修改计划")
+    print(" 2) 关闭计划")
+    print(" 3) 返回")
+    choice = prompt_int("请输入序号", 1, 1, 3)
+    if choice == 3:
+        return
+    if choice == 2:
+        if not guard.get_schedule_config(user)["enabled"]:
+            print("该实例的定时开关机已经关闭。")
+            return
+        if not yes_no("确认关闭该实例的定时开关机", False):
+            print("已取消。")
+            return
+        current = guard.get_schedule_config(user)
+        user["schedule"] = {
+            "enabled": False,
+            "start_time": current["start_time"],
+            "stop_time": current["stop_time"],
+        }
+        save_config(config)
+        print("定时开关机已关闭。")
+        return
+    user["schedule"] = collect_schedule(user, ask_enabled=False)
+    if yes_no("保存以上定时计划", True):
+        save_config(config)
+        print("定时计划已保存，后台会在 1 分钟内读取新设置。")
+    else:
+        print("未保存修改。")
 
 
 def toggle_user(config):
@@ -1065,7 +1183,7 @@ def menu():
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         if update_info and update_info.get("available"):
-            print(yellow_text("发现新版本: v{}（请选择 14 更新）".format(update_info["version"])))
+            print(yellow_text("发现新版本: v{}（请选择 15 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -1074,17 +1192,18 @@ def menu():
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
-        print(" 9) 暂停/恢复监控实例")
-        print("10) 删除监控实例")
-        print("11) 修改全局设置")
-        print("12) 查看最近日志")
-        print("13) 重启后台服务")
+        print(" 9) 定时开关机设置")
+        print("10) 暂停/恢复监控实例")
+        print("11) 删除监控实例")
+        print("12) 修改全局设置")
+        print("13) 查看最近日志")
+        print("14) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
-        print("14) 更新 GitHub 版本{}".format(update_hint))
-        print("15) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 15)
+        print("15) 更新 GitHub 版本{}".format(update_hint))
+        print("16) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 16)
         try:
             if choice == 1:
                 show_status(config)
@@ -1104,23 +1223,25 @@ def menu():
             elif choice == 8:
                 edit_user(config)
             elif choice == 9:
-                toggle_user(config)
+                edit_user_schedule(config)
             elif choice == 10:
-                delete_user(config)
+                toggle_user(config)
             elif choice == 11:
-                edit_settings(config)
+                delete_user(config)
             elif choice == 12:
-                show_logs()
+                edit_settings(config)
             elif choice == 13:
-                run_control("restart")
+                show_logs()
             elif choice == 14:
+                run_control("restart")
+            elif choice == 15:
                 if update_from_github(release_info=update_info) is True:
                     return 0
-            elif choice == 15:
+            elif choice == 16:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 15:
+        if choice != 16:
             prompt("按回车返回菜单")
 
 

@@ -991,6 +991,12 @@ DEFAULT_BILLING = {
     "currency_symbol": "¥",
 }
 
+DEFAULT_SCHEDULE = {
+    "enabled": False,
+    "start_time": "08:00",
+    "stop_time": "23:00",
+}
+
 LOGGER = logging.getLogger("aliyun_guard")
 LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
@@ -1128,6 +1134,18 @@ def validate_config(config):
             raise GuardError("第 {} 个实例的流量阈值无效".format(index))
         if limit <= 0:
             raise GuardError("第 {} 个实例的流量阈值必须大于 0".format(index))
+        configured_schedule = user.get("schedule")
+        if configured_schedule is not None and not isinstance(configured_schedule, dict):
+            raise GuardError("第 {} 个实例的定时开关机配置必须是对象".format(index))
+        if isinstance(configured_schedule, dict) and "enabled" in configured_schedule:
+            if not isinstance(configured_schedule["enabled"], bool):
+                raise GuardError("第 {} 个实例的定时开关机 enabled 必须是布尔值".format(index))
+        schedule = get_schedule_config(user)
+        if schedule["enabled"]:
+            start_time = normalize_schedule_time(schedule["start_time"], "开机时间")
+            stop_time = normalize_schedule_time(schedule["stop_time"], "关机时间")
+            if start_time == stop_time:
+                raise GuardError("第 {} 个实例的开机时间和关机时间不能相同".format(index))
         billing = get_billing_config(user)
         if billing.get("enabled", True):
             for field in ("endpoint", "region", "currency_code", "currency_symbol"):
@@ -1247,6 +1265,98 @@ def get_billing_config(user):
         "currency_symbol": str(user.get("currency", "$" if international else "¥")),
     }
     return deep_merge(DEFAULT_BILLING, legacy)
+
+
+def normalize_schedule_time(value, field_name="时间"):
+    text = str(value or "").strip()
+    if len(text) != 5 or text[2] != ":" or not (text[:2] + text[3:]).isdigit():
+        raise GuardError("{}必须使用 HH:MM 格式，例如 08:30".format(field_name))
+    hour = int(text[:2])
+    minute = int(text[3:])
+    if hour > 23 or minute > 59:
+        raise GuardError("{}超出有效范围".format(field_name))
+    return "{:02d}:{:02d}".format(hour, minute)
+
+
+def get_schedule_config(user):
+    configured = user.get("schedule")
+    if not isinstance(configured, dict):
+        configured = {}
+    schedule = deep_merge(DEFAULT_SCHEDULE, configured)
+    schedule["enabled"] = bool(schedule.get("enabled", False))
+    if schedule["enabled"]:
+        schedule["start_time"] = normalize_schedule_time(
+            schedule.get("start_time"), "开机时间"
+        )
+        schedule["stop_time"] = normalize_schedule_time(
+            schedule.get("stop_time"), "关机时间"
+        )
+    return schedule
+
+
+def schedule_target(user, now=None):
+    """Return the desired ECS state for the current daily schedule."""
+    schedule = get_schedule_config(user)
+    if not schedule["enabled"]:
+        return None
+    now = now or dt.datetime.now().astimezone()
+    current = now.hour * 60 + now.minute
+    start = int(schedule["start_time"][:2]) * 60 + int(schedule["start_time"][3:])
+    stop = int(schedule["stop_time"][:2]) * 60 + int(schedule["stop_time"][3:])
+    if start < stop:
+        running = start <= current < stop
+    else:
+        running = current >= start or current < stop
+    return "running" if running else "stopped"
+
+
+def schedule_signature(user):
+    schedule = get_schedule_config(user)
+    if not schedule["enabled"]:
+        return "disabled"
+    return "{}|{}".format(schedule["start_time"], schedule["stop_time"])
+
+
+def schedule_transition(user, previous_instance, now=None):
+    if user.get("paused") or not get_schedule_config(user)["enabled"]:
+        return None
+    if not isinstance(previous_instance, dict):
+        previous_instance = {}
+    target = schedule_target(user, now)
+    if (
+        previous_instance.get("schedule_signature") != schedule_signature(user)
+        or previous_instance.get("schedule_target") != target
+    ):
+        return "start" if target == "running" else "stop"
+    return None
+
+
+def has_due_schedule(config, state, now=None):
+    now = now or dt.datetime.now().astimezone()
+    previous = state.get("instances", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    for user in config.get("users", []):
+        instance_id = str(user.get("instance_id", ""))
+        if schedule_transition(user, previous.get(instance_id, {}), now):
+            return True
+    return False
+
+
+def next_schedule_event(user, now=None):
+    schedule = get_schedule_config(user)
+    if not schedule["enabled"]:
+        return None
+    now = now or dt.datetime.now().astimezone()
+    events = []
+    for action, value in (("start", schedule["start_time"]), ("stop", schedule["stop_time"])):
+        candidate = now.replace(
+            hour=int(value[:2]), minute=int(value[3:]), second=0, microsecond=0
+        )
+        if candidate <= now:
+            candidate += dt.timedelta(days=1)
+        events.append((candidate, action))
+    return min(events, key=lambda item: item[0])
 
 
 def normalize_bill_items(data):
@@ -1612,9 +1722,11 @@ def wait_for_status(user, expected, timeout, poll_seconds):
     return latest, latest_error
 
 
-def check_one(user, config, dry_run=False):
+def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
+    schedule = get_schedule_config(user)
+    target = schedule_target(user, now) if schedule["enabled"] else None
     result = {
         "name": name,
         "instance_id": str(user.get("instance_id", "")),
@@ -1633,6 +1745,11 @@ def check_one(user, config, dry_run=False):
         "message": "",
         "errors": [],
         "paused": bool(user.get("paused", False)),
+        "schedule_enabled": schedule["enabled"],
+        "schedule_start_time": schedule["start_time"],
+        "schedule_stop_time": schedule["stop_time"],
+        "schedule_target": target,
+        "schedule_event": scheduled_action,
     }
     if result["paused"]:
         result["level"] = "paused"
@@ -1675,6 +1792,65 @@ def check_one(user, config, dry_run=False):
             result["errors"].append(result["bill_error"])
             LOGGER.error("[%s] %s", name, result["bill_error"])
 
+    status = result["status_before"]
+    actions_enabled = bool(user.get("actions_enabled", True))
+    wait_seconds = max(0, int(config.get("start_wait_seconds", 90)))
+    stop_wait_seconds = max(0, int(config.get("stop_wait_seconds", 45)))
+    poll_seconds = max(1, int(config.get("start_poll_seconds", 5)))
+
+    # A planned shutdown only depends on a readable ECS state. CDT or BSS
+    # failures remain visible, but they must not leave an instance running.
+    if target == "stopped" and status is not None:
+        if status == "Running":
+            result["action"] = "schedule_stop"
+            if dry_run:
+                result["level"] = "action"
+                result["message"] = "演练：当前处于计划关机时段，应停止实例"
+            elif not actions_enabled:
+                result["level"] = "warning"
+                result["message"] = "当前处于计划关机时段，但自动操作未启用"
+            else:
+                try:
+                    stop_instance(user)
+                    result["action_performed"] = True
+                    LOGGER.info("[%s] 已提交定时关机请求", name)
+                    latest, poll_error = wait_for_status(
+                        user, "Stopped", stop_wait_seconds, poll_seconds
+                    )
+                    if latest:
+                        result["status_after"] = latest
+                    if latest == "Stopped":
+                        result["level"] = "action"
+                        result["message"] = "定时关机已执行并确认实例停止"
+                    elif poll_error:
+                        result["level"] = "warning"
+                        result["message"] = "已提交定时关机，状态复查失败: {}".format(
+                            poll_error
+                        )
+                    else:
+                        result["level"] = "warning"
+                        result["message"] = "已提交定时关机，等待 {} 秒后状态为 {}".format(
+                            stop_wait_seconds, latest or "Unknown"
+                        )
+                except Exception as exc:
+                    result["level"] = "error"
+                    result["message"] = "定时关机失败: {}".format(
+                        compact_error(exc, secrets=user_secrets)
+                    )
+                    result["errors"].append(result["message"])
+                    LOGGER.error("[%s] %s", name, result["message"])
+        elif status == "Stopped":
+            result["message"] = "当前处于计划关机时段，实例保持关机"
+        else:
+            result["level"] = "warning"
+            result["message"] = "当前处于计划关机时段，实例状态为 {}，本轮不重复操作".format(
+                status
+            )
+        if result["errors"]:
+            result["level"] = "error"
+        LOGGER.info("[%s] 计划关机时段，状态 %s，结果: %s", name, status, result["message"])
+        return result
+
     if core_error_count:
         result["level"] = "error"
         result["message"] = "CDT 或 ECS 核心查询失败，本轮未执行开关机"
@@ -1682,41 +1858,60 @@ def check_one(user, config, dry_run=False):
 
     traffic = result["traffic_gb"]
     limit = result["limit_gb"]
-    status = result["status_before"]
-    actions_enabled = bool(user.get("actions_enabled", True))
-    wait_seconds = max(0, int(config.get("start_wait_seconds", 90)))
-    stop_wait_seconds = max(0, int(config.get("stop_wait_seconds", 45)))
-    poll_seconds = max(1, int(config.get("start_poll_seconds", 5)))
 
     if traffic < limit:
         if status == "Running":
-            result["message"] = "流量安全，实例运行正常"
+            if scheduled_action == "start":
+                result["message"] = "已进入计划运行时段，实例正在运行"
+            else:
+                result["message"] = "流量安全，实例运行正常"
         elif status == "Stopped":
-            result["action"] = "start"
+            result["action"] = "schedule_start" if scheduled_action == "start" else "start"
             if dry_run:
                 result["level"] = "action"
-                result["message"] = "演练：应启动实例"
+                result["message"] = (
+                    "演练：当前处于计划运行时段，应启动实例"
+                    if schedule["enabled"]
+                    else "演练：应启动实例"
+                )
             elif not actions_enabled:
                 result["level"] = "warning"
-                result["message"] = "流量安全但实例已停止，自动操作未启用"
+                result["message"] = (
+                    "当前处于计划运行时段，但自动操作未启用"
+                    if schedule["enabled"]
+                    else "流量安全但实例已停止，自动操作未启用"
+                )
             else:
                 try:
                     start_instance(user)
                     result["action_performed"] = True
-                    LOGGER.info("[%s] 已提交启动请求", name)
+                    LOGGER.info(
+                        "[%s] 已提交%s启动请求",
+                        name,
+                        "定时" if scheduled_action == "start" else "保活",
+                    )
                     latest, poll_error = wait_for_status(user, "Running", wait_seconds, poll_seconds)
                     if latest:
                         result["status_after"] = latest
                     if latest == "Running":
                         result["level"] = "action"
-                        result["message"] = "已启动并确认实例运行"
+                        result["message"] = (
+                            "定时开机已执行并确认实例运行"
+                            if scheduled_action == "start"
+                            else "已启动并确认实例运行"
+                        )
                     elif poll_error:
                         result["level"] = "warning"
-                        result["message"] = "已提交启动请求，状态复查失败: {}".format(poll_error)
+                        result["message"] = "已提交{}启动请求，状态复查失败: {}".format(
+                            "定时" if scheduled_action == "start" else "保活",
+                            poll_error,
+                        )
                     else:
                         result["level"] = "warning"
-                        result["message"] = "已提交启动请求，等待 {} 秒后状态为 {}".format(
-                            wait_seconds, latest or "Unknown"
+                        result["message"] = "已提交{}启动请求，等待 {} 秒后状态为 {}".format(
+                            "定时" if scheduled_action == "start" else "保活",
+                            wait_seconds,
+                            latest or "Unknown",
                         )
                 except Exception as exc:
                     result["level"] = "error"
@@ -1814,6 +2009,15 @@ def build_summary(results, started_at, duration, dry_run=False):
         if item["paused"]:
             lines.append("  结果: {}".format(item["message"]))
             continue
+        if item.get("schedule_enabled"):
+            target_label = "运行" if item.get("schedule_target") == "running" else "关机"
+            lines.append(
+                "  计划: {} 开机 / {} 关机（当前{}时段）".format(
+                    item.get("schedule_start_time"),
+                    item.get("schedule_stop_time"),
+                    target_label,
+                )
+            )
         if item["traffic_gb"] is None:
             lines.append("  流量: 查询失败 / {:.2f} GB".format(item["limit_gb"]))
         else:
@@ -1853,9 +2057,16 @@ def should_notify(config, results, previous_state):
         return True
     if mode == "errors":
         return False
-    if any(item["action"] != "none" or item["level"] == "warning" for item in results):
+    if any(
+        item["action"] != "none"
+        or item["level"] == "warning"
+        or item.get("schedule_event")
+        for item in results
+    ):
         return True
     previous = previous_state.get("instances", {})
+    if not isinstance(previous, dict):
+        previous = {}
     for item in results:
         old = previous.get(item["instance_id"], {})
         if old.get("status_after") and old.get("status_after") != item.get("status_after"):
@@ -1863,7 +2074,16 @@ def should_notify(config, results, previous_state):
     return False
 
 
-def update_state(state, results, started_at, duration, summary, error_count, notify_error=None):
+def update_state(
+    state,
+    results,
+    started_at,
+    duration,
+    summary,
+    error_count,
+    notify_error=None,
+    dry_run=False,
+):
     state["last_cycle_started_at"] = started_at.isoformat(timespec="seconds")
     state["last_cycle_finished_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     state["last_cycle_duration_seconds"] = round(duration, 3)
@@ -1872,9 +2092,13 @@ def update_state(state, results, started_at, duration, summary, error_count, not
     state["last_summary"] = summary
     state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
     state["telegram_error"] = notify_error
-    state.setdefault("instances", {})
+    if not dry_run:
+        state["last_cycle_epoch"] = started_at.timestamp()
+    if not isinstance(state.get("instances"), dict):
+        state["instances"] = {}
     for item in results:
-        state["instances"][item["instance_id"]] = {
+        previous_instance = state["instances"].get(item["instance_id"], {})
+        instance_state = {
             "name": item["name"],
             "traffic_gb": item["traffic_gb"],
             "limit_gb": item["limit_gb"],
@@ -1886,6 +2110,20 @@ def update_state(state, results, started_at, duration, summary, error_count, not
             "message": item["message"],
             "checked_at": started_at.isoformat(timespec="seconds"),
         }
+        if not dry_run and not item.get("paused"):
+            instance_state["schedule_signature"] = (
+                "{}|{}".format(
+                    item.get("schedule_start_time"), item.get("schedule_stop_time")
+                )
+                if item.get("schedule_enabled")
+                else "disabled"
+            )
+            instance_state["schedule_target"] = item.get("schedule_target")
+        else:
+            for field in ("schedule_signature", "schedule_target"):
+                if field in previous_instance:
+                    instance_state[field] = previous_instance[field]
+        state["instances"][item["instance_id"]] = instance_state
 
 
 @contextlib.contextmanager
@@ -1906,18 +2144,33 @@ def cycle_lock():
         handle.close()
 
 
-def run_cycle(dry_run=False, no_notify=False):
+def run_cycle(dry_run=False, no_notify=False, started_at=None):
     config = load_config()
     if config.get("force_ipv4", True):
         enable_ipv4_only()
-    started_at = dt.datetime.now().astimezone()
+    started_at = started_at or dt.datetime.now().astimezone()
     monotonic_start = time.monotonic()
     previous_state = load_state()
+    previous_instances = previous_state.get("instances", {})
+    if not isinstance(previous_instances, dict):
+        previous_instances = {}
     results = []
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
-        results.append(check_one(user, config, dry_run=dry_run))
+        instance_id = str(user.get("instance_id", ""))
+        transition = schedule_transition(
+            user, previous_instances.get(instance_id, {}), started_at
+        )
+        results.append(
+            check_one(
+                user,
+                config,
+                dry_run=dry_run,
+                now=started_at,
+                scheduled_action=transition,
+            )
+        )
     duration = time.monotonic() - monotonic_start
     summary, error_count, action_count, warning_count = build_summary(
         results, started_at, duration, dry_run=dry_run
@@ -1932,7 +2185,16 @@ def run_cycle(dry_run=False, no_notify=False):
         except Exception as exc:
             notify_error = compact_error(exc, secrets=telegram_secrets(telegram))
             LOGGER.error("Telegram 本轮汇总通知发送失败: %s", notify_error)
-    update_state(previous_state, results, started_at, duration, summary, error_count, notify_error)
+    update_state(
+        previous_state,
+        results,
+        started_at,
+        duration,
+        summary,
+        error_count,
+        notify_error,
+        dry_run=dry_run,
+    )
     save_state(previous_state)
     return 1 if error_count else 0
 
@@ -1961,11 +2223,23 @@ def run_scheduled():
             return 0
         config = load_config()
         state = load_state()
-        if not is_due(config, state):
+        now = dt.datetime.now().astimezone()
+        if not is_due(config, state, now.timestamp()) and not has_due_schedule(
+            config, state, now
+        ):
             return 0
-        state["last_cycle_epoch"] = time.time()
-        save_state(state)
-        return run_cycle()
+        return run_cycle(started_at=now)
+
+
+def scheduler_wait_seconds(config, state, now=None):
+    now = time.time() if now is None else float(now)
+    last = state.get("last_cycle_epoch")
+    if last is None:
+        regular_wait = 60.0
+    else:
+        regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
+    minute_wait = 60.05 - (now % 60.0)
+    return max(1.0, min(regular_wait, minute_wait))
 
 
 def handle_stop(signum, frame):
@@ -1992,12 +2266,20 @@ def run_daemon():
                 compact_error(exc, secrets=telegram_secrets(telegram)),
             )
     LOGGER.info("保活服务已启动")
+    first_cycle = True
     while not _STOP_EVENT.is_set():
-        cycle_started = time.monotonic()
         with cycle_lock() as locked:
             if locked:
                 try:
-                    run_cycle()
+                    config = load_config()
+                    state = load_state()
+                    now = dt.datetime.now().astimezone()
+                    if (
+                        first_cycle
+                        or is_due(config, state, now.timestamp())
+                        or has_due_schedule(config, state, now)
+                    ):
+                        run_cycle(started_at=now)
                 except Exception as exc:
                     LOGGER.exception(
                         "本轮检测发生未处理错误: %s",
@@ -2008,11 +2290,13 @@ def run_daemon():
                     )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
+        first_cycle = False
         try:
-            interval = int(load_config().get("interval_seconds", 300))
+            config = load_config()
+            state = load_state()
+            remaining = scheduler_wait_seconds(config, state)
         except Exception:
-            interval = 300
-        remaining = max(1, interval - (time.monotonic() - cycle_started))
+            remaining = 60
         _STOP_EVENT.wait(remaining)
     LOGGER.info("保活服务已停止")
     return 0
@@ -2027,6 +2311,27 @@ def show_status():
     state = load_state()
     print("配置状态: 正常")
     print("实例数量: {}".format(len(config.get("users", []))))
+    scheduled_users = [
+        user
+        for user in config.get("users", [])
+        if get_schedule_config(user)["enabled"] and not user.get("paused")
+    ]
+    print("定时计划: {} 个已启用".format(len(scheduled_users)))
+    upcoming = []
+    now = dt.datetime.now().astimezone()
+    for user in scheduled_users:
+        event = next_schedule_event(user, now)
+        if event:
+            upcoming.append((event[0], event[1], str(user.get("name") or user.get("instance_id"))))
+    if upcoming:
+        event_at, action, name = min(upcoming, key=lambda item: item[0])
+        print(
+            "下一计划: {} {} {}".format(
+                event_at.strftime("%Y-%m-%d %H:%M"),
+                name,
+                "开机" if action == "start" else "关机",
+            )
+        )
     print("检测间隔: {} 秒".format(config["interval_seconds"]))
     print("通知模式: {}".format(config["notification_mode"]))
     print("累计检测: {} 次".format(state.get("cycle_count", 0)))
@@ -2103,6 +2408,7 @@ __AG_APP_PY_EOF__
 """Interactive configuration manager for Aliyun Guard."""
 
 import argparse
+import datetime as dt
 import getpass
 import hashlib
 import json
@@ -2126,8 +2432,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.7"
-LOCAL_RELEASE_ID = "e00e1fa6c76e8ed7310cfac222aaec1c8a8a4b3baf94af28f227b736523e7088"
+APP_VERSION = "1.2.8"
+LOCAL_RELEASE_ID = "b5b7505a6c9b6b13fcf8a49e871c9bc2391164d8b0f60a91f4044d7fb0e52d21"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2246,6 +2552,15 @@ def prompt_float(text, default, minimum=None):
             print("不能小于 {}。".format(minimum))
             continue
         return number
+
+
+def prompt_schedule_time(text, default):
+    while True:
+        value = prompt(text, default, required=True)
+        try:
+            return guard.normalize_schedule_time(value, text)
+        except guard.GuardError as exc:
+            print(exc)
 
 
 def default_config():
@@ -2769,6 +3084,75 @@ def configure_telegram_connection_settings(config):
     return test_ok
 
 
+def schedule_text(user):
+    schedule = guard.get_schedule_config(user)
+    if not schedule["enabled"]:
+        return "关闭"
+    suffix = " (+1日)" if schedule["start_time"] > schedule["stop_time"] else ""
+    return "{}-{}{}".format(
+        schedule["start_time"], schedule["stop_time"], suffix
+    )
+
+
+def print_schedule_details(user):
+    schedule = guard.get_schedule_config(user)
+    now = dt.datetime.now().astimezone()
+    print(
+        "服务器时间: {} ({})".format(
+            now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Z%z")
+        )
+    )
+    if not schedule["enabled"]:
+        print("当前计划: 已关闭")
+        return
+    target = guard.schedule_target(user, now)
+    print("每日开机: {}".format(schedule["start_time"]))
+    print("每日关机: {}".format(schedule["stop_time"]))
+    if schedule["start_time"] > schedule["stop_time"]:
+        print("运行时段: 跨午夜，关机时间属于次日")
+    print("当前时段: {}".format("计划运行" if target == "running" else "计划关机"))
+    next_event = guard.next_schedule_event(user, now)
+    if next_event:
+        event_at, action = next_event
+        print(
+            "下一动作: {} {}".format(
+                event_at.strftime("%Y-%m-%d %H:%M"),
+                "开机" if action == "start" else "关机",
+            )
+        )
+
+
+def collect_schedule(existing_user=None, ask_enabled=True):
+    existing_user = existing_user or {}
+    current = guard.get_schedule_config(existing_user)
+    title("每日定时开关机")
+    print("计划按服务器本地时间执行；流量达到阈值时不会执行计划开机。")
+    enabled = True
+    if ask_enabled:
+        enabled = yes_no("启用该实例的每日定时开关机", current["enabled"])
+    if not enabled:
+        return {
+            "enabled": False,
+            "start_time": current["start_time"],
+            "stop_time": current["stop_time"],
+        }
+    while True:
+        start_time = prompt_schedule_time("每日开机时间 (HH:MM)", current["start_time"])
+        stop_time = prompt_schedule_time("每日关机时间 (HH:MM)", current["stop_time"])
+        if start_time == stop_time:
+            print("开机时间和关机时间不能相同。")
+            continue
+        schedule = {
+            "enabled": True,
+            "start_time": start_time,
+            "stop_time": stop_time,
+        }
+        preview = dict(existing_user)
+        preview["schedule"] = schedule
+        print_schedule_details(preview)
+        return schedule
+
+
 def collect_user(existing=None):
     existing = dict(existing or {})
     title("{}监控实例".format("编辑" if existing else "添加"))
@@ -2790,6 +3174,7 @@ def collect_user(existing=None):
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
+    user["schedule"] = collect_schedule(existing)
     user["paused"] = bool(existing.get("paused", False))
     return user
 
@@ -2852,7 +3237,7 @@ def list_users(config):
     if not users:
         print("当前没有监控实例。")
         return
-    print("序号  状态    名称                  Region                实例 ID                 账单       AccessKey")
+    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单       AccessKey")
     line("-")
     for index, user in enumerate(users, 1):
         status = "暂停" if user.get("paused") else "运行"
@@ -2863,12 +3248,13 @@ def list_users(config):
             "custom": "自定义",
         }.get(billing.get("site"), "自定义") if billing.get("enabled", True) else "关闭"
         print(
-            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<10} {}".format(
+            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {}".format(
                 index,
                 status,
                 str(user.get("name", ""))[:20],
                 str(user.get("region", ""))[:20],
                 str(user.get("instance_id", ""))[:22],
+                schedule_text(user),
                 bill_site,
                 mask_key(user.get("ak")),
             )
@@ -2894,6 +3280,43 @@ def edit_user(config):
         config["users"][index] = candidate
         save_config(config)
         print("实例配置已更新。")
+
+
+def edit_user_schedule(config):
+    index = choose_user(config, "设置定时开关机")
+    if index is None:
+        return
+    user = config["users"][index]
+    title("{} - 定时开关机".format(user.get("name") or user.get("instance_id")))
+    print_schedule_details(user)
+    print("\n 1) 启用或修改计划")
+    print(" 2) 关闭计划")
+    print(" 3) 返回")
+    choice = prompt_int("请输入序号", 1, 1, 3)
+    if choice == 3:
+        return
+    if choice == 2:
+        if not guard.get_schedule_config(user)["enabled"]:
+            print("该实例的定时开关机已经关闭。")
+            return
+        if not yes_no("确认关闭该实例的定时开关机", False):
+            print("已取消。")
+            return
+        current = guard.get_schedule_config(user)
+        user["schedule"] = {
+            "enabled": False,
+            "start_time": current["start_time"],
+            "stop_time": current["stop_time"],
+        }
+        save_config(config)
+        print("定时开关机已关闭。")
+        return
+    user["schedule"] = collect_schedule(user, ask_enabled=False)
+    if yes_no("保存以上定时计划", True):
+        save_config(config)
+        print("定时计划已保存，后台会在 1 分钟内读取新设置。")
+    else:
+        print("未保存修改。")
 
 
 def toggle_user(config):
@@ -3165,7 +3588,7 @@ def menu():
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         if update_info and update_info.get("available"):
-            print(yellow_text("发现新版本: v{}（请选择 14 更新）".format(update_info["version"])))
+            print(yellow_text("发现新版本: v{}（请选择 15 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -3174,17 +3597,18 @@ def menu():
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
-        print(" 9) 暂停/恢复监控实例")
-        print("10) 删除监控实例")
-        print("11) 修改全局设置")
-        print("12) 查看最近日志")
-        print("13) 重启后台服务")
+        print(" 9) 定时开关机设置")
+        print("10) 暂停/恢复监控实例")
+        print("11) 删除监控实例")
+        print("12) 修改全局设置")
+        print("13) 查看最近日志")
+        print("14) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
-        print("14) 更新 GitHub 版本{}".format(update_hint))
-        print("15) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 15)
+        print("15) 更新 GitHub 版本{}".format(update_hint))
+        print("16) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 16)
         try:
             if choice == 1:
                 show_status(config)
@@ -3204,23 +3628,25 @@ def menu():
             elif choice == 8:
                 edit_user(config)
             elif choice == 9:
-                toggle_user(config)
+                edit_user_schedule(config)
             elif choice == 10:
-                delete_user(config)
+                toggle_user(config)
             elif choice == 11:
-                edit_settings(config)
+                delete_user(config)
             elif choice == 12:
-                show_logs()
+                edit_settings(config)
             elif choice == 13:
-                run_control("restart")
+                show_logs()
             elif choice == 14:
+                run_control("restart")
+            elif choice == 15:
                 if update_from_github(release_info=update_info) is True:
                     return 0
-            elif choice == 15:
+            elif choice == 16:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 15:
+        if choice != 16:
             prompt("按回车返回菜单")
 
 
