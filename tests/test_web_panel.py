@@ -525,6 +525,13 @@ class ManualControlTests(unittest.TestCase):
 
 
 class WebHtmlTests(unittest.TestCase):
+    def test_sparkline_points_keep_fixed_size_and_edge_padding(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertIn("const chartLeft = 4, chartRight = 316", html)
+        self.assertIn('class="chart-point" d="M ${latest.x} ${latest.y} h .01"', html)
+        self.assertIn("vector-effect: non-scaling-stroke", html)
+        self.assertNotIn('<circle class="chart-point"', html)
+
     def test_sensitive_fields_use_leave_blank_guidance(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertGreaterEqual(html.count("已保存，留空不修改"), 5)

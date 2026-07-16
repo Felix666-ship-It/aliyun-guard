@@ -336,8 +336,9 @@
     .sparkline { position: relative; height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
     .sparkline svg { width: 100%; height: 58px; display: block; overflow: visible; }
     .chart-hit { fill: transparent; stroke: transparent; cursor: crosshair; outline: none; }
-    .chart-hit:focus { fill: #fff; stroke: var(--cyan); stroke-width: 2px; }
-    .chart-point { fill: #fff; stroke: var(--cyan); stroke-width: 2px; pointer-events: none; }
+    .chart-focus, .chart-point { fill: none; stroke: var(--cyan); stroke-width: 6px; stroke-linecap: round; vector-effect: non-scaling-stroke; pointer-events: none; }
+    .chart-focus { opacity: 0; }
+    .chart-hit:hover + .chart-focus, .chart-hit:focus + .chart-focus { opacity: 1; }
     .chart-tooltip {
       position: absolute;
       z-index: 12;
@@ -849,14 +850,16 @@
       if (!points || !points.length) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待流量样本</text></svg></div>`;
       const values = points.map(p => Number(p.value));
       const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, .01);
+      const chartLeft = 4, chartRight = 316, chartTop = 10, chartBottom = 48;
       const coords = values.map((value, i) => {
-        const x = values.length === 1 ? 160 : i / (values.length - 1) * 316 + 2;
-        return { x: Number(x.toFixed(1)), y: Number((53 - ((value - min) / span) * 45).toFixed(1)) };
+        const x = values.length === 1 ? 160 : i / (values.length - 1) * (chartRight - chartLeft) + chartLeft;
+        const y = chartBottom - ((value - min) / span) * (chartBottom - chartTop);
+        return { x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) };
       });
       const polyline = coords.map(point => `${point.x},${point.y}`).join(" ");
-      const hits = coords.map((point, index) => `<circle class="chart-hit" cx="${point.x}" cy="${point.y}" r="9" tabindex="0" data-point="${index}" data-x="${point.x}" aria-label="查看第 ${index + 1} 个检测样本"></circle>`).join("");
+      const hits = coords.map((point, index) => `<circle class="chart-hit" cx="${point.x}" cy="${point.y}" r="9" tabindex="0" data-point="${index}" data-x="${point.x}" aria-label="查看第 ${index + 1} 个检测样本"></circle><path class="chart-focus" d="M ${point.x} ${point.y} h .01"></path>`).join("");
       const latest = coords[coords.length - 1];
-      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M2 53 H318" stroke="#e1e7e3" stroke-width="1"/>${coords.length > 1 ? `<polyline points="${polyline}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>` : ""}<circle class="chart-point" cx="${latest.x}" cy="${latest.y}" r="3"></circle>${hits}</svg><div class="chart-tooltip" role="tooltip" hidden></div></div>`;
+      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M4 53 H316" stroke="#e1e7e3" stroke-width="1"/>${coords.length > 1 ? `<polyline points="${polyline}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>` : ""}<path class="chart-point" d="M ${latest.x} ${latest.y} h .01"></path>${hits}</svg><div class="chart-tooltip" role="tooltip" hidden></div></div>`;
     }
 
     function instanceCard(item) {
