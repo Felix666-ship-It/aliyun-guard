@@ -1050,6 +1050,7 @@ def _instance_payload(guard, user, index):
         "instance_id": str(user.get("instance_id", "")),
         "traffic_limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
         "actions_enabled": bool(user.get("actions_enabled", True)),
+        "instance_log_enabled": bool(user.get("instance_log_enabled", False)),
         "paused": bool(user.get("paused", False)),
         "billing": _billing_payload(guard, user),
         "schedule": {
@@ -1188,6 +1189,11 @@ def build_instance_candidate(guard, data, existing=None):
     candidate["actions_enabled"] = _boolean(
         data, "actions_enabled", bool(existing.get("actions_enabled", True))
     )
+    candidate["instance_log_enabled"] = _boolean(
+        data,
+        "instance_log_enabled",
+        bool(existing.get("instance_log_enabled", False)),
+    )
     candidate["paused"] = bool(existing.get("paused", False))
     candidate["billing"] = _normalize_billing(
         guard, data.get("billing"), existing
@@ -1265,6 +1271,21 @@ def validate_instance(guard, index):
             guard.compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
             502,
         )
+
+
+def update_instance_logging(guard, index, enabled):
+    if not isinstance(enabled, bool):
+        raise ManagementError("enabled 必须是布尔值")
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise ManagementError("实例不存在", 404)
+    users[index]["instance_log_enabled"] = enabled
+    _save_config(guard, config)
+    return {
+        "enabled": enabled,
+        "instance": _instance_payload(guard, users[index], index),
+    }
 
 
 def delete_instance(guard, index, instance_id):
@@ -1654,7 +1675,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -1889,6 +1910,9 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "region": str(user.get("region", "")),
                 "paused": bool(user.get("paused", False)),
                 "actions_enabled": bool(user.get("actions_enabled", True)),
+                "instance_log_enabled": bool(
+                    user.get("instance_log_enabled", False)
+                ),
                 "traffic_gb": traffic,
                 "traffic_limit_gb": limit,
                 "traffic_percent": percent,
@@ -1964,9 +1988,7 @@ def management_payload(guard):
     return payload
 
 
-def read_recent_logs(guard, limit=200):
-    limit = max(20, min(500, int(limit)))
-    path = Path(guard.LOG_FILE)
+def _read_recent_log_path(path, limit):
     if not path.exists():
         return []
     try:
@@ -1975,6 +1997,41 @@ def read_recent_logs(guard, limit=200):
     except OSError as exc:
         raise WebPanelError("无法读取日志: {}".format(exc), 500)
     return [line.rstrip("\r\n") for line in lines[-limit:]]
+
+
+def logs_payload(guard, limit=200, instance_index=None):
+    try:
+        limit = max(20, min(500, int(limit)))
+    except (TypeError, ValueError):
+        raise WebPanelError("日志行数必须是整数")
+    if instance_index in (None, "", "system"):
+        return {
+            "lines": _read_recent_log_path(Path(guard.LOG_FILE), limit),
+            "source": "system",
+            "name": "系统总日志",
+            "instance_id": None,
+            "index": None,
+            "enabled": True,
+            "toggle_available": False,
+        }
+    try:
+        index = int(instance_index)
+    except (TypeError, ValueError):
+        raise WebPanelError("实例日志序号无效")
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise WebPanelError("实例不存在", 404)
+    user = users[index]
+    return {
+        "lines": _read_recent_log_path(guard.instance_log_path(user), limit),
+        "source": "instance",
+        "name": str(user.get("name") or user.get("instance_id")),
+        "instance_id": str(user.get("instance_id", "")),
+        "index": index,
+        "enabled": guard.instance_log_enabled(user),
+        "toggle_available": True,
+    }
 
 
 def save_config(guard, config):
@@ -2038,6 +2095,41 @@ def update_settings(guard, data):
     return {"interval_seconds": interval, "notification_mode": mode}
 
 
+def _write_manual_instance_log(
+    guard,
+    user,
+    action,
+    before=None,
+    after=None,
+    traffic=None,
+    performed=False,
+    message="",
+    errors=None,
+    level="error",
+):
+    guard.write_instance_log(
+        user,
+        {
+            "name": str(user.get("name") or user.get("instance_id")),
+            "instance_id": str(user.get("instance_id", "")),
+            "traffic_gb": traffic,
+            "limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
+            "status_before": before,
+            "status_after": after or before,
+            "billing_enabled": bool(
+                guard.get_billing_config(user).get("enabled", True)
+            ),
+            "billing_checked": False,
+            "action": "manual_{}".format(action),
+            "action_performed": performed,
+            "level": level,
+            "message": message,
+            "errors": list(errors or []),
+        },
+        event="网页手动{}".format("开机" if action == "start" else "关机"),
+    )
+
+
 def control_instance(guard, index, action):
     if action not in ("start", "stop"):
         raise WebPanelError("开关机动作无效")
@@ -2051,22 +2143,26 @@ def control_instance(guard, index, action):
         user = users[index]
         name = str(user.get("name") or user.get("instance_id"))
         secrets_to_hide = (user.get("ak"), user.get("sk"))
-        schedule_target = guard.schedule_target(user)
-        automation_active = bool(user.get("actions_enabled", True)) and not bool(
-            user.get("paused", False)
-        )
-        if action == "stop" and automation_active and schedule_target != "stopped":
-            raise WebPanelError(
-                "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控", 409
-            )
-        if action == "start" and automation_active and schedule_target == "stopped":
-            raise WebPanelError(
-                "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
-            )
+        before = None
+        after = None
+        traffic = None
+        performed = False
+        poll_error = None
         try:
+            schedule_target = guard.schedule_target(user)
+            automation_active = bool(user.get("actions_enabled", True)) and not bool(
+                user.get("paused", False)
+            )
+            if action == "stop" and automation_active and schedule_target != "stopped":
+                raise WebPanelError(
+                    "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控",
+                    409,
+                )
+            if action == "start" and automation_active and schedule_target == "stopped":
+                raise WebPanelError(
+                    "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
+                )
             before = guard.query_instance_status(user)
-            traffic = None
-            performed = False
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -2087,29 +2183,52 @@ def control_instance(guard, index, action):
                         int(config.get("start_poll_seconds", 5)),
                     )
                 else:
-                    after, poll_error = before, None
+                    after = before
+            elif before != "Stopped":
+                guard.stop_instance(user)
+                performed = True
+                after, poll_error = guard.wait_for_status(
+                    user,
+                    "Stopped",
+                    int(config.get("stop_wait_seconds", 45)),
+                    int(config.get("start_poll_seconds", 5)),
+                )
             else:
-                if before != "Stopped":
-                    guard.stop_instance(user)
-                    performed = True
-                    after, poll_error = guard.wait_for_status(
-                        user,
-                        "Stopped",
-                        int(config.get("stop_wait_seconds", 45)),
-                        int(config.get("start_poll_seconds", 5)),
-                    )
-                else:
-                    after, poll_error = before, None
-        except WebPanelError:
+                after = before
+        except WebPanelError as exc:
+            message = "网页控制台手动{}未执行: {}".format(
+                "开机" if action == "start" else "关机", exc
+            )
+            _write_manual_instance_log(
+                guard,
+                user,
+                action,
+                before=before,
+                after=after,
+                traffic=traffic,
+                performed=performed,
+                message=message,
+                errors=[str(exc)],
+            )
             raise
         except Exception as exc:
-            raise WebPanelError(
-                "实例{}失败: {}".format(
-                    "开机" if action == "start" else "关机",
-                    guard.compact_error(exc, secrets=secrets_to_hide),
-                ),
-                502,
+            error = guard.compact_error(exc, secrets=secrets_to_hide)
+            message = "实例{}失败: {}".format(
+                "开机" if action == "start" else "关机", error
             )
+            _write_manual_instance_log(
+                guard,
+                user,
+                action,
+                before=before,
+                after=after,
+                traffic=traffic,
+                performed=performed,
+                message=message,
+                errors=[error],
+            )
+            raise WebPanelError(message, 502)
+
         message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
             "开机" if action == "start" else "关机",
             name,
@@ -2126,6 +2245,12 @@ def control_instance(guard, index, action):
             notify_error = guard.compact_error(
                 exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
             )
+        log_errors = []
+        if poll_error:
+            log_errors.append("ECS 状态复查失败: {}".format(poll_error))
+        if notify_error:
+            log_errors.append("Telegram 通知失败: {}".format(notify_error))
+        level = "warning" if log_errors else ("action" if performed else "ok")
         checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         state = guard.load_state()
         instances = state.setdefault("instances", {})
@@ -2134,7 +2259,18 @@ def control_instance(guard, index, action):
             previous = {}
         if traffic is None:
             traffic = previous.get("traffic_gb")
-        level = "action" if performed else "ok"
+        _write_manual_instance_log(
+            guard,
+            user,
+            action,
+            before=before,
+            after=after,
+            traffic=traffic,
+            performed=performed,
+            message=message,
+            errors=log_errors,
+            level=level,
+        )
         instances[str(user.get("instance_id", ""))] = dict(
             previous,
             name=name,
@@ -2422,7 +2558,14 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
-                self._json({"lines": read_recent_logs(self.server.guard, limit)})
+                instance_index = query.get("instance", [None])[0]
+                self._json(
+                    logs_payload(
+                        self.server.guard,
+                        limit=limit,
+                        instance_index=instance_index,
+                    )
+                )
                 return
             if parts == ["api", "job"]:
                 with self.server.job_lock:
@@ -2566,6 +2709,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 if parts[3] == "pause":
                     result = update_pause(self.server.guard, index, data.get("paused"))
                     self._json({"ok": True, "paused": result})
+                    return
+                if parts[3] == "logging":
+                    result = web_actions.update_instance_logging(
+                        self.server.guard, index, data.get("enabled")
+                    )
+                    self._json({"ok": True, "result": result})
                     return
                 if parts[3] == "power":
                     result = control_instance(self.server.guard, index, data.get("action"))
@@ -3198,6 +3347,8 @@ __AG_WEB_PY_EOF__
       border-radius: var(--radius);
     }
     .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .log-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    .log-source { width: min(300px, 46vw); min-height: 38px; padding-block: 7px; }
     .log-view {
       min-height: 520px;
       max-height: calc(100vh - 235px);
@@ -3317,6 +3468,8 @@ __AG_WEB_PY_EOF__
       .panel.full { grid-column: auto; }
       .section-heading { flex-wrap: wrap; }
       .section-actions { width: 100%; justify-content: flex-start; }
+      .log-actions { width: 100%; justify-content: flex-start; }
+      .log-source { width: auto; flex: 1 1 220px; }
       .card-head { align-items: flex-start; }
       .card-head-tools { gap: 6px; }
       .status-badge { min-width: 74px; padding: 0 8px; }
@@ -3332,6 +3485,7 @@ __AG_WEB_PY_EOF__
       .mode-grid { grid-template-columns: 1fr 1fr; }
       .node-row { grid-template-columns: 1fr; }
       .node-actions { overflow-x: auto; }
+      .log-source { flex-basis: 100%; }
     }
   </style>
 </head>
@@ -3464,7 +3618,14 @@ __AG_WEB_PY_EOF__
       </section>
 
       <section id="logsTab" class="tab-panel" hidden>
-        <div class="section-heading"><div><h1>运行日志</h1><p>最近 200 行</p></div><button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button></div>
+        <div class="section-heading">
+          <div><h1>运行日志</h1><p id="logsDescription">系统总日志 · 最近 200 行</p></div>
+          <div class="section-actions log-actions">
+            <select id="logSource" class="log-source" aria-label="日志来源"><option value="system">系统总日志</option></select>
+            <button id="instanceLogToggle" class="button secondary" type="button" hidden><span data-icon="terminal"></span><span id="instanceLogToggleText">启用独立日志</span></button>
+            <button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button>
+          </div>
+        </div>
         <pre id="logView" class="log-view">正在读取...</pre>
       </section>
 
@@ -3540,6 +3701,7 @@ __AG_WEB_PY_EOF__
           <div class="field"><label for="instanceSk">AccessKey Secret</label><input id="instanceSk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="trafficLimit">CDT 关机阈值（GB）</label><input id="trafficLimit" type="number" min="0.01" step="0.01" required></div>
           <label class="check-row"><input id="actionsEnabled" type="checkbox">允许自动开机与关机</label>
+          <label class="check-row"><input id="instanceLogEnabled" type="checkbox">记录该实例独立日志</label>
           <label class="check-row"><input id="billingEnabled" type="checkbox">查询本月实例账单</label>
           <div id="billingSiteField" class="field"><label for="billingSite">账单站点</label><select id="billingSite"><option value="china">阿里云中国站</option><option value="international">阿里云国际站</option><option value="custom">自定义</option></select></div>
           <div id="billingCustomFields" class="wide form-grid" hidden>
@@ -3610,7 +3772,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -3710,6 +3872,7 @@ __AG_WEB_PY_EOF__
                 <button class="menu-button ${item.paused ? "" : "warning"}" type="button" role="menuitem" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复监控" : "暂停监控"}</span></button>
                 <button class="menu-button" type="button" role="menuitem" data-action="edit">${icon("pencil")}<span>编辑配置</span></button>
                 <button class="menu-button" type="button" role="menuitem" data-action="validate">${icon("shield-check")}<span>只读校验</span></button>
+                <button class="menu-button" type="button" role="menuitem" data-action="logs">${icon("terminal")}<span>查看独立日志${item.instance_log_enabled ? "（已启用）" : ""}</span></button>
                 <button class="menu-button danger" type="button" role="menuitem" data-action="delete">${icon("trash-2")}<span>删除监控实例</span></button>
               </div>
             </details>
@@ -3762,6 +3925,9 @@ __AG_WEB_PY_EOF__
 
     function renderManagement(data) {
       state.management = data;
+      const selectedLogSource = $("logSource").value || "system";
+      $("logSource").innerHTML = '<option value="system">系统总日志</option>' + data.instances.map(item => `<option value="${item.index}">${esc(item.name)} (${esc(item.instance_id)}) · ${item.instance_log_enabled ? "已启用" : "已关闭"}</option>`).join("");
+      $("logSource").value = Array.from($("logSource").options).some(option => option.value === selectedLogSource) ? selectedLogSource : "system";
       const telegram = data.telegram;
       $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
       $("connectionDescription").textContent = telegram.connection_description;
@@ -3818,7 +3984,19 @@ __AG_WEB_PY_EOF__
 
     async function loadLogs() {
       $("logView").textContent = "正在读取...";
-      try { const data = await api("/api/logs?limit=200"); $("logView").textContent = data.lines.length ? data.lines.join("\n") : "日志尚未生成。"; $("logView").scrollTop = $("logView").scrollHeight; }
+      try {
+        const selected = $("logSource").value || "system";
+        const suffix = selected === "system" ? "" : `&instance=${encodeURIComponent(selected)}`;
+        const data = await api(`/api/logs?limit=200${suffix}`);
+        state.logs = data;
+        $("logsDescription").textContent = `${data.name}${data.instance_id ? ` (${data.instance_id})` : ""} · 最近 200 行`;
+        $("instanceLogToggle").hidden = !data.toggle_available;
+        $("instanceLogToggle").classList.toggle("warning", data.enabled);
+        $("instanceLogToggleText").textContent = data.enabled ? "停用独立日志" : "启用独立日志";
+        const emptyText = data.source === "instance" && !data.enabled ? "独立日志已关闭，且尚无历史记录。" : "日志尚未生成。";
+        $("logView").textContent = data.lines.length ? data.lines.join("\n") : emptyText;
+        $("logView").scrollTop = $("logView").scrollHeight;
+      }
       catch (error) { $("logView").textContent = error.message; }
     }
 
@@ -3871,6 +4049,7 @@ __AG_WEB_PY_EOF__
       $("instanceSk").placeholder = existing?.secret_key_configured ? "已保存，留空不修改" : "请输入 AccessKey Secret";
       $("trafficLimit").value = existing?.traffic_limit_gb ?? 180;
       $("actionsEnabled").checked = existing?.actions_enabled ?? true;
+      $("instanceLogEnabled").checked = existing?.instance_log_enabled ?? false;
       $("billingEnabled").checked = existing?.billing.enabled ?? true;
       $("billingSite").value = existing?.billing.site || "china";
       $("billingEndpoint").value = existing?.billing.endpoint || "";
@@ -3894,6 +4073,7 @@ __AG_WEB_PY_EOF__
         instance_id: $("instanceId").value.trim(),
         traffic_limit_gb: Number($("trafficLimit").value),
         actions_enabled: $("actionsEnabled").checked,
+        instance_log_enabled: $("instanceLogEnabled").checked,
         billing: {
           enabled: $("billingEnabled").checked,
           site: $("billingSite").value,
@@ -3981,6 +4161,19 @@ __AG_WEB_PY_EOF__
     $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
     $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await Promise.all([loadDashboard(), loadManagement()]); $("refreshButton").querySelector("svg").classList.remove("spin"); });
     $("logsRefresh").addEventListener("click", loadLogs);
+    $("logSource").addEventListener("change", loadLogs);
+    $("instanceLogToggle").addEventListener("click", async () => {
+      if (!state.logs?.toggle_available) return;
+      const enabled = !state.logs.enabled;
+      $("instanceLogToggle").disabled = true;
+      try {
+        await api(`/api/instances/${state.logs.index}/logging`, { method: "POST", body: { enabled } });
+        toast(enabled ? "该实例独立日志已启用" : "该实例独立日志已停用，历史日志已保留");
+        await Promise.all([loadDashboard(false), loadManagement(false)]);
+        await loadLogs();
+      } catch (error) { toast(error.message, true); }
+      finally { $("instanceLogToggle").disabled = false; }
+    });
     $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
     $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: false } }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
     $("dryRunButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: true } }); toast("演练检测已启动，不会执行开关机"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
@@ -3997,6 +4190,12 @@ __AG_WEB_PY_EOF__
       if (button.dataset.action === "edit") {
         if (!state.management) await loadManagement();
         openInstanceDialog(index);
+        return;
+      }
+      if (button.dataset.action === "logs") {
+        if (!state.management) await loadManagement();
+        $("logSource").value = String(index);
+        document.querySelector('.tab-button[data-tab="logs"]').click();
         return;
       }
       if (button.dataset.action === "validate") {
@@ -4220,11 +4419,13 @@ __AG_WEB_HTML_EOF__
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -4320,6 +4521,7 @@ LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
 _CYCLE_THREAD_LOCK = threading.Lock()
+_INSTANCE_LOG_LOCK = threading.Lock()
 
 
 class GuardError(RuntimeError):
@@ -4327,7 +4529,8 @@ class GuardError(RuntimeError):
 
 
 def configure_logging(console=True):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(LOG_FILE.parent), 0o700)
     LOGGER.handlers = []
     LOGGER.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -4336,6 +4539,7 @@ def configure_logging(console=True):
     )
     file_handler.setFormatter(formatter)
     LOGGER.addHandler(file_handler)
+    os.chmod(str(LOG_FILE), 0o600)
     if console:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
@@ -4448,6 +4652,10 @@ def validate_config(config):
     for index, user in enumerate(users, 1):
         if not isinstance(user, dict):
             raise GuardError("第 {} 个实例配置不是对象".format(index))
+        if "instance_log_enabled" in user and not isinstance(
+            user["instance_log_enabled"], bool
+        ):
+            raise GuardError("第 {} 个实例的独立日志开关必须是布尔值".format(index))
         for field in ("name", "ak", "sk", "region", "instance_id"):
             if not str(user.get(field, "")).strip():
                 raise GuardError("第 {} 个实例缺少 {}".format(index, field))
@@ -4560,6 +4768,148 @@ def compact_error(exc, limit=500, secrets=None):
         if secret:
             text = text.replace(secret, "***")
     return text[:limit] if text else exc.__class__.__name__
+
+
+def instance_log_enabled(user):
+    return bool(user.get("instance_log_enabled", False))
+
+
+def instance_log_path(user):
+    """Return a deterministic path below the private instance log directory."""
+    instance_id = str(user.get("instance_id", "") or "").strip()
+    region = str(user.get("region", "") or "").strip()
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", instance_id)
+    safe_id = safe_id.strip(".-_")[:64] or "instance"
+    digest = hashlib.sha256(
+        "{}\0{}".format(region, instance_id).encode("utf-8")
+    ).hexdigest()[:10]
+    return LOG_FILE.parent / "instances" / "{}-{}.log".format(safe_id, digest)
+
+
+def _instance_log_value(value, user, limit=500):
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    for secret in (user.get("ak"), user.get("sk")):
+        secret = str(secret or "")
+        if secret:
+            text = text.replace(secret, "***")
+    text = re.sub(
+        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss)://[^\s；，,]+",
+        "[链接已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])\d{6,12}:[A-Za-z0-9_-]{20,}",
+        "[Bot Token 已隐藏]",
+        text,
+    )
+    return text[:limit] or "-"
+
+
+def _instance_log_message(user, result, dry_run=False, event="周期检测"):
+    traffic = result.get("traffic_gb")
+    limit = result.get("limit_gb")
+    if traffic is None:
+        traffic_text = "无数据"
+    elif limit is None:
+        traffic_text = "{:.2f} GB".format(float(traffic))
+    else:
+        traffic_text = "{:.2f}/{:.2f} GB".format(float(traffic), float(limit))
+
+    before = result.get("status_before") or "Unknown"
+    after = result.get("status_after") or before
+    status_text = str(before) if before == after else "{}->{}".format(before, after)
+
+    if result.get("billing_checked", True) is False:
+        bill_text = "未查询"
+    elif not result.get("billing_enabled", False):
+        bill_text = "已关闭"
+    elif result.get("bill_error"):
+        bill_text = "失败: {}".format(
+            _instance_log_value(result.get("bill_error"), user)
+        )
+    elif result.get("bill_amount") is not None:
+        bill_text = "{}{:.2f} {}".format(
+            result.get("bill_symbol", ""),
+            float(result["bill_amount"]),
+            result.get("bill_currency") or "",
+        ).strip()
+    else:
+        bill_text = "无数据"
+
+    errors = result.get("errors", [])
+    if not isinstance(errors, list):
+        errors = [errors]
+    errors_text = "；".join(
+        _instance_log_value(value, user) for value in errors if value
+    ) or "无"
+    return " | ".join(
+        (
+            "事件={}".format(_instance_log_value(event, user, 80)),
+            "实例={} ({})".format(
+                _instance_log_value(result.get("name") or user.get("name"), user, 120),
+                _instance_log_value(result.get("instance_id") or user.get("instance_id"), user, 120),
+            ),
+            "结果={}".format(_instance_log_value(result.get("level", "unknown"), user, 40)),
+            "流量={}".format(traffic_text),
+            "ECS={}".format(_instance_log_value(status_text, user, 120)),
+            "账单={}".format(_instance_log_value(bill_text, user, 500)),
+            "动作={}".format(_instance_log_value(result.get("action", "none"), user, 80)),
+            "已执行={}".format("是" if result.get("action_performed") else "否"),
+            "演练={}".format("是" if dry_run else "否"),
+            "说明={}".format(_instance_log_value(result.get("message"), user, 500)),
+            "错误={}".format(errors_text),
+        )
+    )
+
+
+def write_instance_log(user, result, dry_run=False, event="周期检测"):
+    """Write one redacted result line when per-instance logging is enabled."""
+    if not instance_log_enabled(user):
+        return False
+    path = instance_log_path(user)
+    try:
+        with _INSTANCE_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(path.parent), 0o700)
+            handler = TimedRotatingFileHandler(
+                str(path),
+                when="midnight",
+                interval=1,
+                backupCount=14,
+                encoding="utf-8",
+                delay=True,
+            )
+            try:
+                handler.setFormatter(
+                    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                )
+                level = {
+                    "error": logging.ERROR,
+                    "warning": logging.WARNING,
+                    "action": logging.INFO,
+                    "paused": logging.INFO,
+                }.get(result.get("level"), logging.INFO)
+                record = logging.LogRecord(
+                    "aliyun_guard.instance",
+                    level,
+                    __file__,
+                    0,
+                    _instance_log_message(user, result, dry_run=dry_run, event=event),
+                    (),
+                    None,
+                )
+                handler.handle(record)
+            finally:
+                handler.close()
+            os.chmod(str(path), 0o600)
+        return True
+    except Exception as exc:
+        LOGGER.error(
+            "[%s] 独立日志写入失败: %s",
+            user.get("name") or user.get("instance_id") or "未命名",
+            compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+        )
+        return False
 
 
 def require_sdk():
@@ -5520,15 +5870,15 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         transition = schedule_transition(
             user, previous_instances.get(instance_id, {}), started_at
         )
-        results.append(
-            check_one(
-                user,
-                config,
-                dry_run=dry_run,
-                now=started_at,
-                scheduled_action=transition,
-            )
+        result = check_one(
+            user,
+            config,
+            dry_run=dry_run,
+            now=started_at,
+            scheduled_action=transition,
         )
+        results.append(result)
+        write_instance_log(user, result, dry_run=dry_run)
     duration = time.monotonic() - monotonic_start
     summary, error_count, action_count, warning_count = build_summary(
         results, started_at, duration, dry_run=dry_run
@@ -5812,8 +6162,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.4.2"
-LOCAL_RELEASE_ID = "1c7c1150c37d0e303402e0367798aca7c09740006fd1bd35985059d2438a28ea"
+APP_VERSION = "1.5.0"
+LOCAL_RELEASE_ID = "ab32a0ca2ceecf6abba4245cd3f85da04aad01ca7b1154cbe69f2cc1471a0f23"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -6554,6 +6904,10 @@ def collect_user(existing=None):
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
+    user["instance_log_enabled"] = yes_no(
+        "为该实例启用独立日志",
+        bool(existing.get("instance_log_enabled", False)),
+    )
     user["schedule"] = collect_schedule(existing)
     user["paused"] = bool(existing.get("paused", False))
     return user
@@ -6848,8 +7202,31 @@ def run_once(dry_run=False):
     return subprocess.call(command)
 
 
-def show_logs(lines=80):
-    path = guard.LOG_FILE
+def show_logs(config, lines=80):
+    users = config.get("users", [])
+    title("选择日志来源")
+    print(" 1) 系统总日志")
+    for index, user in enumerate(users, 2):
+        status = "已启用" if guard.instance_log_enabled(user) else "已关闭"
+        print(
+            " {:>2}) {} ({})  [独立日志{}]".format(
+                index,
+                user.get("name") or user.get("instance_id"),
+                user.get("instance_id"),
+                status,
+            )
+        )
+    choice = prompt_int("日志来源序号", 1, 1, len(users) + 1)
+    if choice == 1:
+        path = guard.LOG_FILE
+        label = "系统总日志"
+    else:
+        user = users[choice - 2]
+        path = guard.instance_log_path(user)
+        label = "{} 独立日志".format(user.get("name") or user.get("instance_id"))
+        if not guard.instance_log_enabled(user):
+            print("该实例独立日志当前已关闭，仅显示已有历史记录。")
+    print("\n{}（最近 {} 行）: {}".format(label, lines, path))
     if not path.exists():
         print("日志尚未生成: {}".format(path))
         return
@@ -7119,7 +7496,7 @@ def menu():
             elif choice == 13:
                 edit_settings(config)
             elif choice == 14:
-                show_logs()
+                show_logs(config)
             elif choice == 15:
                 run_control("restart")
             elif choice == 16:

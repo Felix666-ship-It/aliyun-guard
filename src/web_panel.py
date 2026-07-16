@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -265,6 +265,9 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "region": str(user.get("region", "")),
                 "paused": bool(user.get("paused", False)),
                 "actions_enabled": bool(user.get("actions_enabled", True)),
+                "instance_log_enabled": bool(
+                    user.get("instance_log_enabled", False)
+                ),
                 "traffic_gb": traffic,
                 "traffic_limit_gb": limit,
                 "traffic_percent": percent,
@@ -340,9 +343,7 @@ def management_payload(guard):
     return payload
 
 
-def read_recent_logs(guard, limit=200):
-    limit = max(20, min(500, int(limit)))
-    path = Path(guard.LOG_FILE)
+def _read_recent_log_path(path, limit):
     if not path.exists():
         return []
     try:
@@ -351,6 +352,41 @@ def read_recent_logs(guard, limit=200):
     except OSError as exc:
         raise WebPanelError("无法读取日志: {}".format(exc), 500)
     return [line.rstrip("\r\n") for line in lines[-limit:]]
+
+
+def logs_payload(guard, limit=200, instance_index=None):
+    try:
+        limit = max(20, min(500, int(limit)))
+    except (TypeError, ValueError):
+        raise WebPanelError("日志行数必须是整数")
+    if instance_index in (None, "", "system"):
+        return {
+            "lines": _read_recent_log_path(Path(guard.LOG_FILE), limit),
+            "source": "system",
+            "name": "系统总日志",
+            "instance_id": None,
+            "index": None,
+            "enabled": True,
+            "toggle_available": False,
+        }
+    try:
+        index = int(instance_index)
+    except (TypeError, ValueError):
+        raise WebPanelError("实例日志序号无效")
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise WebPanelError("实例不存在", 404)
+    user = users[index]
+    return {
+        "lines": _read_recent_log_path(guard.instance_log_path(user), limit),
+        "source": "instance",
+        "name": str(user.get("name") or user.get("instance_id")),
+        "instance_id": str(user.get("instance_id", "")),
+        "index": index,
+        "enabled": guard.instance_log_enabled(user),
+        "toggle_available": True,
+    }
 
 
 def save_config(guard, config):
@@ -414,6 +450,41 @@ def update_settings(guard, data):
     return {"interval_seconds": interval, "notification_mode": mode}
 
 
+def _write_manual_instance_log(
+    guard,
+    user,
+    action,
+    before=None,
+    after=None,
+    traffic=None,
+    performed=False,
+    message="",
+    errors=None,
+    level="error",
+):
+    guard.write_instance_log(
+        user,
+        {
+            "name": str(user.get("name") or user.get("instance_id")),
+            "instance_id": str(user.get("instance_id", "")),
+            "traffic_gb": traffic,
+            "limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
+            "status_before": before,
+            "status_after": after or before,
+            "billing_enabled": bool(
+                guard.get_billing_config(user).get("enabled", True)
+            ),
+            "billing_checked": False,
+            "action": "manual_{}".format(action),
+            "action_performed": performed,
+            "level": level,
+            "message": message,
+            "errors": list(errors or []),
+        },
+        event="网页手动{}".format("开机" if action == "start" else "关机"),
+    )
+
+
 def control_instance(guard, index, action):
     if action not in ("start", "stop"):
         raise WebPanelError("开关机动作无效")
@@ -427,22 +498,26 @@ def control_instance(guard, index, action):
         user = users[index]
         name = str(user.get("name") or user.get("instance_id"))
         secrets_to_hide = (user.get("ak"), user.get("sk"))
-        schedule_target = guard.schedule_target(user)
-        automation_active = bool(user.get("actions_enabled", True)) and not bool(
-            user.get("paused", False)
-        )
-        if action == "stop" and automation_active and schedule_target != "stopped":
-            raise WebPanelError(
-                "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控", 409
-            )
-        if action == "start" and automation_active and schedule_target == "stopped":
-            raise WebPanelError(
-                "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
-            )
+        before = None
+        after = None
+        traffic = None
+        performed = False
+        poll_error = None
         try:
+            schedule_target = guard.schedule_target(user)
+            automation_active = bool(user.get("actions_enabled", True)) and not bool(
+                user.get("paused", False)
+            )
+            if action == "stop" and automation_active and schedule_target != "stopped":
+                raise WebPanelError(
+                    "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控",
+                    409,
+                )
+            if action == "start" and automation_active and schedule_target == "stopped":
+                raise WebPanelError(
+                    "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
+                )
             before = guard.query_instance_status(user)
-            traffic = None
-            performed = False
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
@@ -463,29 +538,52 @@ def control_instance(guard, index, action):
                         int(config.get("start_poll_seconds", 5)),
                     )
                 else:
-                    after, poll_error = before, None
+                    after = before
+            elif before != "Stopped":
+                guard.stop_instance(user)
+                performed = True
+                after, poll_error = guard.wait_for_status(
+                    user,
+                    "Stopped",
+                    int(config.get("stop_wait_seconds", 45)),
+                    int(config.get("start_poll_seconds", 5)),
+                )
             else:
-                if before != "Stopped":
-                    guard.stop_instance(user)
-                    performed = True
-                    after, poll_error = guard.wait_for_status(
-                        user,
-                        "Stopped",
-                        int(config.get("stop_wait_seconds", 45)),
-                        int(config.get("start_poll_seconds", 5)),
-                    )
-                else:
-                    after, poll_error = before, None
-        except WebPanelError:
+                after = before
+        except WebPanelError as exc:
+            message = "网页控制台手动{}未执行: {}".format(
+                "开机" if action == "start" else "关机", exc
+            )
+            _write_manual_instance_log(
+                guard,
+                user,
+                action,
+                before=before,
+                after=after,
+                traffic=traffic,
+                performed=performed,
+                message=message,
+                errors=[str(exc)],
+            )
             raise
         except Exception as exc:
-            raise WebPanelError(
-                "实例{}失败: {}".format(
-                    "开机" if action == "start" else "关机",
-                    guard.compact_error(exc, secrets=secrets_to_hide),
-                ),
-                502,
+            error = guard.compact_error(exc, secrets=secrets_to_hide)
+            message = "实例{}失败: {}".format(
+                "开机" if action == "start" else "关机", error
             )
+            _write_manual_instance_log(
+                guard,
+                user,
+                action,
+                before=before,
+                after=after,
+                traffic=traffic,
+                performed=performed,
+                message=message,
+                errors=[error],
+            )
+            raise WebPanelError(message, 502)
+
         message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
             "开机" if action == "start" else "关机",
             name,
@@ -502,6 +600,12 @@ def control_instance(guard, index, action):
             notify_error = guard.compact_error(
                 exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
             )
+        log_errors = []
+        if poll_error:
+            log_errors.append("ECS 状态复查失败: {}".format(poll_error))
+        if notify_error:
+            log_errors.append("Telegram 通知失败: {}".format(notify_error))
+        level = "warning" if log_errors else ("action" if performed else "ok")
         checked_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         state = guard.load_state()
         instances = state.setdefault("instances", {})
@@ -510,7 +614,18 @@ def control_instance(guard, index, action):
             previous = {}
         if traffic is None:
             traffic = previous.get("traffic_gb")
-        level = "action" if performed else "ok"
+        _write_manual_instance_log(
+            guard,
+            user,
+            action,
+            before=before,
+            after=after,
+            traffic=traffic,
+            performed=performed,
+            message=message,
+            errors=log_errors,
+            level=level,
+        )
         instances[str(user.get("instance_id", ""))] = dict(
             previous,
             name=name,
@@ -798,7 +913,14 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
-                self._json({"lines": read_recent_logs(self.server.guard, limit)})
+                instance_index = query.get("instance", [None])[0]
+                self._json(
+                    logs_payload(
+                        self.server.guard,
+                        limit=limit,
+                        instance_index=instance_index,
+                    )
+                )
                 return
             if parts == ["api", "job"]:
                 with self.server.job_lock:
@@ -942,6 +1064,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 if parts[3] == "pause":
                     result = update_pause(self.server.guard, index, data.get("paused"))
                     self._json({"ok": True, "paused": result})
+                    return
+                if parts[3] == "logging":
+                    result = web_actions.update_instance_logging(
+                        self.server.guard, index, data.get("enabled")
+                    )
+                    self._json({"ok": True, "result": result})
                     return
                 if parts[3] == "power":
                     result = control_instance(self.server.guard, index, data.get("action"))

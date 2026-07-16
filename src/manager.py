@@ -28,7 +28,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -770,6 +770,10 @@ def collect_user(existing=None):
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
+    user["instance_log_enabled"] = yes_no(
+        "为该实例启用独立日志",
+        bool(existing.get("instance_log_enabled", False)),
+    )
     user["schedule"] = collect_schedule(existing)
     user["paused"] = bool(existing.get("paused", False))
     return user
@@ -1064,8 +1068,31 @@ def run_once(dry_run=False):
     return subprocess.call(command)
 
 
-def show_logs(lines=80):
-    path = guard.LOG_FILE
+def show_logs(config, lines=80):
+    users = config.get("users", [])
+    title("选择日志来源")
+    print(" 1) 系统总日志")
+    for index, user in enumerate(users, 2):
+        status = "已启用" if guard.instance_log_enabled(user) else "已关闭"
+        print(
+            " {:>2}) {} ({})  [独立日志{}]".format(
+                index,
+                user.get("name") or user.get("instance_id"),
+                user.get("instance_id"),
+                status,
+            )
+        )
+    choice = prompt_int("日志来源序号", 1, 1, len(users) + 1)
+    if choice == 1:
+        path = guard.LOG_FILE
+        label = "系统总日志"
+    else:
+        user = users[choice - 2]
+        path = guard.instance_log_path(user)
+        label = "{} 独立日志".format(user.get("name") or user.get("instance_id"))
+        if not guard.instance_log_enabled(user):
+            print("该实例独立日志当前已关闭，仅显示已有历史记录。")
+    print("\n{}（最近 {} 行）: {}".format(label, lines, path))
     if not path.exists():
         print("日志尚未生成: {}".format(path))
         return
@@ -1335,7 +1362,7 @@ def menu():
             elif choice == 13:
                 edit_settings(config)
             elif choice == 14:
-                show_logs()
+                show_logs(config)
             elif choice == 15:
                 run_control("restart")
             elif choice == 16:

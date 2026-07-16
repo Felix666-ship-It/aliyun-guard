@@ -30,6 +30,7 @@ def instance_config():
         "instance_id": "i-test-web-actions",
         "traffic_limit_gb": 180,
         "actions_enabled": True,
+        "instance_log_enabled": False,
         "paused": False,
         "billing": {"enabled": False, "site": "china"},
         "schedule": {
@@ -88,7 +89,17 @@ class WebActionTests(unittest.TestCase):
         self.assertNotIn("proxy_display", payload["telegram"])
         self.assertNotIn("api_base_display", payload["telegram"])
         self.assertNotIn("access_key", payload["instances"][0])
+        self.assertFalse(payload["instances"][0]["instance_log_enabled"])
         self.assertEqual(payload["telegram"]["nodes"][0]["description"], "VLESS 节点（Saved）")
+
+    def test_instance_logging_switch_persists(self):
+        result = web_actions.update_instance_logging(guard, 0, True)
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["instance"]["instance_log_enabled"])
+        self.assertTrue(guard.load_config()["users"][0]["instance_log_enabled"])
+        result = web_actions.update_instance_logging(guard, 0, False)
+        self.assertFalse(result["enabled"])
+        self.assertFalse(guard.load_config()["users"][0]["instance_log_enabled"])
 
     def test_failed_instance_validation_does_not_save_without_force(self):
         data = {

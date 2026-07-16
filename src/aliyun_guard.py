@@ -5,11 +5,13 @@
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -105,6 +107,7 @@ LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
 _CYCLE_THREAD_LOCK = threading.Lock()
+_INSTANCE_LOG_LOCK = threading.Lock()
 
 
 class GuardError(RuntimeError):
@@ -112,7 +115,8 @@ class GuardError(RuntimeError):
 
 
 def configure_logging(console=True):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(LOG_FILE.parent), 0o700)
     LOGGER.handlers = []
     LOGGER.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -121,6 +125,7 @@ def configure_logging(console=True):
     )
     file_handler.setFormatter(formatter)
     LOGGER.addHandler(file_handler)
+    os.chmod(str(LOG_FILE), 0o600)
     if console:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
@@ -233,6 +238,10 @@ def validate_config(config):
     for index, user in enumerate(users, 1):
         if not isinstance(user, dict):
             raise GuardError("第 {} 个实例配置不是对象".format(index))
+        if "instance_log_enabled" in user and not isinstance(
+            user["instance_log_enabled"], bool
+        ):
+            raise GuardError("第 {} 个实例的独立日志开关必须是布尔值".format(index))
         for field in ("name", "ak", "sk", "region", "instance_id"):
             if not str(user.get(field, "")).strip():
                 raise GuardError("第 {} 个实例缺少 {}".format(index, field))
@@ -345,6 +354,148 @@ def compact_error(exc, limit=500, secrets=None):
         if secret:
             text = text.replace(secret, "***")
     return text[:limit] if text else exc.__class__.__name__
+
+
+def instance_log_enabled(user):
+    return bool(user.get("instance_log_enabled", False))
+
+
+def instance_log_path(user):
+    """Return a deterministic path below the private instance log directory."""
+    instance_id = str(user.get("instance_id", "") or "").strip()
+    region = str(user.get("region", "") or "").strip()
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", instance_id)
+    safe_id = safe_id.strip(".-_")[:64] or "instance"
+    digest = hashlib.sha256(
+        "{}\0{}".format(region, instance_id).encode("utf-8")
+    ).hexdigest()[:10]
+    return LOG_FILE.parent / "instances" / "{}-{}.log".format(safe_id, digest)
+
+
+def _instance_log_value(value, user, limit=500):
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    for secret in (user.get("ak"), user.get("sk")):
+        secret = str(secret or "")
+        if secret:
+            text = text.replace(secret, "***")
+    text = re.sub(
+        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss)://[^\s；，,]+",
+        "[链接已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])\d{6,12}:[A-Za-z0-9_-]{20,}",
+        "[Bot Token 已隐藏]",
+        text,
+    )
+    return text[:limit] or "-"
+
+
+def _instance_log_message(user, result, dry_run=False, event="周期检测"):
+    traffic = result.get("traffic_gb")
+    limit = result.get("limit_gb")
+    if traffic is None:
+        traffic_text = "无数据"
+    elif limit is None:
+        traffic_text = "{:.2f} GB".format(float(traffic))
+    else:
+        traffic_text = "{:.2f}/{:.2f} GB".format(float(traffic), float(limit))
+
+    before = result.get("status_before") or "Unknown"
+    after = result.get("status_after") or before
+    status_text = str(before) if before == after else "{}->{}".format(before, after)
+
+    if result.get("billing_checked", True) is False:
+        bill_text = "未查询"
+    elif not result.get("billing_enabled", False):
+        bill_text = "已关闭"
+    elif result.get("bill_error"):
+        bill_text = "失败: {}".format(
+            _instance_log_value(result.get("bill_error"), user)
+        )
+    elif result.get("bill_amount") is not None:
+        bill_text = "{}{:.2f} {}".format(
+            result.get("bill_symbol", ""),
+            float(result["bill_amount"]),
+            result.get("bill_currency") or "",
+        ).strip()
+    else:
+        bill_text = "无数据"
+
+    errors = result.get("errors", [])
+    if not isinstance(errors, list):
+        errors = [errors]
+    errors_text = "；".join(
+        _instance_log_value(value, user) for value in errors if value
+    ) or "无"
+    return " | ".join(
+        (
+            "事件={}".format(_instance_log_value(event, user, 80)),
+            "实例={} ({})".format(
+                _instance_log_value(result.get("name") or user.get("name"), user, 120),
+                _instance_log_value(result.get("instance_id") or user.get("instance_id"), user, 120),
+            ),
+            "结果={}".format(_instance_log_value(result.get("level", "unknown"), user, 40)),
+            "流量={}".format(traffic_text),
+            "ECS={}".format(_instance_log_value(status_text, user, 120)),
+            "账单={}".format(_instance_log_value(bill_text, user, 500)),
+            "动作={}".format(_instance_log_value(result.get("action", "none"), user, 80)),
+            "已执行={}".format("是" if result.get("action_performed") else "否"),
+            "演练={}".format("是" if dry_run else "否"),
+            "说明={}".format(_instance_log_value(result.get("message"), user, 500)),
+            "错误={}".format(errors_text),
+        )
+    )
+
+
+def write_instance_log(user, result, dry_run=False, event="周期检测"):
+    """Write one redacted result line when per-instance logging is enabled."""
+    if not instance_log_enabled(user):
+        return False
+    path = instance_log_path(user)
+    try:
+        with _INSTANCE_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(path.parent), 0o700)
+            handler = TimedRotatingFileHandler(
+                str(path),
+                when="midnight",
+                interval=1,
+                backupCount=14,
+                encoding="utf-8",
+                delay=True,
+            )
+            try:
+                handler.setFormatter(
+                    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                )
+                level = {
+                    "error": logging.ERROR,
+                    "warning": logging.WARNING,
+                    "action": logging.INFO,
+                    "paused": logging.INFO,
+                }.get(result.get("level"), logging.INFO)
+                record = logging.LogRecord(
+                    "aliyun_guard.instance",
+                    level,
+                    __file__,
+                    0,
+                    _instance_log_message(user, result, dry_run=dry_run, event=event),
+                    (),
+                    None,
+                )
+                handler.handle(record)
+            finally:
+                handler.close()
+            os.chmod(str(path), 0o600)
+        return True
+    except Exception as exc:
+        LOGGER.error(
+            "[%s] 独立日志写入失败: %s",
+            user.get("name") or user.get("instance_id") or "未命名",
+            compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+        )
+        return False
 
 
 def require_sdk():
@@ -1305,15 +1456,15 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         transition = schedule_transition(
             user, previous_instances.get(instance_id, {}), started_at
         )
-        results.append(
-            check_one(
-                user,
-                config,
-                dry_run=dry_run,
-                now=started_at,
-                scheduled_action=transition,
-            )
+        result = check_one(
+            user,
+            config,
+            dry_run=dry_run,
+            now=started_at,
+            scheduled_action=transition,
         )
+        results.append(result)
+        write_instance_log(user, result, dry_run=dry_run)
     duration = time.monotonic() - monotonic_start
     summary, error_count, action_count, warning_count = build_summary(
         results, started_at, duration, dry_run=dry_run

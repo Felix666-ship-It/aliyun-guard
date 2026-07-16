@@ -2,6 +2,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -131,6 +132,95 @@ class GuardDecisionTests(unittest.TestCase):
         traffic.assert_not_called()
         status.assert_not_called()
         self.assertEqual(result["level"], "paused")
+
+
+class InstanceLogTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.original_log_file = guard.LOG_FILE
+        guard.LOG_FILE = Path(self.temp.name) / "logs" / "guard.log"
+
+    def tearDown(self):
+        guard.LOG_FILE = self.original_log_file
+        self.temp.cleanup()
+
+    @staticmethod
+    def result(name="HK", instance_id="i-test123", message="运行正常"):
+        return {
+            "name": name,
+            "instance_id": instance_id,
+            "traffic_gb": 46.22,
+            "limit_gb": 180.0,
+            "status_before": "Running",
+            "status_after": "Running",
+            "billing_enabled": True,
+            "bill_amount": 12.34,
+            "bill_currency": "CNY",
+            "bill_symbol": "¥",
+            "bill_error": None,
+            "action": "none",
+            "action_performed": False,
+            "level": "ok",
+            "message": message,
+            "errors": [],
+        }
+
+    def test_disabled_instance_log_does_not_create_file(self):
+        user = make_user(instance_log_enabled=False)
+        self.assertFalse(guard.write_instance_log(user, self.result()))
+        self.assertFalse(guard.instance_log_path(user).exists())
+
+    def test_enabled_instance_log_is_private_and_redacted(self):
+        token = "123456789:" + "A" * 30
+        node = "vless://uuid@node.example:443?security=tls"
+        proxy = "socks5://user:password@proxy.example:1080"
+        user = make_user(
+            instance_log_enabled=True,
+            ak="private-access-key",
+            sk="private-secret-key",
+        )
+        result = self.result(
+            message="{} {} {} {} {}".format(
+                user["ak"], user["sk"], token, node, proxy
+            )
+        )
+        self.assertTrue(guard.write_instance_log(user, result))
+        path = guard.instance_log_path(user)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("事件=周期检测", content)
+        self.assertIn("流量=46.22/180.00 GB", content)
+        for secret in (user["ak"], user["sk"], token, node, proxy):
+            self.assertNotIn(secret, content)
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_instance_paths_are_safe_and_separate(self):
+        first = make_user(
+            name="Unsafe",
+            instance_id="../../etc/passwd",
+            instance_log_enabled=True,
+        )
+        second = make_user(
+            name="SG",
+            region="ap-southeast-1",
+            instance_id="i-second",
+            instance_log_enabled=True,
+        )
+        first_path = guard.instance_log_path(first)
+        second_path = guard.instance_log_path(second)
+        self.assertEqual(first_path.parent, guard.LOG_FILE.parent / "instances")
+        self.assertNotIn("..", first_path.name)
+        self.assertNotEqual(first_path, second_path)
+        guard.write_instance_log(first, self.result("Unsafe", first["instance_id"]))
+        guard.write_instance_log(second, self.result("SG", second["instance_id"]))
+        self.assertNotIn("SG", first_path.read_text(encoding="utf-8"))
+        self.assertNotIn("Unsafe", second_path.read_text(encoding="utf-8"))
+
+    def test_instance_log_switch_must_be_boolean(self):
+        config = make_config(make_user(instance_log_enabled="yes"))
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
 
 
 class ScheduleTests(unittest.TestCase):

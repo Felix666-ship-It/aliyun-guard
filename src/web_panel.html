@@ -372,6 +372,8 @@
       border-radius: var(--radius);
     }
     .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .log-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    .log-source { width: min(300px, 46vw); min-height: 38px; padding-block: 7px; }
     .log-view {
       min-height: 520px;
       max-height: calc(100vh - 235px);
@@ -491,6 +493,8 @@
       .panel.full { grid-column: auto; }
       .section-heading { flex-wrap: wrap; }
       .section-actions { width: 100%; justify-content: flex-start; }
+      .log-actions { width: 100%; justify-content: flex-start; }
+      .log-source { width: auto; flex: 1 1 220px; }
       .card-head { align-items: flex-start; }
       .card-head-tools { gap: 6px; }
       .status-badge { min-width: 74px; padding: 0 8px; }
@@ -506,6 +510,7 @@
       .mode-grid { grid-template-columns: 1fr 1fr; }
       .node-row { grid-template-columns: 1fr; }
       .node-actions { overflow-x: auto; }
+      .log-source { flex-basis: 100%; }
     }
   </style>
 </head>
@@ -638,7 +643,14 @@
       </section>
 
       <section id="logsTab" class="tab-panel" hidden>
-        <div class="section-heading"><div><h1>运行日志</h1><p>最近 200 行</p></div><button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button></div>
+        <div class="section-heading">
+          <div><h1>运行日志</h1><p id="logsDescription">系统总日志 · 最近 200 行</p></div>
+          <div class="section-actions log-actions">
+            <select id="logSource" class="log-source" aria-label="日志来源"><option value="system">系统总日志</option></select>
+            <button id="instanceLogToggle" class="button secondary" type="button" hidden><span data-icon="terminal"></span><span id="instanceLogToggleText">启用独立日志</span></button>
+            <button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button>
+          </div>
+        </div>
         <pre id="logView" class="log-view">正在读取...</pre>
       </section>
 
@@ -714,6 +726,7 @@
           <div class="field"><label for="instanceSk">AccessKey Secret</label><input id="instanceSk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="trafficLimit">CDT 关机阈值（GB）</label><input id="trafficLimit" type="number" min="0.01" step="0.01" required></div>
           <label class="check-row"><input id="actionsEnabled" type="checkbox">允许自动开机与关机</label>
+          <label class="check-row"><input id="instanceLogEnabled" type="checkbox">记录该实例独立日志</label>
           <label class="check-row"><input id="billingEnabled" type="checkbox">查询本月实例账单</label>
           <div id="billingSiteField" class="field"><label for="billingSite">账单站点</label><select id="billingSite"><option value="china">阿里云中国站</option><option value="international">阿里云国际站</option><option value="custom">自定义</option></select></div>
           <div id="billingCustomFields" class="wide form-grid" hidden>
@@ -784,7 +797,7 @@
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -884,6 +897,7 @@
                 <button class="menu-button ${item.paused ? "" : "warning"}" type="button" role="menuitem" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复监控" : "暂停监控"}</span></button>
                 <button class="menu-button" type="button" role="menuitem" data-action="edit">${icon("pencil")}<span>编辑配置</span></button>
                 <button class="menu-button" type="button" role="menuitem" data-action="validate">${icon("shield-check")}<span>只读校验</span></button>
+                <button class="menu-button" type="button" role="menuitem" data-action="logs">${icon("terminal")}<span>查看独立日志${item.instance_log_enabled ? "（已启用）" : ""}</span></button>
                 <button class="menu-button danger" type="button" role="menuitem" data-action="delete">${icon("trash-2")}<span>删除监控实例</span></button>
               </div>
             </details>
@@ -936,6 +950,9 @@
 
     function renderManagement(data) {
       state.management = data;
+      const selectedLogSource = $("logSource").value || "system";
+      $("logSource").innerHTML = '<option value="system">系统总日志</option>' + data.instances.map(item => `<option value="${item.index}">${esc(item.name)} (${esc(item.instance_id)}) · ${item.instance_log_enabled ? "已启用" : "已关闭"}</option>`).join("");
+      $("logSource").value = Array.from($("logSource").options).some(option => option.value === selectedLogSource) ? selectedLogSource : "system";
       const telegram = data.telegram;
       $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
       $("connectionDescription").textContent = telegram.connection_description;
@@ -992,7 +1009,19 @@
 
     async function loadLogs() {
       $("logView").textContent = "正在读取...";
-      try { const data = await api("/api/logs?limit=200"); $("logView").textContent = data.lines.length ? data.lines.join("\n") : "日志尚未生成。"; $("logView").scrollTop = $("logView").scrollHeight; }
+      try {
+        const selected = $("logSource").value || "system";
+        const suffix = selected === "system" ? "" : `&instance=${encodeURIComponent(selected)}`;
+        const data = await api(`/api/logs?limit=200${suffix}`);
+        state.logs = data;
+        $("logsDescription").textContent = `${data.name}${data.instance_id ? ` (${data.instance_id})` : ""} · 最近 200 行`;
+        $("instanceLogToggle").hidden = !data.toggle_available;
+        $("instanceLogToggle").classList.toggle("warning", data.enabled);
+        $("instanceLogToggleText").textContent = data.enabled ? "停用独立日志" : "启用独立日志";
+        const emptyText = data.source === "instance" && !data.enabled ? "独立日志已关闭，且尚无历史记录。" : "日志尚未生成。";
+        $("logView").textContent = data.lines.length ? data.lines.join("\n") : emptyText;
+        $("logView").scrollTop = $("logView").scrollHeight;
+      }
       catch (error) { $("logView").textContent = error.message; }
     }
 
@@ -1045,6 +1074,7 @@
       $("instanceSk").placeholder = existing?.secret_key_configured ? "已保存，留空不修改" : "请输入 AccessKey Secret";
       $("trafficLimit").value = existing?.traffic_limit_gb ?? 180;
       $("actionsEnabled").checked = existing?.actions_enabled ?? true;
+      $("instanceLogEnabled").checked = existing?.instance_log_enabled ?? false;
       $("billingEnabled").checked = existing?.billing.enabled ?? true;
       $("billingSite").value = existing?.billing.site || "china";
       $("billingEndpoint").value = existing?.billing.endpoint || "";
@@ -1068,6 +1098,7 @@
         instance_id: $("instanceId").value.trim(),
         traffic_limit_gb: Number($("trafficLimit").value),
         actions_enabled: $("actionsEnabled").checked,
+        instance_log_enabled: $("instanceLogEnabled").checked,
         billing: {
           enabled: $("billingEnabled").checked,
           site: $("billingSite").value,
@@ -1155,6 +1186,19 @@
     $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
     $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await Promise.all([loadDashboard(), loadManagement()]); $("refreshButton").querySelector("svg").classList.remove("spin"); });
     $("logsRefresh").addEventListener("click", loadLogs);
+    $("logSource").addEventListener("change", loadLogs);
+    $("instanceLogToggle").addEventListener("click", async () => {
+      if (!state.logs?.toggle_available) return;
+      const enabled = !state.logs.enabled;
+      $("instanceLogToggle").disabled = true;
+      try {
+        await api(`/api/instances/${state.logs.index}/logging`, { method: "POST", body: { enabled } });
+        toast(enabled ? "该实例独立日志已启用" : "该实例独立日志已停用，历史日志已保留");
+        await Promise.all([loadDashboard(false), loadManagement(false)]);
+        await loadLogs();
+      } catch (error) { toast(error.message, true); }
+      finally { $("instanceLogToggle").disabled = false; }
+    });
     $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
     $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: false } }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
     $("dryRunButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: true } }); toast("演练检测已启动，不会执行开关机"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
@@ -1171,6 +1215,12 @@
       if (button.dataset.action === "edit") {
         if (!state.management) await loadManagement();
         openInstanceDialog(index);
+        return;
+      }
+      if (button.dataset.action === "logs") {
+        if (!state.management) await loadManagement();
+        $("logSource").value = String(index);
+        document.querySelector('.tab-button[data-tab="logs"]').click();
         return;
       }
       if (button.dataset.action === "validate") {

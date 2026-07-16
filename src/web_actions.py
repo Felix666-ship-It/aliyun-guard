@@ -142,6 +142,7 @@ def _instance_payload(guard, user, index):
         "instance_id": str(user.get("instance_id", "")),
         "traffic_limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
         "actions_enabled": bool(user.get("actions_enabled", True)),
+        "instance_log_enabled": bool(user.get("instance_log_enabled", False)),
         "paused": bool(user.get("paused", False)),
         "billing": _billing_payload(guard, user),
         "schedule": {
@@ -280,6 +281,11 @@ def build_instance_candidate(guard, data, existing=None):
     candidate["actions_enabled"] = _boolean(
         data, "actions_enabled", bool(existing.get("actions_enabled", True))
     )
+    candidate["instance_log_enabled"] = _boolean(
+        data,
+        "instance_log_enabled",
+        bool(existing.get("instance_log_enabled", False)),
+    )
     candidate["paused"] = bool(existing.get("paused", False))
     candidate["billing"] = _normalize_billing(
         guard, data.get("billing"), existing
@@ -357,6 +363,21 @@ def validate_instance(guard, index):
             guard.compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
             502,
         )
+
+
+def update_instance_logging(guard, index, enabled):
+    if not isinstance(enabled, bool):
+        raise ManagementError("enabled 必须是布尔值")
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise ManagementError("实例不存在", 404)
+    users[index]["instance_log_enabled"] = enabled
+    _save_config(guard, config)
+    return {
+        "enabled": enabled,
+        "instance": _instance_payload(guard, users[index], index),
+    }
 
 
 def delete_instance(guard, index, instance_id):

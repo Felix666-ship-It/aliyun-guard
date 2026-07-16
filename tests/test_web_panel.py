@@ -28,6 +28,7 @@ def make_user():
         "instance_id": "i-webtest123",
         "traffic_limit_gb": 180,
         "actions_enabled": True,
+        "instance_log_enabled": False,
         "paused": False,
         "billing": {
             "enabled": False,
@@ -362,6 +363,59 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(saved["start_time"], "22:30")
         self.assertEqual(saved["stop_time"], "06:15")
 
+    def test_instance_logs_can_be_selected_toggled_and_read_after_disable(self):
+        cookie, csrf = self.login()
+        user = guard.load_config()["users"][0]
+        path = guard.instance_log_path(user)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("historical instance line\n", encoding="utf-8")
+
+        status, _data, _headers = self.request(
+            "POST",
+            "/api/instances/0/logging",
+            {"enabled": True},
+            cookie=cookie,
+        )
+        self.assertEqual(status, 403)
+        status, data, _headers = self.request(
+            "POST",
+            "/api/instances/0/logging",
+            {"enabled": True},
+            cookie=cookie,
+            csrf=csrf,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["result"]["enabled"])
+
+        status, data, _headers = self.request(
+            "GET", "/api/logs?instance=0&limit=200", cookie=cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["source"], "instance")
+        self.assertEqual(data["instance_id"], "i-webtest123")
+        self.assertTrue(data["enabled"])
+        self.assertEqual(data["lines"], ["historical instance line"])
+
+        status, _data, _headers = self.request(
+            "POST",
+            "/api/instances/0/logging",
+            {"enabled": False},
+            cookie=cookie,
+            csrf=csrf,
+        )
+        self.assertEqual(status, 200)
+        status, data, _headers = self.request(
+            "GET", "/api/logs?instance=0", cookie=cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(data["enabled"])
+        self.assertEqual(data["lines"], ["historical instance line"])
+
+        status, _data, _headers = self.request(
+            "GET", "/api/logs?instance=../../etc/passwd", cookie=cookie
+        )
+        self.assertEqual(status, 400)
+
     def test_settings_update_persists(self):
         cookie, csrf = self.login()
         status, _data, _headers = self.request(
@@ -502,7 +556,9 @@ class ManualControlTests(unittest.TestCase):
             guard, "wait_for_status", return_value=("Stopped", None)
         ), mock.patch.object(guard, "send_telegram_message") as send, mock.patch.object(
             guard, "load_state", return_value={"instances": {}, "history": []}
-        ), mock.patch.object(guard, "save_state") as save_state:
+        ), mock.patch.object(guard, "save_state") as save_state, mock.patch.object(
+            guard, "write_instance_log"
+        ) as write_log:
             result = web_panel.control_instance(guard, 0, "stop")
         stop.assert_called_once()
         send.assert_called_once()
@@ -511,6 +567,8 @@ class ManualControlTests(unittest.TestCase):
         self.assertEqual(event["action"], "manual_stop")
         self.assertTrue(event["action_performed"])
         self.assertEqual(result["after"], "Stopped")
+        write_log.assert_called_once()
+        self.assertEqual(write_log.call_args.kwargs["event"], "网页手动关机")
 
     def test_manual_stop_requires_pausing_active_keepalive(self):
         config = make_config()
@@ -539,6 +597,9 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn("执行动作", html)
         self.assertIn("仅检测，无动作", html)
         self.assertIn("单机设置", html)
+        self.assertIn("查看独立日志", html)
+        self.assertIn("记录该实例独立日志", html)
+        self.assertIn("instanceLogToggle", html)
         self.assertIn("删除监控实例", html)
 
 if __name__ == "__main__":
