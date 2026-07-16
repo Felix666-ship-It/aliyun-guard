@@ -218,7 +218,9 @@ BSS 账单查询失败: InvalidAccessKeyId.NotFound
 
 安装器是 POSIX `sh` 脚本。即使通过 `wget ... | sh` 执行，所有菜单输入也会从 `/dev/tty` 读取，不会把脚本正文误判为用户输入。
 
-## 一键安装
+## 推荐安装：原生一键安装
+
+**首选方式：推荐绝大多数用户直接使用下面的原生一键安装，不需要 Docker。** 原生安装会自动接入 systemd、OpenRC 或 cron，终端管理面板、网页控制台、后台保活和 GitHub 更新均可直接使用。只有已经使用 Docker Compose 管理服务，或明确需要容器隔离时，再选择后面的 Docker 部署方式。
 
 使用 `root` 登录任意可联网 Linux 服务器，然后执行：
 
@@ -261,7 +263,50 @@ ag
 
 ## Docker 部署
 
-Docker 模式不需要 systemd、OpenRC 或宿主机 Python。需要提前安装 Docker Engine 与 Compose v2，然后执行：
+Docker 是可选部署方式，不是默认推荐的安装方式；首次使用本项目时请优先选择上面的原生一键安装。已有 Docker Compose 运维环境或需要容器隔离时，可以使用本节方案。Docker 模式不需要 systemd、OpenRC 或宿主机 Python。
+
+### 一键 Docker 部署
+
+使用 root 登录服务器，在普通 SSH/VNC 交互终端执行：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main/docker-install.sh | sh
+```
+
+也可以使用 `curl`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main/docker-install.sh | sh
+```
+
+脚本会自动完成以下操作：
+
+1. 检测 `apt`、`dnf`、`yum`、`apk`、`pacman` 或 `zypper`。
+2. 检查并按需安装 Docker Engine 与 Docker Compose。
+3. 下载当前 GitHub `main` 分支到 `/opt/aliyun-guard-docker`。
+4. 创建 `.env` 和权限为 `700` 的 `docker-data` 持久化目录。
+5. 构建镜像，并在首次部署时打开完整交互配置向导。
+6. 启动容器、检查运行状态并显示网页地址和常用命令。
+
+首次部署默认把宿主机 `0.0.0.0:8765` 映射到容器面板。云服务器还需要在安全组和系统防火墙中放行该端口；公网 HTTP 会明文传输登录信息，建议限制来源并配置 HTTPS。
+
+重复执行同一条一键命令会更新部署文件、重建容器并保留以下数据：
+
+- `/opt/aliyun-guard-docker/.env`
+- `/opt/aliyun-guard-docker/docker-data`
+- Docker 命名卷中的 sing-box
+
+只允许更新已有部署时可执行：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main/docker-install.sh | sh -s -- --update
+```
+
+如果首次部署时检测到 `/opt/aliyun-guard` 原生安装，脚本会先询问是否停用原生调度并迁移配置、状态和日志，避免两套保活同时操作同一台 ECS。原生程序文件不会删除。
+
+### 手动 Compose 部署
+
+已经安装 Docker Engine 与 Compose v2 时，也可以手动执行：
 
 ```sh
 git clone https://github.com/Felix666-ship-It/aliyun-guard.git
@@ -331,6 +376,8 @@ docker compose down
 git pull
 docker compose up -d --build
 ```
+
+一键部署用户也可以直接重新执行 `docker-install.sh` 安装命令，无需手动进入部署目录。
 
 网页“系统”页仍会检查 GitHub 新版本，但不会在运行中的容器内覆盖镜像；发现更新时会提示在宿主机执行以上命令。网页“重启后台服务”会终止容器主进程，再由 Compose 的 `restart: unless-stopped` 自动拉起。`docker compose down` 不删除 `./docker-data`；只有显式使用 `down -v` 才会删除 sing-box 命名卷。
 
@@ -569,6 +616,7 @@ src/web_actions.py           网页管理动作与脱敏 API 载荷
 src/web_panel.py             网页认证、API 与进程管理
 src/web_panel.html           响应式网页控制台
 docker/entrypoint.sh         Docker 命令入口与网页监听规范化
+docker-install.sh            Docker 检测、安装、配置、构建与更新脚本
 packaging/install.template.sh 安装器模板
 packaging/build_installer.py  单文件安装器构建器
 Dockerfile                    Docker 镜像定义
@@ -586,7 +634,7 @@ version.json                  当前版本号与构建指纹
 
 ```sh
 python3 -m unittest discover -s tests -v
-shellcheck -s sh install.sh src/control.sh src/uninstall.sh packaging/install.template.sh
+shellcheck -s sh install.sh docker-install.sh src/control.sh src/uninstall.sh packaging/install.template.sh
 ```
 
 重新构建单文件安装器：
