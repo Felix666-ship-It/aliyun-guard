@@ -5,6 +5,7 @@ APP_DIR=${ALIYUN_GUARD_HOME:-/opt/aliyun-guard}
 PYTHON="$APP_DIR/venv/bin/python"
 APP="$APP_DIR/aliyun_guard.py"
 MANAGER="$APP_DIR/manager.py"
+WEB="$APP_DIR/web_panel.py"
 BACKEND_FILE="$APP_DIR/service_backend"
 SERVICE_NAME="aliyun-guard"
 
@@ -62,6 +63,7 @@ start_service() {
             ;;
         cron)
             rm -f "$APP_DIR/disabled"
+            "$PYTHON" "$WEB" ensure >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已启用。"
             ;;
         *)
@@ -84,6 +86,7 @@ stop_service() {
         cron)
             : > "$APP_DIR/disabled"
             chmod 600 "$APP_DIR/disabled"
+            "$PYTHON" "$WEB" stop >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已暂停。"
             ;;
         *)
@@ -107,6 +110,7 @@ restart_service() {
         cron)
             rm -f "$APP_DIR/disabled"
             "$PYTHON" "$APP" scheduled
+            "$PYTHON" "$WEB" restart
             ;;
         *)
             printf '%s\n' "未知调度后端: $current" >&2
@@ -124,6 +128,7 @@ status                查看服务和最近检测状态
 run                    立即执行一轮检测并通知
 dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
+web                    查看网页控制面板地址和状态
 update                 从 GitHub 下载并安装最新版本
 version                显示当前版本号
 logs                   查看最近 100 行日志
@@ -161,6 +166,9 @@ case "$command_name" in
         ;;
     test-telegram)
         exec "$PYTHON" "$APP" test-telegram
+        ;;
+    web)
+        exec "$PYTHON" "$MANAGER" web
         ;;
     update)
         exec "$PYTHON" "$MANAGER" update

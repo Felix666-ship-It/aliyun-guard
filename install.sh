@@ -182,7 +182,7 @@ preserve_local_data() {
         cp "$APP_DIR/bin/sing-box" "$PRESERVE_DIR/bin/sing-box"
     fi
     chmod 600 "$PRESERVE_DIR/config.json"
-    say "${GREEN}已保护现有配置（包括 Telegram 连接方式和节点链接）。${RESET}"
+    say "${GREEN}已保护现有配置（包括 Telegram 连接方式、节点和网页面板设置）。${RESET}"
 }
 
 restore_local_data() {
@@ -200,7 +200,7 @@ restore_local_data() {
         cp "$PRESERVE_DIR/bin/sing-box" "$APP_DIR/bin/sing-box"
         chmod 700 "$APP_DIR/bin/sing-box"
     fi
-    say "${GREEN}已恢复现有配置，Telegram 代理和节点保持不变。${RESET}"
+    say "${GREEN}已恢复现有配置，Telegram 代理、节点和网页面板设置保持不变。${RESET}"
     cleanup_preserved_data
 }
 
@@ -315,6 +315,9 @@ stop_old_backend() {
     fi
     if command -v rc-service >/dev/null 2>&1 && [ -f "/etc/init.d/$SERVICE_NAME" ]; then
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    fi
+    if [ -x "$VENV_DIR/bin/python" ] && [ -f "$APP_DIR/web_panel.py" ]; then
+        "$VENV_DIR/bin/python" "$APP_DIR/web_panel.py" stop >/dev/null 2>&1 || true
     fi
 }
 
@@ -902,6 +905,1651 @@ def ensure_node_proxy(node_link, startup_timeout=12):
 
 atexit.register(stop_node_proxy)
 __AG_PROXY_PY_EOF__
+    cat > "$APP_DIR/web_panel.py" <<'__AG_WEB_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Authenticated web control panel for Aliyun Guard."""
+
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import hmac
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import secrets
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - cron supervision runs on Linux
+    fcntl = None
+
+
+APP_VERSION = "1.3.0"
+APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+HTML_FILE = APP_DIR / "web_panel.html"
+PID_FILE = APP_DIR / "web-panel.pid"
+SUPERVISOR_LOCK_FILE = APP_DIR / "web-panel-supervisor.lock"
+DISABLED_FILE = APP_DIR / "disabled"
+BACKEND_FILE = APP_DIR / "service_backend"
+MAX_BODY_BYTES = 64 * 1024
+SESSION_SECONDS = 12 * 60 * 60
+PASSWORD_ITERATIONS = 260000
+
+DEFAULT_WEB_CONFIG = {
+    "enabled": False,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "username": "admin",
+    "password_hash": "",
+    "cookie_secure": False,
+}
+
+
+class WebPanelError(RuntimeError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def hash_password(password, iterations=PASSWORD_ITERATIONS):
+    password = str(password or "")
+    if len(password) < 8:
+        raise ValueError("网页面板密码至少需要 8 个字符")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, int(iterations)
+    )
+    return "pbkdf2_sha256${}${}${}".format(
+        int(iterations), salt.hex(), digest.hex()
+    )
+
+
+def verify_password(password, encoded):
+    try:
+        algorithm, iterations, salt_hex, expected_hex = str(encoded).split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(expected_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", str(password or "").encode("utf-8"), salt, int(iterations)
+        )
+        return hmac.compare_digest(actual, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def get_web_config(config):
+    result = dict(DEFAULT_WEB_CONFIG)
+    configured = config.get("web_panel", {}) if isinstance(config, dict) else {}
+    if isinstance(configured, dict):
+        result.update(configured)
+    result["enabled"] = bool(result.get("enabled", False))
+    result["host"] = str(result.get("host", "127.0.0.1") or "127.0.0.1").strip()
+    result["username"] = str(result.get("username", "admin") or "admin").strip()
+    result["password_hash"] = str(result.get("password_hash", "") or "")
+    result["cookie_secure"] = bool(result.get("cookie_secure", False))
+    try:
+        result["port"] = int(result.get("port", 8765))
+    except (TypeError, ValueError):
+        result["port"] = 0
+    return result
+
+
+def validate_web_config(config):
+    web = get_web_config(config)
+    if web["host"] not in ("127.0.0.1", "0.0.0.0"):
+        raise WebPanelError("网页面板监听地址只能是 127.0.0.1 或 0.0.0.0")
+    if web["port"] < 1024 or web["port"] > 65535:
+        raise WebPanelError("网页面板端口必须在 1024 到 65535 之间")
+    if not web["username"] or len(web["username"]) > 64:
+        raise WebPanelError("网页面板用户名不能为空且不能超过 64 个字符")
+    if web["enabled"]:
+        if not web["password_hash"] or not web["password_hash"].startswith(
+            "pbkdf2_sha256$"
+        ):
+            raise WebPanelError("网页面板尚未设置有效登录密码")
+    return web
+
+
+def mask_key(value):
+    value = str(value or "")
+    if len(value) <= 8:
+        return "*" * len(value)
+    return "{}...{}".format(value[:4], value[-4:])
+
+
+def _safe_instances(state):
+    instances = state.get("instances", {}) if isinstance(state, dict) else {}
+    return instances if isinstance(instances, dict) else {}
+
+
+def _safe_history(state):
+    history = state.get("history", []) if isinstance(state, dict) else []
+    return history if isinstance(history, list) else []
+
+
+def dashboard_payload(guard, config=None, state=None, job=None):
+    config = config or guard.load_config()
+    state = state or guard.load_state()
+    now = dt.datetime.now().astimezone()
+    states = _safe_instances(state)
+    history = _safe_history(state)
+    users = []
+    for index, user in enumerate(config.get("users", [])):
+        instance_id = str(user.get("instance_id", ""))
+        current = states.get(instance_id, {})
+        if not isinstance(current, dict):
+            current = {}
+        billing = guard.get_billing_config(user)
+        schedule = guard.get_schedule_config(user)
+        next_event = guard.next_schedule_event(user, now) if schedule["enabled"] else None
+        points = []
+        for sample in history[-96:]:
+            if not isinstance(sample, dict):
+                continue
+            values = sample.get("instances", {})
+            value = values.get(instance_id, {}) if isinstance(values, dict) else {}
+            if isinstance(value, dict) and value.get("traffic_gb") is not None:
+                points.append(
+                    {"at": sample.get("at"), "value": value.get("traffic_gb")}
+                )
+        traffic = current.get("traffic_gb")
+        limit = float(user.get("traffic_limit_gb", 0) or 0)
+        percent = None
+        if traffic is not None and limit > 0:
+            percent = round((float(traffic) / limit) * 100.0, 2)
+        users.append(
+            {
+                "index": index,
+                "name": str(user.get("name") or instance_id),
+                "instance_id": instance_id,
+                "region": str(user.get("region", "")),
+                "access_key": mask_key(user.get("ak")),
+                "paused": bool(user.get("paused", False)),
+                "actions_enabled": bool(user.get("actions_enabled", True)),
+                "traffic_gb": traffic,
+                "traffic_limit_gb": limit,
+                "traffic_percent": percent,
+                "status": current.get("status_after") or "Unknown",
+                "level": current.get("level") or "unknown",
+                "message": current.get("message") or "尚未完成检测",
+                "checked_at": current.get("checked_at"),
+                "bill_amount": current.get("bill_amount"),
+                "bill_currency": current.get("bill_currency"),
+                "bill_error": current.get("bill_error"),
+                "bill_symbol": str(billing.get("currency_symbol", "")),
+                "billing_enabled": bool(billing.get("enabled", True)),
+                "schedule": {
+                    "enabled": schedule["enabled"],
+                    "start_time": schedule["start_time"],
+                    "stop_time": schedule["stop_time"],
+                    "target": guard.schedule_target(user, now)
+                    if schedule["enabled"]
+                    else None,
+                    "next_at": next_event[0].isoformat(timespec="minutes")
+                    if next_event
+                    else None,
+                    "next_action": next_event[1] if next_event else None,
+                },
+                "history": points,
+            }
+        )
+    finished = state.get("last_cycle_finished_at")
+    stale = True
+    if finished:
+        try:
+            age = now.timestamp() - dt.datetime.fromisoformat(finished).timestamp()
+            stale = age > max(180, int(config.get("interval_seconds", 300)) * 2)
+        except (TypeError, ValueError):
+            pass
+    web = get_web_config(config)
+    return {
+        "version": APP_VERSION,
+        "now": now.isoformat(timespec="seconds"),
+        "users": users,
+        "service": {
+            "cycle_count": int(state.get("cycle_count", 0) or 0),
+            "last_finished_at": finished,
+            "last_ok": bool(state.get("last_cycle_ok", False)),
+            "last_error_count": int(state.get("last_cycle_error_count", 0) or 0),
+            "telegram_error": state.get("telegram_error"),
+            "stale": stale,
+        },
+        "settings": {
+            "interval_seconds": int(config.get("interval_seconds", 300)),
+            "notification_mode": str(config.get("notification_mode", "always")),
+            "force_ipv4": bool(config.get("force_ipv4", True)),
+            "web_host": web["host"],
+            "web_port": web["port"],
+        },
+        "job": dict(job or {}),
+    }
+
+
+def read_recent_logs(guard, limit=200):
+    limit = max(20, min(500, int(limit)))
+    path = Path(guard.LOG_FILE)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        raise WebPanelError("无法读取日志: {}".format(exc), 500)
+    return [line.rstrip("\r\n") for line in lines[-limit:]]
+
+
+def save_config(guard, config):
+    guard.validate_config(config)
+    validate_web_config(config)
+    guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
+
+
+def update_schedule(guard, index, data):
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise WebPanelError("实例不存在", 404)
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        raise WebPanelError("enabled 必须是布尔值")
+    current = guard.get_schedule_config(users[index])
+    start_time = guard.normalize_schedule_time(
+        data.get("start_time", current["start_time"]), "开机时间"
+    )
+    stop_time = guard.normalize_schedule_time(
+        data.get("stop_time", current["stop_time"]), "关机时间"
+    )
+    if enabled and start_time == stop_time:
+        raise WebPanelError("开机时间和关机时间不能相同")
+    users[index]["schedule"] = {
+        "enabled": enabled,
+        "start_time": start_time,
+        "stop_time": stop_time,
+    }
+    save_config(guard, config)
+    return users[index]["schedule"]
+
+
+def update_pause(guard, index, paused):
+    if not isinstance(paused, bool):
+        raise WebPanelError("paused 必须是布尔值")
+    config = guard.load_config()
+    users = config.get("users", [])
+    if index < 0 or index >= len(users):
+        raise WebPanelError("实例不存在", 404)
+    users[index]["paused"] = paused
+    save_config(guard, config)
+    return paused
+
+
+def update_settings(guard, data):
+    config = guard.load_config()
+    try:
+        interval = int(data.get("interval_seconds"))
+    except (TypeError, ValueError):
+        raise WebPanelError("检测间隔必须是整数")
+    if interval < 60 or interval > 86400:
+        raise WebPanelError("检测间隔必须在 60 到 86400 秒之间")
+    mode = str(data.get("notification_mode", ""))
+    if mode not in ("always", "events", "errors"):
+        raise WebPanelError("通知模式无效")
+    config["interval_seconds"] = interval
+    config["notification_mode"] = mode
+    save_config(guard, config)
+    return {"interval_seconds": interval, "notification_mode": mode}
+
+
+def control_instance(guard, index, action):
+    if action not in ("start", "stop"):
+        raise WebPanelError("开关机动作无效")
+    with guard.cycle_lock() as locked:
+        if not locked:
+            raise WebPanelError("检测任务正在运行，请稍后再试", 409)
+        config = guard.load_config()
+        users = config.get("users", [])
+        if index < 0 or index >= len(users):
+            raise WebPanelError("实例不存在", 404)
+        user = users[index]
+        name = str(user.get("name") or user.get("instance_id"))
+        secrets_to_hide = (user.get("ak"), user.get("sk"))
+        schedule_target = guard.schedule_target(user)
+        automation_active = bool(user.get("actions_enabled", True)) and not bool(
+            user.get("paused", False)
+        )
+        if action == "stop" and automation_active and schedule_target != "stopped":
+            raise WebPanelError(
+                "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控", 409
+            )
+        if action == "start" and automation_active and schedule_target == "stopped":
+            raise WebPanelError(
+                "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
+            )
+        try:
+            before = guard.query_instance_status(user)
+            if action == "start":
+                traffic = guard.query_cdt_traffic_gb(user)
+                limit = float(user.get("traffic_limit_gb", 0) or 0)
+                if traffic >= limit:
+                    raise WebPanelError(
+                        "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                            traffic, limit
+                        ),
+                        409,
+                    )
+                if before != "Running":
+                    guard.start_instance(user)
+                    after, poll_error = guard.wait_for_status(
+                        user,
+                        "Running",
+                        int(config.get("start_wait_seconds", 90)),
+                        int(config.get("start_poll_seconds", 5)),
+                    )
+                else:
+                    after, poll_error = before, None
+            else:
+                if before != "Stopped":
+                    guard.stop_instance(user)
+                    after, poll_error = guard.wait_for_status(
+                        user,
+                        "Stopped",
+                        int(config.get("stop_wait_seconds", 45)),
+                        int(config.get("start_poll_seconds", 5)),
+                    )
+                else:
+                    after, poll_error = before, None
+        except WebPanelError:
+            raise
+        except Exception as exc:
+            raise WebPanelError(
+                "实例{}失败: {}".format(
+                    "开机" if action == "start" else "关机",
+                    guard.compact_error(exc, secrets=secrets_to_hide),
+                ),
+                502,
+            )
+        message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+            "开机" if action == "start" else "关机",
+            name,
+            user.get("instance_id"),
+            before,
+            after or "Unknown",
+        )
+        if poll_error:
+            message += "\n状态复查: {}".format(poll_error)
+        notify_error = None
+        try:
+            guard.send_telegram_message(config.get("telegram", {}), message)
+        except Exception as exc:
+            notify_error = guard.compact_error(
+                exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
+            )
+        return {
+            "before": before,
+            "after": after or "Unknown",
+            "message": message,
+            "notification_error": notify_error,
+        }
+
+
+class PanelServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, handler, guard, config, html):
+        super().__init__(address, handler)
+        self.guard = guard
+        self.initial_config = config
+        self.html = html
+        self.sessions = {}
+        self.session_lock = threading.Lock()
+        self.login_attempts = {}
+        self.login_attempt_lock = threading.Lock()
+        self.job_lock = threading.Lock()
+        self.job = {"running": False, "started_at": None, "finished_at": None, "error": None}
+
+    def create_session(self):
+        session_id = secrets.token_urlsafe(32)
+        now = time.time()
+        data = {
+            "csrf": secrets.token_urlsafe(24),
+            "expires": now + SESSION_SECONDS,
+        }
+        with self.session_lock:
+            self.sessions = {
+                key: value
+                for key, value in self.sessions.items()
+                if value.get("expires", 0) >= now
+            }
+            self.sessions[session_id] = data
+        return session_id, data
+
+    def get_session(self, session_id):
+        if not session_id:
+            return None
+        with self.session_lock:
+            data = self.sessions.get(session_id)
+            if not data:
+                return None
+            if data["expires"] < time.time():
+                self.sessions.pop(session_id, None)
+                return None
+            data["expires"] = time.time() + SESSION_SECONDS
+            return dict(data)
+
+    def delete_session(self, session_id):
+        with self.session_lock:
+            self.sessions.pop(session_id, None)
+
+    def login_allowed(self, address):
+        now = time.time()
+        with self.login_attempt_lock:
+            attempts = [
+                value
+                for value in self.login_attempts.get(address, [])
+                if now - value < 300
+            ]
+            self.login_attempts[address] = attempts
+            return len(attempts) < 5
+
+    def record_login_failure(self, address):
+        with self.login_attempt_lock:
+            self.login_attempts.setdefault(address, []).append(time.time())
+
+    def clear_login_failures(self, address):
+        with self.login_attempt_lock:
+            self.login_attempts.pop(address, None)
+
+    def start_cycle_job(self):
+        with self.job_lock:
+            if self.job.get("running"):
+                raise WebPanelError("检测任务已经在运行", 409)
+            self.job = {
+                "running": True,
+                "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "finished_at": None,
+                "error": None,
+            }
+
+        def worker():
+            error = None
+            try:
+                with self.guard.cycle_lock() as locked:
+                    if not locked:
+                        raise WebPanelError("其他检测任务正在运行", 409)
+                    self.guard.run_cycle()
+            except Exception as exc:
+                error = self.guard.compact_error(exc)
+            with self.job_lock:
+                self.job["running"] = False
+                self.job["finished_at"] = dt.datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+                self.job["error"] = error
+
+        threading.Thread(target=worker, name="aliyun-guard-web-cycle", daemon=True).start()
+        return dict(self.job)
+
+
+class PanelHandler(BaseHTTPRequestHandler):
+    server_version = "AliyunGuardWeb"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        try:
+            self.server.guard.LOGGER.info("Web %s - %s", self.client_address[0], fmt % args)
+        except Exception:
+            pass
+
+    def _base_headers(self, content_type, length, status=200, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        )
+        for key, value in extra or []:
+            self.send_header(key, value)
+        self.end_headers()
+
+    def _json(self, value, status=200, extra=None):
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._base_headers("application/json; charset=utf-8", len(body), status, extra)
+        self.wfile.write(body)
+
+    def _html(self):
+        body = self.server.html.encode("utf-8")
+        self._base_headers("text/html; charset=utf-8", len(body))
+        self.wfile.write(body)
+
+    def _empty(self, status=204):
+        self._base_headers("image/x-icon", 0, status)
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise WebPanelError("请求长度无效")
+        if length <= 0 or length > MAX_BODY_BYTES:
+            raise WebPanelError("请求内容为空或过大", 413)
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise WebPanelError("JSON 请求格式无效")
+        if not isinstance(value, dict):
+            raise WebPanelError("JSON 顶层必须是对象")
+        return value
+
+    def _session_id(self):
+        raw = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except cookies.CookieError:
+            return ""
+        morsel = jar.get("ag_session")
+        return morsel.value if morsel else ""
+
+    def _authenticated(self, require_csrf=False):
+        session_id = self._session_id()
+        session = self.server.get_session(session_id)
+        if not session:
+            raise WebPanelError("请先登录", 401)
+        if require_csrf and not hmac.compare_digest(
+            str(self.headers.get("X-CSRF-Token", "")), str(session["csrf"])
+        ):
+            raise WebPanelError("CSRF 校验失败", 403)
+        return session_id, session
+
+    def _route_parts(self):
+        path = urllib.parse.urlsplit(self.path).path
+        return [urllib.parse.unquote(value) for value in path.strip("/").split("/") if value]
+
+    def do_GET(self):
+        try:
+            parts = self._route_parts()
+            if not parts or parts == ["index.html"]:
+                self._html()
+                return
+            if parts == ["favicon.ico"]:
+                self._empty()
+                return
+            if parts == ["healthz"]:
+                self._json({"ok": True, "version": APP_VERSION})
+                return
+            if parts == ["api", "session"]:
+                session = self.server.get_session(self._session_id())
+                self._json(
+                    {
+                        "authenticated": bool(session),
+                        "csrf": session.get("csrf") if session else None,
+                        "version": APP_VERSION,
+                    }
+                )
+                return
+            self._authenticated()
+            if parts == ["api", "dashboard"]:
+                with self.server.job_lock:
+                    job = dict(self.server.job)
+                self._json(dashboard_payload(self.server.guard, job=job))
+                return
+            if parts == ["api", "logs"]:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                limit = query.get("limit", ["200"])[0]
+                self._json({"lines": read_recent_logs(self.server.guard, limit)})
+                return
+            if parts == ["api", "job"]:
+                with self.server.job_lock:
+                    self._json(dict(self.server.job))
+                return
+            raise WebPanelError("接口不存在", 404)
+        except WebPanelError as exc:
+            self._json({"ok": False, "error": str(exc)}, exc.status)
+        except Exception as exc:
+            self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            self.server.guard.LOGGER.exception("Web GET error: %s", exc)
+
+    def do_POST(self):
+        try:
+            parts = self._route_parts()
+            if parts == ["api", "login"]:
+                self._handle_login()
+                return
+            session_id, _session = self._authenticated(require_csrf=True)
+            if parts == ["api", "logout"]:
+                self.server.delete_session(session_id)
+                self._json(
+                    {"ok": True},
+                    extra=[
+                        (
+                            "Set-Cookie",
+                            "ag_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
+                        )
+                    ],
+                )
+                return
+            if parts == ["api", "run"]:
+                self._json({"ok": True, "job": self.server.start_cycle_job()}, 202)
+                return
+            if parts == ["api", "settings"]:
+                result = update_settings(self.server.guard, self._read_json())
+                self._json({"ok": True, "settings": result})
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "instances"]:
+                try:
+                    index = int(parts[2])
+                except ValueError:
+                    raise WebPanelError("实例序号无效")
+                data = self._read_json()
+                if parts[3] == "schedule":
+                    result = update_schedule(self.server.guard, index, data)
+                    self._json({"ok": True, "schedule": result})
+                    return
+                if parts[3] == "pause":
+                    result = update_pause(self.server.guard, index, data.get("paused"))
+                    self._json({"ok": True, "paused": result})
+                    return
+                if parts[3] == "power":
+                    result = control_instance(self.server.guard, index, data.get("action"))
+                    self._json({"ok": True, "result": result})
+                    return
+            raise WebPanelError("接口不存在", 404)
+        except WebPanelError as exc:
+            self._json({"ok": False, "error": str(exc)}, exc.status)
+        except Exception as exc:
+            self._json({"ok": False, "error": "服务器内部错误"}, 500)
+            self.server.guard.LOGGER.exception("Web POST error: %s", exc)
+
+    def _handle_login(self):
+        address = self.client_address[0]
+        if not self.server.login_allowed(address):
+            raise WebPanelError("登录失败次数过多，请 5 分钟后再试", 429)
+        data = self._read_json()
+        config = self.server.guard.load_config()
+        web = get_web_config(config)
+        username_ok = hmac.compare_digest(
+            str(data.get("username", "")), web["username"]
+        )
+        password_ok = verify_password(data.get("password", ""), web["password_hash"])
+        if not username_ok or not password_ok:
+            self.server.record_login_failure(address)
+            raise WebPanelError("用户名或密码错误", 401)
+        self.server.clear_login_failures(address)
+        session_id, session = self.server.create_session()
+        cookie = "ag_session={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
+            session_id, SESSION_SECONDS
+        )
+        if web["cookie_secure"]:
+            cookie += "; Secure"
+        self._json(
+            {"ok": True, "csrf": session["csrf"]},
+            extra=[("Set-Cookie", cookie)],
+        )
+
+
+def create_server(guard, config=None, host=None, port=None, html=None):
+    config = config or guard.load_config()
+    web = get_web_config(config)
+    bind_host = host if host is not None else web["host"]
+    bind_port = int(port if port is not None else web["port"])
+    if html is None:
+        try:
+            html = HTML_FILE.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WebPanelError("无法读取网页文件: {}".format(exc), 500)
+    return PanelServer((bind_host, bind_port), PanelHandler, guard, config, html)
+
+
+def start_background(guard, config=None):
+    config = config or guard.load_config()
+    web = validate_web_config(config)
+    if not web["enabled"]:
+        return None
+    server = create_server(guard, config)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        name="aliyun-guard-web",
+        daemon=True,
+    )
+    thread.start()
+    guard.LOGGER.info("网页控制面板已启动: http://%s:%s", web["host"], web["port"])
+    return server
+
+
+def _load_guard():
+    import aliyun_guard
+
+    return aliyun_guard
+
+
+def _pid_is_web_process(pid):
+    if pid <= 1:
+        return False
+    path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        command = path.read_bytes().decode("utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "web_panel.py" in command and "serve" in command
+
+
+def _read_pid():
+    try:
+        return int(PID_FILE.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def stop_supervised():
+    pid = _read_pid()
+    if not _pid_is_web_process(pid):
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.time() + 8
+    while time.time() < deadline and _pid_is_web_process(pid):
+        time.sleep(0.2)
+    if _pid_is_web_process(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        deadline = time.time() + 2
+        while time.time() < deadline and _pid_is_web_process(pid):
+            time.sleep(0.1)
+    stopped = not _pid_is_web_process(pid)
+    try:
+        PID_FILE.unlink()
+    except OSError:
+        pass
+    return stopped
+
+
+@contextlib.contextmanager
+def supervisor_lock():
+    SUPERVISOR_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = SUPERVISOR_LOCK_FILE.open("a+")
+    locked = True
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                locked = False
+        yield locked
+    finally:
+        if locked and fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def serve_foreground():
+    guard = _load_guard()
+    guard.configure_logging(console=True)
+    config = guard.load_config()
+    web = validate_web_config(config)
+    if not web["enabled"]:
+        print("网页控制面板尚未启用。")
+        return 2
+    server = create_server(guard, config)
+    PID_FILE.write_text(str(os.getpid()), encoding="ascii")
+    os.chmod(str(PID_FILE), 0o600)
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    print("网页控制面板: http://{}:{}".format(web["host"], web["port"]))
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+def ensure_supervised():
+    with supervisor_lock() as locked:
+        if not locked:
+            return 0
+        guard = _load_guard()
+        if BACKEND_FILE.exists() and BACKEND_FILE.read_text(encoding="utf-8").strip() != "cron":
+            return 0
+        config = guard.load_config()
+        web = get_web_config(config)
+        if DISABLED_FILE.exists() or not web["enabled"]:
+            stop_supervised()
+            return 0
+        pid = _read_pid()
+        if _pid_is_web_process(pid):
+            return 0
+        log_path = APP_DIR / "logs" / "web.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab", buffering=0) as log_handle:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "serve"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+            )
+    return 0
+
+
+def show_status():
+    guard = _load_guard()
+    config = guard.load_config()
+    web = get_web_config(config)
+    print("网页面板: {}".format("已启用" if web["enabled"] else "已关闭"))
+    print("监听地址: http://{}:{}".format(web["host"], web["port"]))
+    backend = BACKEND_FILE.read_text(encoding="utf-8").strip() if BACKEND_FILE.exists() else "unknown"
+    if backend == "cron":
+        print("进程状态: {}".format("运行中" if _pid_is_web_process(_read_pid()) else "未运行"))
+    else:
+        print("进程状态: 随 aliyun-guard 后台服务运行")
+    return 0
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Aliyun Guard 网页控制面板")
+    parser.add_argument("command", choices=("serve", "ensure", "stop", "restart", "status"))
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.command == "serve":
+        return serve_foreground()
+    if args.command == "ensure":
+        return ensure_supervised()
+    if args.command == "stop":
+        stop_supervised()
+        return 0
+    if args.command == "restart":
+        stop_supervised()
+        return ensure_supervised()
+    return show_status()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__AG_WEB_PY_EOF__
+    cat > "$APP_DIR/web_panel.html" <<'__AG_WEB_HTML_EOF__'
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>Aliyun Guard</title>
+  <style>
+    :root {
+      --bg: #f4f6f3;
+      --surface: #ffffff;
+      --surface-alt: #eef4f1;
+      --ink: #17201d;
+      --muted: #65716c;
+      --line: #d9e1dc;
+      --brand: #08775a;
+      --brand-dark: #075e49;
+      --cyan: #167c94;
+      --amber: #b96808;
+      --red: #b63d36;
+      --shadow: 0 8px 24px rgba(23, 32, 29, .07);
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      letter-spacing: 0;
+    }
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+    [hidden] { display: none !important; }
+    .icon { width: 18px; height: 18px; flex: 0 0 18px; stroke-width: 2; }
+    .auth-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+      background: var(--surface);
+    }
+    .auth-panel {
+      padding: 52px 42px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border-right: 1px solid var(--line);
+    }
+    .auth-scene {
+      position: relative;
+      overflow: hidden;
+      background: #14352d;
+      color: #fff;
+      display: grid;
+      align-content: center;
+      padding: 8vw;
+    }
+    .auth-scene::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      opacity: .18;
+      background-image:
+        linear-gradient(#b8fff0 1px, transparent 1px),
+        linear-gradient(90deg, #b8fff0 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+    .scene-chart { position: relative; width: min(660px, 100%); }
+    .scene-chart svg { display: block; width: 100%; height: auto; }
+    .scene-title { position: relative; margin: 26px 0 0; font-size: 18px; font-weight: 600; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      background: var(--brand);
+      color: #fff;
+      border-radius: var(--radius);
+      flex: 0 0 38px;
+    }
+    .brand-name { font-size: 20px; font-weight: 750; line-height: 1.1; overflow-wrap: anywhere; }
+    .brand-sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .auth-title { margin: 50px 0 4px; font-size: 27px; line-height: 1.25; }
+    .auth-meta { margin: 0 0 28px; color: var(--muted); }
+    .field { display: grid; gap: 7px; margin-bottom: 17px; }
+    .field label { font-size: 13px; font-weight: 650; color: #3d4944; }
+    .input-wrap { position: relative; }
+    input, select {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid #cbd5cf;
+      border-radius: 5px;
+      background: #fff;
+      color: var(--ink);
+      padding: 9px 11px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(8, 119, 90, .12); }
+    .input-wrap input { padding-right: 44px; }
+    .input-icon {
+      position: absolute;
+      right: 3px;
+      top: 3px;
+      width: 36px;
+      height: 36px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+    }
+    .button {
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      padding: 8px 13px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .button.primary { background: var(--brand); color: #fff; }
+    .button.primary:hover { background: var(--brand-dark); }
+    .button.secondary { background: #fff; border-color: var(--line); color: var(--ink); }
+    .button.secondary:hover { background: var(--surface-alt); }
+    .button.danger { background: #fff; border-color: #e1b5b1; color: var(--red); }
+    .button.warning { background: #fff8ed; border-color: #e8c897; color: #8b4e07; }
+    .button:disabled { cursor: not-allowed; opacity: .55; }
+    .auth-submit { width: 100%; margin-top: 6px; min-height: 44px; }
+    .form-error { min-height: 22px; color: var(--red); margin: 5px 0 0; }
+    .app { min-height: 100vh; }
+    .app-header {
+      height: 66px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 0 28px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 30;
+    }
+    .header-actions { display: flex; align-items: center; gap: 8px; }
+    .icon-button {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #fff;
+      color: #46534e;
+      display: grid;
+      place-items: center;
+      padding: 0;
+    }
+    .icon-button:hover { background: var(--surface-alt); color: var(--brand); }
+    .service-chip {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      color: #355047;
+      background: #f8faf8;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--brand); }
+    .dot.bad { background: var(--red); }
+    .app-nav {
+      height: 48px;
+      padding: 0 28px;
+      display: flex;
+      align-items: end;
+      gap: 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+    }
+    .tab-button {
+      height: 48px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 2px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .tab-button.active { color: var(--brand); border-bottom-color: var(--brand); }
+    .main { width: min(1440px, 100%); margin: 0 auto; padding: 24px 28px 44px; }
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 17px;
+    }
+    .section-heading h1 { font-size: 20px; margin: 0; }
+    .section-heading p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .summary-band {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin-bottom: 18px;
+      overflow: hidden;
+    }
+    .summary-item { min-width: 0; padding: 17px 18px; border-right: 1px solid var(--line); }
+    .summary-item:last-child { border-right: 0; }
+    .summary-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+    .summary-value { margin-top: 5px; font-size: 20px; font-weight: 750; overflow-wrap: anywhere; }
+    .notice {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border: 1px solid #e6c38d;
+      border-left: 4px solid var(--amber);
+      background: #fff9ef;
+      padding: 11px 13px;
+      margin-bottom: 18px;
+      border-radius: 4px;
+      color: #6c450f;
+    }
+    .instances {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .instance-card {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .card-head {
+      min-height: 66px;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .instance-name { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+    .instance-meta { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .status-badge {
+      flex: 0 0 auto;
+      min-width: 82px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-radius: 14px;
+      padding: 0 10px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid #b7d8cb;
+      color: #086146;
+      background: #eff9f5;
+    }
+    .status-badge.stopped, .status-badge.error { color: #96352f; border-color: #e3bab7; background: #fff3f2; }
+    .status-badge.transition { color: #865006; border-color: #ead09f; background: #fff9ed; }
+    .status-badge.unknown { color: #58645f; border-color: #d0d8d3; background: #f4f6f5; }
+    .card-body { padding: 15px 16px 12px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { min-width: 0; }
+    .metric-label { color: var(--muted); font-size: 11px; }
+    .metric-value { margin-top: 3px; font-weight: 700; overflow-wrap: anywhere; }
+    .traffic-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 15px; font-size: 12px; }
+    .progress { height: 7px; margin-top: 7px; background: #e7ede9; border-radius: 3px; overflow: hidden; }
+    .progress > span { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
+    .progress > span.warn { background: var(--amber); }
+    .progress > span.danger { background: var(--red); }
+    .sparkline { height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
+    .sparkline svg { width: 100%; height: 58px; display: block; overflow: visible; }
+    .result-line { min-height: 40px; padding: 10px 16px; color: #53605b; background: #fafbfa; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+    .card-actions { min-height: 56px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); overflow-x: auto; }
+    .card-actions .button { min-height: 35px; padding: 7px 10px; font-size: 12px; }
+    .empty {
+      grid-column: 1 / -1;
+      min-height: 260px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px dashed #cbd5cf;
+      border-radius: var(--radius);
+    }
+    .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .log-view {
+      min-height: 520px;
+      max-height: calc(100vh - 235px);
+      overflow: auto;
+      margin: 0;
+      padding: 16px;
+      color: #dff7ed;
+      background: #13251f;
+      border-radius: var(--radius);
+      font: 12px/1.65 "Cascadia Mono", Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .settings-panel { max-width: 720px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
+    .settings-actions { margin-top: 4px; display: flex; justify-content: flex-end; }
+    dialog {
+      width: min(460px, calc(100vw - 28px));
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0;
+      color: var(--ink);
+      box-shadow: 0 24px 70px rgba(17, 28, 24, .24);
+    }
+    dialog::backdrop { background: rgba(17, 28, 24, .48); }
+    .dialog-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .dialog-head h2 { margin: 0; font-size: 16px; }
+    .dialog-body { padding: 18px 16px; }
+    .dialog-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
+    .toggle-row { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 42px; }
+    .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .switch span { position: absolute; inset: 0; background: #bfc9c3; border-radius: 12px; transition: .18s; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: .18s; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+    .switch input:checked + span { background: var(--brand); }
+    .switch input:checked + span::after { transform: translateX(18px); }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 80;
+      max-width: min(420px, calc(100vw - 40px));
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      color: #fff;
+      background: #20352e;
+      border-radius: 6px;
+      box-shadow: var(--shadow);
+    }
+    .toast.error { background: #8f312d; }
+    .spin { animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 980px) {
+      .auth-shell { grid-template-columns: minmax(280px, 390px) 1fr; }
+      .auth-scene { padding: 5vw; }
+      .summary-band { grid-template-columns: 1fr 1fr; }
+      .summary-item:nth-child(2) { border-right: 0; }
+      .summary-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 760px) {
+      .auth-shell { display: block; background: var(--bg); padding: 0; }
+      .auth-panel { min-height: 100vh; padding: 36px 22px; border: 0; background: var(--surface); }
+      .auth-scene { display: none; }
+      .auth-title { margin-top: 44px; font-size: 24px; }
+      .app-header { height: 60px; padding: 0 14px; }
+      .brand-mark { width: 34px; height: 34px; flex-basis: 34px; }
+      .brand-name { font-size: 17px; }
+      .brand-sub, .service-chip { display: none; }
+      .app-nav { padding: 0 14px; gap: 20px; }
+      .main { padding: 18px 14px 34px; }
+      .section-heading { align-items: flex-start; }
+      .instances { grid-template-columns: 1fr; }
+      .settings-grid { grid-template-columns: 1fr; }
+      .card-head { align-items: flex-start; }
+      .card-actions { padding: 9px; }
+      .log-view { min-height: 440px; max-height: calc(100vh - 215px); }
+    }
+    @media (max-width: 430px) {
+      .summary-band { grid-template-columns: 1fr 1fr; }
+      .summary-item { padding: 13px 12px; }
+      .summary-value { font-size: 17px; }
+      .metric-grid { gap: 12px 8px; }
+      .button .optional-label { display: none; }
+      .section-heading h1 { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <section id="loginView" class="auth-shell">
+    <div class="auth-panel">
+      <div class="brand">
+        <div class="brand-mark" data-icon="activity"></div>
+        <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub">ECS CONTROL CONSOLE</div></div>
+      </div>
+      <h1 class="auth-title">登录控制台</h1>
+      <p class="auth-meta" id="loginVersion">受保护的运维入口</p>
+      <form id="loginForm" autocomplete="on">
+        <div class="field">
+          <label for="username">用户名</label>
+          <input id="username" name="username" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <div class="input-wrap">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button class="input-icon" id="togglePassword" type="button" title="显示或隐藏密码" aria-label="显示或隐藏密码" data-icon="eye"></button>
+          </div>
+        </div>
+        <button class="button primary auth-submit" type="submit"><span data-icon="log-in"></span>登录</button>
+        <p id="loginError" class="form-error" role="alert"></p>
+      </form>
+    </div>
+    <div class="auth-scene" aria-hidden="true">
+      <div class="scene-chart">
+        <svg viewBox="0 0 760 300" role="img">
+          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55" fill="none" stroke="#5cf0c8" stroke-width="6" stroke-linecap="round"/>
+          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55 L740 280 L20 280 Z" fill="#5cf0c8" opacity=".1"/>
+          <circle cx="740" cy="55" r="9" fill="#fff" stroke="#5cf0c8" stroke-width="5"/>
+        </svg>
+      </div>
+      <p class="scene-title">Alibaba Cloud · Operations</p>
+    </div>
+  </section>
+
+  <div id="appView" class="app" hidden>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" data-icon="activity"></div>
+        <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub" id="appVersion">Web Console</div></div>
+      </div>
+      <div class="header-actions">
+        <div class="service-chip"><span id="serviceDot" class="dot"></span><span id="serviceText">读取中</span></div>
+        <button id="refreshButton" class="icon-button" type="button" title="刷新" aria-label="刷新" data-icon="refresh-cw"></button>
+        <button id="logoutButton" class="icon-button" type="button" title="退出登录" aria-label="退出登录" data-icon="log-out"></button>
+      </div>
+    </header>
+    <nav class="app-nav" aria-label="控制台视图">
+      <button class="tab-button active" data-tab="dashboard"><span data-icon="layout-dashboard"></span>实例</button>
+      <button class="tab-button" data-tab="logs"><span data-icon="terminal"></span>日志</button>
+      <button class="tab-button" data-tab="settings"><span data-icon="settings"></span>设置</button>
+    </nav>
+    <main class="main">
+      <section id="dashboardTab" class="tab-panel">
+        <div class="section-heading">
+          <div><h1>实例总览</h1><p id="lastUpdated">尚未刷新</p></div>
+          <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
+        </div>
+        <div class="summary-band">
+          <div class="summary-item"><div class="summary-label"><span data-icon="server"></span>实例</div><div class="summary-value" id="summaryInstances">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="activity"></span>运行中</div><div class="summary-value" id="summaryRunning">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="triangle-alert"></span>异常</div><div class="summary-value" id="summaryErrors">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
+        </div>
+        <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
+        <div id="instances" class="instances"></div>
+      </section>
+
+      <section id="logsTab" class="tab-panel" hidden>
+        <div class="section-heading"><div><h1>运行日志</h1><p>最近 200 行</p></div><button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button></div>
+        <pre id="logView" class="log-view">正在读取...</pre>
+      </section>
+
+      <section id="settingsTab" class="tab-panel" hidden>
+        <div class="section-heading"><div><h1>全局设置</h1><p>后台调度参数</p></div></div>
+        <form id="settingsForm" class="settings-panel">
+          <div class="settings-grid">
+            <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
+            <div class="field"><label for="notificationMode">Telegram 通知模式</label><select id="notificationMode"><option value="always">每轮通知</option><option value="events">仅事件与变化</option><option value="errors">仅错误</option></select></div>
+            <div class="field"><label>网页监听</label><input id="webEndpoint" readonly></div>
+            <div class="field"><label>网络策略</label><input id="networkPolicy" readonly></div>
+          </div>
+          <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="scheduleDialog">
+    <form id="scheduleForm">
+      <div class="dialog-head"><h2 id="scheduleTitle">定时开关机</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
+      <div class="dialog-body">
+        <div class="toggle-row"><div><strong>每日计划</strong><div class="brand-sub">按服务器本地时间</div></div><label class="switch"><input id="scheduleEnabled" type="checkbox"><span></span></label></div>
+        <div class="settings-grid">
+          <div class="field"><label for="startTime">开机时间</label><input id="startTime" type="time" required></div>
+          <div class="field"><label for="stopTime">关机时间</label><input id="stopTime" type="time" required></div>
+        </div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><span data-icon="save"></span>保存计划</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden role="status"><span id="toastIcon" data-icon="circle-check"></span><span id="toastText"></span></div>
+
+  <script>
+    // Paths are from the Lucide icon set (ISC License).
+    const ICONS = {
+      "activity": '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+      "eye": '<path d="M2.06 12.35a1 1 0 0 1 0-.7C3.74 7.6 7.69 5 12 5c4.31 0 8.26 2.6 9.94 6.65a1 1 0 0 1 0 .7C20.26 16.4 16.31 19 12 19c-4.31 0-8.26-2.6-9.94-6.65"/><circle cx="12" cy="12" r="3"/>',
+      "eye-off": '<path d="m2 2 20 20"/><path d="M6.71 6.71C4.93 7.9 3.52 9.6 2.66 11.6a1 1 0 0 0 0 .8C4.27 16.1 7.8 18.5 12 18.5c1.1 0 2.16-.17 3.15-.48"/><path d="M10.73 5.58A10.8 10.8 0 0 1 12 5.5c4.2 0 7.73 2.4 9.34 6.1a1 1 0 0 1 0 .8 10.5 10.5 0 0 1-1.38 2.22"/><path d="M14.12 14.12A3 3 0 0 1 9.88 9.88"/>',
+      "log-in": '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+      "log-out": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+      "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.22-6.22L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 15.22 6.22L21 16"/><path d="M16 16h5v5"/>',
+      "layout-dashboard": '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+      "terminal": '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
+      "settings": '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+      "play": '<polygon points="6 3 20 12 6 21 6 3"/>',
+      "server": '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+      "triangle-alert": '<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+      "clock": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+      "power": '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
+      "pause": '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
+      "calendar-clock": '<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/>',
+      "save": '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+      "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>'
+    };
+    const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
+    document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
+
+    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null };
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+    const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
+    const fmtNum = (value, digits = 2) => value === null || value === undefined ? "--" : Number(value).toFixed(digits);
+
+    async function api(path, options = {}) {
+      const headers = { "Accept": "application/json", ...(options.headers || {}) };
+      if (options.body && typeof options.body !== "string") {
+        headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(options.body);
+      }
+      if (state.csrf && options.method && options.method !== "GET") headers["X-CSRF-Token"] = state.csrf;
+      const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+      let data;
+      try { data = await response.json(); } catch (_) { data = { error: `HTTP ${response.status}` }; }
+      if (response.status === 401 && path !== "/api/login") showLogin();
+      if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+      return data;
+    }
+
+    function toast(message, isError = false) {
+      $("toastText").textContent = message;
+      $("toast").classList.toggle("error", isError);
+      $("toastIcon").innerHTML = icon(isError ? "triangle-alert" : "circle-check");
+      $("toast").hidden = false;
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => { $("toast").hidden = true; }, 4200);
+    }
+
+    function showLogin() {
+      clearInterval(state.timer);
+      state.timer = null;
+      state.csrf = null;
+      $("appView").hidden = true;
+      $("loginView").hidden = false;
+      setTimeout(() => $("username").focus(), 30);
+    }
+
+    function showApp() {
+      $("loginView").hidden = true;
+      $("appView").hidden = false;
+      loadDashboard();
+      clearInterval(state.timer);
+      state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+    }
+
+    function statusInfo(status, paused) {
+      if (paused) return { label: "已暂停", cls: "unknown" };
+      if (status === "Running") return { label: "运行中", cls: "" };
+      if (status === "Stopped") return { label: "已停止", cls: "stopped" };
+      if (["Starting", "Stopping", "Pending"].includes(status)) return { label: status, cls: "transition" };
+      return { label: status || "Unknown", cls: "unknown" };
+    }
+
+    function sparkline(points) {
+      if (!points || points.length < 2) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待更多流量样本</text></svg></div>`;
+      const values = points.map(p => Number(p.value));
+      const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, .01);
+      const coords = values.map((value, i) => `${(i / (values.length - 1) * 316 + 2).toFixed(1)},${(53 - ((value - min) / span) * 45).toFixed(1)}`).join(" ");
+      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M2 53 H318" stroke="#e1e7e3" stroke-width="1"/><polyline points="${coords}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/></svg></div>`;
+    }
+
+    function instanceCard(item) {
+      const status = statusInfo(item.status, item.paused);
+      const percent = item.traffic_percent === null ? 0 : Math.max(0, Math.min(100, item.traffic_percent));
+      const barClass = percent >= 100 ? "danger" : percent >= 85 ? "warn" : "";
+      const bill = !item.billing_enabled ? "已关闭" : item.bill_error ? "查询失败" : item.bill_amount === null ? "--" : `${esc(item.bill_symbol)}${fmtNum(item.bill_amount)} ${esc(item.bill_currency || "")}`;
+      const sched = item.schedule.enabled ? `${esc(item.schedule.start_time)} - ${esc(item.schedule.stop_time)}` : "已关闭";
+      const next = item.schedule.next_at ? `${item.schedule.next_action === "start" ? "开机" : "关机"} ${fmtDate(item.schedule.next_at)}` : "无计划";
+      const powerAction = item.status === "Running" ? "stop" : "start";
+      const powerLabel = powerAction === "start" ? "开机" : "关机";
+      return `<article class="instance-card" data-index="${item.index}">
+        <div class="card-head"><div><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div><div class="status-badge ${status.cls}"><span class="dot ${status.cls === "stopped" || status.cls === "error" ? "bad" : ""}"></span>${esc(status.label)}</div></div>
+        <div class="card-body">
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
+            <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
+          </div>
+          <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
+          <div class="progress"><span class="${barClass}" style="width:${percent}%"></span></div>
+          ${sparkline(item.history)}
+          <div class="instance-meta">下一动作：${esc(next)}</div>
+        </div>
+        <div class="result-line">${esc(item.message)}</div>
+        <div class="card-actions">
+          <button class="button ${powerAction === "stop" ? "danger" : "primary"}" data-action="power" data-power="${powerAction}" ${["Starting","Stopping","Pending"].includes(item.status) ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
+          <button class="button secondary" data-action="schedule">${icon("calendar-clock")}<span>计划</span></button>
+          <button class="button ${item.paused ? "secondary" : "warning"}" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复" : "暂停"}</span></button>
+        </div>
+      </article>`;
+    }
+
+    function renderDashboard(data) {
+      state.dashboard = data;
+      $("appVersion").textContent = `Web Console v${data.version}`;
+      $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
+      $("summaryInstances").textContent = data.users.length;
+      $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
+      $("summaryErrors").textContent = data.users.filter(x => x.level === "error").length;
+      $("summaryCycles").textContent = data.service.cycle_count;
+      const bad = data.service.stale || data.service.last_error_count > 0;
+      $("serviceDot").classList.toggle("bad", bad);
+      $("serviceText").textContent = data.service.stale ? "检测超时" : data.service.last_ok ? "服务正常" : "存在异常";
+      const notices = [];
+      if (data.service.stale) notices.push("后台检测超过预期间隔，请检查服务状态");
+      if (data.service.telegram_error) notices.push(`Telegram：${data.service.telegram_error}`);
+      if (data.job && data.job.error) notices.push(`手动检测：${data.job.error}`);
+      $("notice").hidden = !notices.length;
+      $("noticeText").textContent = notices.join("；");
+      $("runButton").disabled = Boolean(data.job && data.job.running);
+      $("runButton").innerHTML = data.job && data.job.running ? `${icon("refresh-cw", "spin")}检测中` : `${icon("play")}立即检测`;
+      $("instances").innerHTML = data.users.length ? data.users.map(instanceCard).join("") : `<div class="empty"><div>${icon("server")}<p>暂无监控实例</p></div></div>`;
+      $("intervalSeconds").value = data.settings.interval_seconds;
+      $("notificationMode").value = data.settings.notification_mode;
+      $("webEndpoint").value = `http://${data.settings.web_host}:${data.settings.web_port}`;
+      $("networkPolicy").value = data.settings.force_ipv4 ? "IPv4 优先" : "系统默认";
+    }
+
+    async function loadDashboard(showErrors = true) {
+      try { renderDashboard(await api("/api/dashboard")); }
+      catch (error) { if (showErrors) toast(error.message, true); }
+    }
+
+    async function loadLogs() {
+      $("logView").textContent = "正在读取...";
+      try { const data = await api("/api/logs?limit=200"); $("logView").textContent = data.lines.length ? data.lines.join("\n") : "日志尚未生成。"; $("logView").scrollTop = $("logView").scrollHeight; }
+      catch (error) { $("logView").textContent = error.message; }
+    }
+
+    document.querySelectorAll(".tab-button").forEach(button => button.addEventListener("click", () => {
+      document.querySelectorAll(".tab-button").forEach(x => x.classList.toggle("active", x === button));
+      document.querySelectorAll(".tab-panel").forEach(x => x.hidden = x.id !== `${button.dataset.tab}Tab`);
+      if (button.dataset.tab === "logs") loadLogs();
+    }));
+
+    $("loginForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      $("loginError").textContent = "";
+      const submit = event.currentTarget.querySelector("button[type=submit]");
+      submit.disabled = true;
+      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; $("password").value = ""; showApp(); }
+      catch (error) { $("loginError").textContent = error.message; }
+      finally { submit.disabled = false; }
+    });
+
+    $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
+    $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await loadDashboard(); $("refreshButton").querySelector("svg").classList.remove("spin"); });
+    $("logsRefresh").addEventListener("click", loadLogs);
+    $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
+    $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: {} }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+
+    $("instances").addEventListener("click", async event => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const card = button.closest("[data-index]");
+      const index = Number(card.dataset.index);
+      const item = state.dashboard.users.find(x => x.index === index);
+      if (!item) return;
+      if (button.dataset.action === "schedule") {
+        state.scheduleIndex = index;
+        $("scheduleTitle").textContent = `${item.name} · 定时开关机`;
+        $("scheduleEnabled").checked = item.schedule.enabled;
+        $("startTime").value = item.schedule.start_time;
+        $("stopTime").value = item.schedule.stop_time;
+        $("scheduleDialog").showModal();
+        return;
+      }
+      if (button.dataset.action === "pause") {
+        const paused = !item.paused;
+        if (!confirm(`确认${paused ? "暂停" : "恢复"} ${item.name}？`)) return;
+        button.disabled = true;
+        try { await api(`/api/instances/${index}/pause`, { method: "POST", body: { paused } }); toast(paused ? "实例监控已暂停" : "实例监控已恢复"); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+        return;
+      }
+      if (button.dataset.action === "power") {
+        const action = button.dataset.power;
+        if (!confirm(`确认${action === "start" ? "开机" : "关机"} ${item.name}？`)) return;
+        button.disabled = true;
+        try { const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } }); toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error)); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+      }
+    });
+
+    document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => $("scheduleDialog").close()));
+    $("scheduleForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const enabled = $("scheduleEnabled").checked, start_time = $("startTime").value, stop_time = $("stopTime").value;
+      if (enabled && start_time === stop_time) { toast("开机时间和关机时间不能相同", true); return; }
+      try { await api(`/api/instances/${state.scheduleIndex}/schedule`, { method: "POST", body: { enabled, start_time, stop_time } }); $("scheduleDialog").close(); toast("定时计划已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+    });
+
+    $("settingsForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      try { await api("/api/settings", { method: "POST", body: { interval_seconds: Number($("intervalSeconds").value), notification_mode: $("notificationMode").value } }); toast("全局设置已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+    });
+
+    (async function init() {
+      try { const data = await api("/api/session"); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else showLogin(); }
+      catch (error) { $("loginError").textContent = error.message; showLogin(); }
+    })();
+  </script>
+</body>
+</html>
+__AG_WEB_HTML_EOF__
     cat > "$APP_DIR/aliyun_guard.py" <<'__AG_APP_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -965,6 +2613,14 @@ DEFAULT_CONFIG = {
     "notification_mode": "always",
     "notify_on_daemon_start": False,
     "force_ipv4": True,
+    "web_panel": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "username": "admin",
+        "password_hash": "",
+        "cookie_secure": False,
+    },
     "telegram": {
         "bot_token": "",
         "chat_id": "",
@@ -1001,6 +2657,7 @@ LOGGER = logging.getLogger("aliyun_guard")
 LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
+_CYCLE_THREAD_LOCK = threading.Lock()
 
 
 class GuardError(RuntimeError):
@@ -1113,6 +2770,14 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    try:
+        import web_panel
+    except ImportError as exc:
+        raise GuardError("网页面板模块缺失: {}".format(exc))
+    try:
+        web_panel.validate_web_config(config)
+    except web_panel.WebPanelError as exc:
+        raise GuardError(str(exc))
     validate_telegram_config(config.get("telegram", {}))
     users = config.get("users")
     if not isinstance(users, list):
@@ -2124,14 +3789,37 @@ def update_state(
                 if field in previous_instance:
                     instance_state[field] = previous_instance[field]
         state["instances"][item["instance_id"]] = instance_state
+    if not dry_run:
+        history = state.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "at": started_at.isoformat(timespec="seconds"),
+                "instances": {
+                    item["instance_id"]: {
+                        "traffic_gb": item.get("traffic_gb"),
+                        "status": item.get("status_after"),
+                        "bill_amount": item.get("bill_amount"),
+                    }
+                    for item in results
+                },
+            }
+        )
+        state["history"] = history[-576:]
 
 
 @contextlib.contextmanager
 def cycle_lock():
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = LOCK_FILE.open("a+")
+    thread_locked = _CYCLE_THREAD_LOCK.acquire(False)
+    if not thread_locked:
+        yield False
+        return
+    handle = None
     locked = True
     try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handle = LOCK_FILE.open("a+")
         if fcntl is not None:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2139,9 +3827,11 @@ def cycle_lock():
                 locked = False
         yield locked
     finally:
-        if locked and fcntl is not None:
+        if handle is not None and locked and fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        if handle is not None:
+            handle.close()
+        _CYCLE_THREAD_LOCK.release()
 
 
 def run_cycle(dry_run=False, no_notify=False, started_at=None):
@@ -2265,6 +3955,13 @@ def run_daemon():
                 "启动通知发送失败: %s",
                 compact_error(exc, secrets=telegram_secrets(telegram)),
             )
+    web_server = None
+    try:
+        import web_panel
+
+        web_server = web_panel.start_background(sys.modules[__name__], config)
+    except Exception as exc:
+        LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
@@ -2298,6 +3995,9 @@ def run_daemon():
         except Exception:
             remaining = 60
         _STOP_EVENT.wait(remaining)
+    if web_server is not None:
+        web_server.shutdown()
+        web_server.server_close()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -2334,6 +4034,17 @@ def show_status():
         )
     print("检测间隔: {} 秒".format(config["interval_seconds"]))
     print("通知模式: {}".format(config["notification_mode"]))
+    try:
+        import web_panel
+
+        web = web_panel.get_web_config(config)
+        print(
+            "网页面板: {} (http://{}:{})".format(
+                "已启用" if web["enabled"] else "已关闭", web["host"], web["port"]
+            )
+        )
+    except Exception:
+        print("网页面板: 配置异常")
     print("累计检测: {} 次".format(state.get("cycle_count", 0)))
     print("最后完成: {}".format(state.get("last_cycle_finished_at", "尚未运行")))
     print("最后结果: {}".format("正常" if state.get("last_cycle_ok") else "有错误或尚未运行"))
@@ -2423,6 +4134,7 @@ import urllib.request
 
 import aliyun_guard as guard
 import telegram_proxy
+import web_panel
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -2432,8 +4144,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.8"
-LOCAL_RELEASE_ID = "b5b7505a6c9b6b13fcf8a49e871c9bc2391164d8b0f60a91f4044d7fb0e52d21"
+APP_VERSION = "1.3.0"
+LOCAL_RELEASE_ID = "9e549bf8dc353ef1b0150add5ca43253d921216c75b89cdf6a296b69a110f94f"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -3319,6 +5031,80 @@ def edit_user_schedule(config):
         print("未保存修改。")
 
 
+def _set_web_password(web):
+    while True:
+        password = prompt_secret("网页登录密码")
+        confirm_password = prompt_secret("再次输入网页登录密码")
+        if password != confirm_password:
+            print("两次输入的密码不一致。")
+            continue
+        try:
+            web["password_hash"] = web_panel.hash_password(password)
+            return
+        except ValueError as exc:
+            print(exc)
+
+
+def print_web_panel_access(web):
+    print("网页监听: http://{}:{}".format(web["host"], web["port"]))
+    if web["host"] == "127.0.0.1":
+        print("SSH 隧道: ssh -L {0}:127.0.0.1:{0} root@服务器IP".format(web["port"]))
+        print("浏览器访问: http://127.0.0.1:{}".format(web["port"]))
+    else:
+        print("浏览器访问: http://服务器IP:{}".format(web["port"]))
+
+
+def configure_web_panel(config, initial=False, restart=True):
+    current = web_panel.get_web_config(config)
+    title("网页控制面板")
+    if not initial:
+        print("当前状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        if current["enabled"]:
+            print_web_panel_access(current)
+    enabled = yes_no("启用网页控制面板", current["enabled"] if not initial else True)
+    candidate = dict(current)
+    candidate["enabled"] = enabled
+    if not enabled:
+        config["web_panel"] = candidate
+        save_config(config)
+        if restart:
+            run_control("restart")
+        print("网页控制面板已关闭。")
+        return False
+
+    print("\n监听方式：")
+    print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
+    print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
+    default_host = 2 if current["host"] == "0.0.0.0" else 1
+    host_choice = prompt_int("监听方式序号", default_host, 1, 2)
+    if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
+        print("已改为仅本机监听。")
+        host_choice = 1
+    candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
+    candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
+    candidate["username"] = prompt(
+        "网页登录用户名", current["username"] or "admin", required=True
+    )
+    candidate["cookie_secure"] = yes_no(
+        "浏览器入口已经配置 HTTPS（启用 Secure Cookie）",
+        bool(current.get("cookie_secure", False)),
+    )
+    if not current.get("password_hash") or yes_no("修改网页登录密码", False):
+        _set_web_password(candidate)
+    config["web_panel"] = candidate
+    try:
+        save_config(config)
+    except Exception:
+        config["web_panel"] = current
+        raise
+    if restart:
+        if run_control("restart") != 0:
+            print("配置已保存，但后台服务重启失败。")
+    print("网页控制面板配置已保存。")
+    print_web_panel_access(candidate)
+    return True
+
+
 def toggle_user(config):
     index = choose_user(config, "暂停/恢复")
     if index is None:
@@ -3555,6 +5341,7 @@ def initial_setup(force=False):
             continue
         else:
             break
+    configure_web_panel(config, initial=True, restart=False)
     save_config(config)
     print("\n首次配置完成。")
     return 0
@@ -3588,7 +5375,7 @@ def menu():
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         if update_info and update_info.get("available"):
-            print(yellow_text("发现新版本: v{}（请选择 15 更新）".format(update_info["version"])))
+            print(yellow_text("发现新版本: v{}（请选择 16 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -3598,17 +5385,18 @@ def menu():
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
         print(" 9) 定时开关机设置")
-        print("10) 暂停/恢复监控实例")
-        print("11) 删除监控实例")
-        print("12) 修改全局设置")
-        print("13) 查看最近日志")
-        print("14) 重启后台服务")
+        print("10) 网页控制面板")
+        print("11) 暂停/恢复监控实例")
+        print("12) 删除监控实例")
+        print("13) 修改全局设置")
+        print("14) 查看最近日志")
+        print("15) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
-        print("15) 更新 GitHub 版本{}".format(update_hint))
-        print("16) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 16)
+        print("16) 更新 GitHub 版本{}".format(update_hint))
+        print("17) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 17)
         try:
             if choice == 1:
                 show_status(config)
@@ -3630,23 +5418,25 @@ def menu():
             elif choice == 9:
                 edit_user_schedule(config)
             elif choice == 10:
-                toggle_user(config)
+                configure_web_panel(config)
             elif choice == 11:
-                delete_user(config)
+                toggle_user(config)
             elif choice == 12:
-                edit_settings(config)
+                delete_user(config)
             elif choice == 13:
-                show_logs()
+                edit_settings(config)
             elif choice == 14:
-                run_control("restart")
+                show_logs()
             elif choice == 15:
+                run_control("restart")
+            elif choice == 16:
                 if update_from_github(release_info=update_info) is True:
                     return 0
-            elif choice == 16:
+            elif choice == 17:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 16:
+        if choice != 17:
             prompt("按回车返回菜单")
 
 
@@ -3660,6 +5450,7 @@ def parse_args(argv=None):
     subparsers.add_parser("add", help="添加实例")
     subparsers.add_parser("update", help="从 GitHub 更新程序")
     subparsers.add_parser("version", help="显示当前版本")
+    subparsers.add_parser("web", help="显示网页控制面板状态")
     return parser.parse_args(argv)
 
 
@@ -3682,6 +5473,8 @@ def main(argv=None):
         if args.command == "version":
             print("Aliyun Guard v{}".format(APP_VERSION))
             return 0
+        if args.command == "web":
+            return web_panel.show_status()
         return menu()
     except guard.GuardError as exc:
         print("错误: {}".format(exc), file=sys.stderr)
@@ -3702,6 +5495,7 @@ APP_DIR=${ALIYUN_GUARD_HOME:-/opt/aliyun-guard}
 PYTHON="$APP_DIR/venv/bin/python"
 APP="$APP_DIR/aliyun_guard.py"
 MANAGER="$APP_DIR/manager.py"
+WEB="$APP_DIR/web_panel.py"
 BACKEND_FILE="$APP_DIR/service_backend"
 SERVICE_NAME="aliyun-guard"
 
@@ -3759,6 +5553,7 @@ start_service() {
             ;;
         cron)
             rm -f "$APP_DIR/disabled"
+            "$PYTHON" "$WEB" ensure >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已启用。"
             ;;
         *)
@@ -3781,6 +5576,7 @@ stop_service() {
         cron)
             : > "$APP_DIR/disabled"
             chmod 600 "$APP_DIR/disabled"
+            "$PYTHON" "$WEB" stop >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已暂停。"
             ;;
         *)
@@ -3804,6 +5600,7 @@ restart_service() {
         cron)
             rm -f "$APP_DIR/disabled"
             "$PYTHON" "$APP" scheduled
+            "$PYTHON" "$WEB" restart
             ;;
         *)
             printf '%s\n' "未知调度后端: $current" >&2
@@ -3821,6 +5618,7 @@ status                查看服务和最近检测状态
 run                    立即执行一轮检测并通知
 dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
+web                    查看网页控制面板地址和状态
 update                 从 GitHub 下载并安装最新版本
 version                显示当前版本号
 logs                   查看最近 100 行日志
@@ -3858,6 +5656,9 @@ case "$command_name" in
         ;;
     test-telegram)
         exec "$PYTHON" "$APP" test-telegram
+        ;;
+    web)
+        exec "$PYTHON" "$MANAGER" web
         ;;
     update)
         exec "$PYTHON" "$MANAGER" update
@@ -3958,6 +5759,10 @@ if [ -r "$BACKEND_FILE" ]; then
     backend=$(sed -n '1p' "$BACKEND_FILE")
 fi
 
+if [ -x "$APP_DIR/venv/bin/python" ] && [ -f "$APP_DIR/web_panel.py" ]; then
+    "$APP_DIR/venv/bin/python" "$APP_DIR/web_panel.py" stop >/dev/null 2>&1 || true
+fi
+
 case "$backend" in
     systemd)
         systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
@@ -3993,7 +5798,8 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_panel.py"
+    chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
     [ ! -f "$APP_DIR/config.json" ] || chmod 600 "$APP_DIR/config.json"
@@ -4001,7 +5807,8 @@ __AG_UNINSTALL_SH_EOF__
     "$VENV_DIR/bin/python" -m py_compile \
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
-        "$APP_DIR/telegram_proxy.py"
+        "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"
     sh -n "$APP_DIR/uninstall.sh"
     mkdir -p /usr/local/bin
@@ -4128,6 +5935,8 @@ setup_cron() {
     grep -v '# aliyun-guard' "$cron_old" > "$cron_new" || :
     printf '* * * * * %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
+        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
     if [ "$START_BACKEND" = yes ]; then
@@ -4138,6 +5947,10 @@ setup_cron() {
     fi
     printf '%s\n' cron > "$APP_DIR/service_backend"
     start_cron_service
+    if [ "$START_BACKEND" = yes ]; then
+        "$VENV_DIR/bin/python" "$APP_DIR/web_panel.py" ensure >/dev/null 2>&1 || \
+            say "${YELLOW}网页面板暂未启动，cron 将在一分钟内自动重试。${RESET}"
+    fi
 }
 
 setup_backend() {
@@ -4189,6 +6002,7 @@ finish() {
     say "演练检测: ${CYAN}aliyun-guard dry-run${RESET}"
     say "查看状态: ${CYAN}aliyun-guard status${RESET}"
     say "查看日志: ${CYAN}aliyun-guard logs${RESET}"
+    say "网页面板: ${CYAN}aliyun-guard web${RESET}"
     say "更新版本: ${CYAN}aliyun-guard update${RESET}"
 }
 

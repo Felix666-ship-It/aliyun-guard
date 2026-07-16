@@ -53,6 +53,10 @@ if [ -r "$BACKEND_FILE" ]; then
     backend=$(sed -n '1p' "$BACKEND_FILE")
 fi
 
+if [ -x "$APP_DIR/venv/bin/python" ] && [ -f "$APP_DIR/web_panel.py" ]; then
+    "$APP_DIR/venv/bin/python" "$APP_DIR/web_panel.py" stop >/dev/null 2>&1 || true
+fi
+
 case "$backend" in
     systemd)
         systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true

@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>Aliyun Guard</title>
+  <style>
+    :root {
+      --bg: #f4f6f3;
+      --surface: #ffffff;
+      --surface-alt: #eef4f1;
+      --ink: #17201d;
+      --muted: #65716c;
+      --line: #d9e1dc;
+      --brand: #08775a;
+      --brand-dark: #075e49;
+      --cyan: #167c94;
+      --amber: #b96808;
+      --red: #b63d36;
+      --shadow: 0 8px 24px rgba(23, 32, 29, .07);
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      letter-spacing: 0;
+    }
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+    [hidden] { display: none !important; }
+    .icon { width: 18px; height: 18px; flex: 0 0 18px; stroke-width: 2; }
+    .auth-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+      background: var(--surface);
+    }
+    .auth-panel {
+      padding: 52px 42px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border-right: 1px solid var(--line);
+    }
+    .auth-scene {
+      position: relative;
+      overflow: hidden;
+      background: #14352d;
+      color: #fff;
+      display: grid;
+      align-content: center;
+      padding: 8vw;
+    }
+    .auth-scene::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      opacity: .18;
+      background-image:
+        linear-gradient(#b8fff0 1px, transparent 1px),
+        linear-gradient(90deg, #b8fff0 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+    .scene-chart { position: relative; width: min(660px, 100%); }
+    .scene-chart svg { display: block; width: 100%; height: auto; }
+    .scene-title { position: relative; margin: 26px 0 0; font-size: 18px; font-weight: 600; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      background: var(--brand);
+      color: #fff;
+      border-radius: var(--radius);
+      flex: 0 0 38px;
+    }
+    .brand-name { font-size: 20px; font-weight: 750; line-height: 1.1; overflow-wrap: anywhere; }
+    .brand-sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .auth-title { margin: 50px 0 4px; font-size: 27px; line-height: 1.25; }
+    .auth-meta { margin: 0 0 28px; color: var(--muted); }
+    .field { display: grid; gap: 7px; margin-bottom: 17px; }
+    .field label { font-size: 13px; font-weight: 650; color: #3d4944; }
+    .input-wrap { position: relative; }
+    input, select {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid #cbd5cf;
+      border-radius: 5px;
+      background: #fff;
+      color: var(--ink);
+      padding: 9px 11px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(8, 119, 90, .12); }
+    .input-wrap input { padding-right: 44px; }
+    .input-icon {
+      position: absolute;
+      right: 3px;
+      top: 3px;
+      width: 36px;
+      height: 36px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+    }
+    .button {
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      padding: 8px 13px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .button.primary { background: var(--brand); color: #fff; }
+    .button.primary:hover { background: var(--brand-dark); }
+    .button.secondary { background: #fff; border-color: var(--line); color: var(--ink); }
+    .button.secondary:hover { background: var(--surface-alt); }
+    .button.danger { background: #fff; border-color: #e1b5b1; color: var(--red); }
+    .button.warning { background: #fff8ed; border-color: #e8c897; color: #8b4e07; }
+    .button:disabled { cursor: not-allowed; opacity: .55; }
+    .auth-submit { width: 100%; margin-top: 6px; min-height: 44px; }
+    .form-error { min-height: 22px; color: var(--red); margin: 5px 0 0; }
+    .app { min-height: 100vh; }
+    .app-header {
+      height: 66px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 0 28px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 30;
+    }
+    .header-actions { display: flex; align-items: center; gap: 8px; }
+    .icon-button {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #fff;
+      color: #46534e;
+      display: grid;
+      place-items: center;
+      padding: 0;
+    }
+    .icon-button:hover { background: var(--surface-alt); color: var(--brand); }
+    .service-chip {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      color: #355047;
+      background: #f8faf8;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--brand); }
+    .dot.bad { background: var(--red); }
+    .app-nav {
+      height: 48px;
+      padding: 0 28px;
+      display: flex;
+      align-items: end;
+      gap: 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+    }
+    .tab-button {
+      height: 48px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 2px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .tab-button.active { color: var(--brand); border-bottom-color: var(--brand); }
+    .main { width: min(1440px, 100%); margin: 0 auto; padding: 24px 28px 44px; }
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 17px;
+    }
+    .section-heading h1 { font-size: 20px; margin: 0; }
+    .section-heading p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .summary-band {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin-bottom: 18px;
+      overflow: hidden;
+    }
+    .summary-item { min-width: 0; padding: 17px 18px; border-right: 1px solid var(--line); }
+    .summary-item:last-child { border-right: 0; }
+    .summary-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+    .summary-value { margin-top: 5px; font-size: 20px; font-weight: 750; overflow-wrap: anywhere; }
+    .notice {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border: 1px solid #e6c38d;
+      border-left: 4px solid var(--amber);
+      background: #fff9ef;
+      padding: 11px 13px;
+      margin-bottom: 18px;
+      border-radius: 4px;
+      color: #6c450f;
+    }
+    .instances {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .instance-card {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .card-head {
+      min-height: 66px;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .instance-name { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+    .instance-meta { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .status-badge {
+      flex: 0 0 auto;
+      min-width: 82px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border-radius: 14px;
+      padding: 0 10px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid #b7d8cb;
+      color: #086146;
+      background: #eff9f5;
+    }
+    .status-badge.stopped, .status-badge.error { color: #96352f; border-color: #e3bab7; background: #fff3f2; }
+    .status-badge.transition { color: #865006; border-color: #ead09f; background: #fff9ed; }
+    .status-badge.unknown { color: #58645f; border-color: #d0d8d3; background: #f4f6f5; }
+    .card-body { padding: 15px 16px 12px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { min-width: 0; }
+    .metric-label { color: var(--muted); font-size: 11px; }
+    .metric-value { margin-top: 3px; font-weight: 700; overflow-wrap: anywhere; }
+    .traffic-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 15px; font-size: 12px; }
+    .progress { height: 7px; margin-top: 7px; background: #e7ede9; border-radius: 3px; overflow: hidden; }
+    .progress > span { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
+    .progress > span.warn { background: var(--amber); }
+    .progress > span.danger { background: var(--red); }
+    .sparkline { height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
+    .sparkline svg { width: 100%; height: 58px; display: block; overflow: visible; }
+    .result-line { min-height: 40px; padding: 10px 16px; color: #53605b; background: #fafbfa; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+    .card-actions { min-height: 56px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); overflow-x: auto; }
+    .card-actions .button { min-height: 35px; padding: 7px 10px; font-size: 12px; }
+    .empty {
+      grid-column: 1 / -1;
+      min-height: 260px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px dashed #cbd5cf;
+      border-radius: var(--radius);
+    }
+    .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .log-view {
+      min-height: 520px;
+      max-height: calc(100vh - 235px);
+      overflow: auto;
+      margin: 0;
+      padding: 16px;
+      color: #dff7ed;
+      background: #13251f;
+      border-radius: var(--radius);
+      font: 12px/1.65 "Cascadia Mono", Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .settings-panel { max-width: 720px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
+    .settings-actions { margin-top: 4px; display: flex; justify-content: flex-end; }
+    dialog {
+      width: min(460px, calc(100vw - 28px));
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0;
+      color: var(--ink);
+      box-shadow: 0 24px 70px rgba(17, 28, 24, .24);
+    }
+    dialog::backdrop { background: rgba(17, 28, 24, .48); }
+    .dialog-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .dialog-head h2 { margin: 0; font-size: 16px; }
+    .dialog-body { padding: 18px 16px; }
+    .dialog-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
+    .toggle-row { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 42px; }
+    .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .switch span { position: absolute; inset: 0; background: #bfc9c3; border-radius: 12px; transition: .18s; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: .18s; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+    .switch input:checked + span { background: var(--brand); }
+    .switch input:checked + span::after { transform: translateX(18px); }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 80;
+      max-width: min(420px, calc(100vw - 40px));
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      color: #fff;
+      background: #20352e;
+      border-radius: 6px;
+      box-shadow: var(--shadow);
+    }
+    .toast.error { background: #8f312d; }
+    .spin { animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 980px) {
+      .auth-shell { grid-template-columns: minmax(280px, 390px) 1fr; }
+      .auth-scene { padding: 5vw; }
+      .summary-band { grid-template-columns: 1fr 1fr; }
+      .summary-item:nth-child(2) { border-right: 0; }
+      .summary-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 760px) {
+      .auth-shell { display: block; background: var(--bg); padding: 0; }
+      .auth-panel { min-height: 100vh; padding: 36px 22px; border: 0; background: var(--surface); }
+      .auth-scene { display: none; }
+      .auth-title { margin-top: 44px; font-size: 24px; }
+      .app-header { height: 60px; padding: 0 14px; }
+      .brand-mark { width: 34px; height: 34px; flex-basis: 34px; }
+      .brand-name { font-size: 17px; }
+      .brand-sub, .service-chip { display: none; }
+      .app-nav { padding: 0 14px; gap: 20px; }
+      .main { padding: 18px 14px 34px; }
+      .section-heading { align-items: flex-start; }
+      .instances { grid-template-columns: 1fr; }
+      .settings-grid { grid-template-columns: 1fr; }
+      .card-head { align-items: flex-start; }
+      .card-actions { padding: 9px; }
+      .log-view { min-height: 440px; max-height: calc(100vh - 215px); }
+    }
+    @media (max-width: 430px) {
+      .summary-band { grid-template-columns: 1fr 1fr; }
+      .summary-item { padding: 13px 12px; }
+      .summary-value { font-size: 17px; }
+      .metric-grid { gap: 12px 8px; }
+      .button .optional-label { display: none; }
+      .section-heading h1 { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <section id="loginView" class="auth-shell">
+    <div class="auth-panel">
+      <div class="brand">
+        <div class="brand-mark" data-icon="activity"></div>
+        <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub">ECS CONTROL CONSOLE</div></div>
+      </div>
+      <h1 class="auth-title">登录控制台</h1>
+      <p class="auth-meta" id="loginVersion">受保护的运维入口</p>
+      <form id="loginForm" autocomplete="on">
+        <div class="field">
+          <label for="username">用户名</label>
+          <input id="username" name="username" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <div class="input-wrap">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button class="input-icon" id="togglePassword" type="button" title="显示或隐藏密码" aria-label="显示或隐藏密码" data-icon="eye"></button>
+          </div>
+        </div>
+        <button class="button primary auth-submit" type="submit"><span data-icon="log-in"></span>登录</button>
+        <p id="loginError" class="form-error" role="alert"></p>
+      </form>
+    </div>
+    <div class="auth-scene" aria-hidden="true">
+      <div class="scene-chart">
+        <svg viewBox="0 0 760 300" role="img">
+          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55" fill="none" stroke="#5cf0c8" stroke-width="6" stroke-linecap="round"/>
+          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55 L740 280 L20 280 Z" fill="#5cf0c8" opacity=".1"/>
+          <circle cx="740" cy="55" r="9" fill="#fff" stroke="#5cf0c8" stroke-width="5"/>
+        </svg>
+      </div>
+      <p class="scene-title">Alibaba Cloud · Operations</p>
+    </div>
+  </section>
+
+  <div id="appView" class="app" hidden>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" data-icon="activity"></div>
+        <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub" id="appVersion">Web Console</div></div>
+      </div>
+      <div class="header-actions">
+        <div class="service-chip"><span id="serviceDot" class="dot"></span><span id="serviceText">读取中</span></div>
+        <button id="refreshButton" class="icon-button" type="button" title="刷新" aria-label="刷新" data-icon="refresh-cw"></button>
+        <button id="logoutButton" class="icon-button" type="button" title="退出登录" aria-label="退出登录" data-icon="log-out"></button>
+      </div>
+    </header>
+    <nav class="app-nav" aria-label="控制台视图">
+      <button class="tab-button active" data-tab="dashboard"><span data-icon="layout-dashboard"></span>实例</button>
+      <button class="tab-button" data-tab="logs"><span data-icon="terminal"></span>日志</button>
+      <button class="tab-button" data-tab="settings"><span data-icon="settings"></span>设置</button>
+    </nav>
+    <main class="main">
+      <section id="dashboardTab" class="tab-panel">
+        <div class="section-heading">
+          <div><h1>实例总览</h1><p id="lastUpdated">尚未刷新</p></div>
+          <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
+        </div>
+        <div class="summary-band">
+          <div class="summary-item"><div class="summary-label"><span data-icon="server"></span>实例</div><div class="summary-value" id="summaryInstances">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="activity"></span>运行中</div><div class="summary-value" id="summaryRunning">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="triangle-alert"></span>异常</div><div class="summary-value" id="summaryErrors">0</div></div>
+          <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
+        </div>
+        <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
+        <div id="instances" class="instances"></div>
+      </section>
+
+      <section id="logsTab" class="tab-panel" hidden>
+        <div class="section-heading"><div><h1>运行日志</h1><p>最近 200 行</p></div><button id="logsRefresh" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新</button></div>
+        <pre id="logView" class="log-view">正在读取...</pre>
+      </section>
+
+      <section id="settingsTab" class="tab-panel" hidden>
+        <div class="section-heading"><div><h1>全局设置</h1><p>后台调度参数</p></div></div>
+        <form id="settingsForm" class="settings-panel">
+          <div class="settings-grid">
+            <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
+            <div class="field"><label for="notificationMode">Telegram 通知模式</label><select id="notificationMode"><option value="always">每轮通知</option><option value="events">仅事件与变化</option><option value="errors">仅错误</option></select></div>
+            <div class="field"><label>网页监听</label><input id="webEndpoint" readonly></div>
+            <div class="field"><label>网络策略</label><input id="networkPolicy" readonly></div>
+          </div>
+          <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="scheduleDialog">
+    <form id="scheduleForm">
+      <div class="dialog-head"><h2 id="scheduleTitle">定时开关机</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
+      <div class="dialog-body">
+        <div class="toggle-row"><div><strong>每日计划</strong><div class="brand-sub">按服务器本地时间</div></div><label class="switch"><input id="scheduleEnabled" type="checkbox"><span></span></label></div>
+        <div class="settings-grid">
+          <div class="field"><label for="startTime">开机时间</label><input id="startTime" type="time" required></div>
+          <div class="field"><label for="stopTime">关机时间</label><input id="stopTime" type="time" required></div>
+        </div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button class="button primary" type="submit"><span data-icon="save"></span>保存计划</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden role="status"><span id="toastIcon" data-icon="circle-check"></span><span id="toastText"></span></div>
+
+  <script>
+    // Paths are from the Lucide icon set (ISC License).
+    const ICONS = {
+      "activity": '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+      "eye": '<path d="M2.06 12.35a1 1 0 0 1 0-.7C3.74 7.6 7.69 5 12 5c4.31 0 8.26 2.6 9.94 6.65a1 1 0 0 1 0 .7C20.26 16.4 16.31 19 12 19c-4.31 0-8.26-2.6-9.94-6.65"/><circle cx="12" cy="12" r="3"/>',
+      "eye-off": '<path d="m2 2 20 20"/><path d="M6.71 6.71C4.93 7.9 3.52 9.6 2.66 11.6a1 1 0 0 0 0 .8C4.27 16.1 7.8 18.5 12 18.5c1.1 0 2.16-.17 3.15-.48"/><path d="M10.73 5.58A10.8 10.8 0 0 1 12 5.5c4.2 0 7.73 2.4 9.34 6.1a1 1 0 0 1 0 .8 10.5 10.5 0 0 1-1.38 2.22"/><path d="M14.12 14.12A3 3 0 0 1 9.88 9.88"/>',
+      "log-in": '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+      "log-out": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+      "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.22-6.22L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 15.22 6.22L21 16"/><path d="M16 16h5v5"/>',
+      "layout-dashboard": '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+      "terminal": '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
+      "settings": '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+      "play": '<polygon points="6 3 20 12 6 21 6 3"/>',
+      "server": '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+      "triangle-alert": '<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+      "clock": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+      "power": '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
+      "pause": '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
+      "calendar-clock": '<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/>',
+      "save": '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+      "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>'
+    };
+    const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
+    document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
+
+    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null };
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+    const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
+    const fmtNum = (value, digits = 2) => value === null || value === undefined ? "--" : Number(value).toFixed(digits);
+
+    async function api(path, options = {}) {
+      const headers = { "Accept": "application/json", ...(options.headers || {}) };
+      if (options.body && typeof options.body !== "string") {
+        headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(options.body);
+      }
+      if (state.csrf && options.method && options.method !== "GET") headers["X-CSRF-Token"] = state.csrf;
+      const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+      let data;
+      try { data = await response.json(); } catch (_) { data = { error: `HTTP ${response.status}` }; }
+      if (response.status === 401 && path !== "/api/login") showLogin();
+      if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+      return data;
+    }
+
+    function toast(message, isError = false) {
+      $("toastText").textContent = message;
+      $("toast").classList.toggle("error", isError);
+      $("toastIcon").innerHTML = icon(isError ? "triangle-alert" : "circle-check");
+      $("toast").hidden = false;
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => { $("toast").hidden = true; }, 4200);
+    }
+
+    function showLogin() {
+      clearInterval(state.timer);
+      state.timer = null;
+      state.csrf = null;
+      $("appView").hidden = true;
+      $("loginView").hidden = false;
+      setTimeout(() => $("username").focus(), 30);
+    }
+
+    function showApp() {
+      $("loginView").hidden = true;
+      $("appView").hidden = false;
+      loadDashboard();
+      clearInterval(state.timer);
+      state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+    }
+
+    function statusInfo(status, paused) {
+      if (paused) return { label: "已暂停", cls: "unknown" };
+      if (status === "Running") return { label: "运行中", cls: "" };
+      if (status === "Stopped") return { label: "已停止", cls: "stopped" };
+      if (["Starting", "Stopping", "Pending"].includes(status)) return { label: status, cls: "transition" };
+      return { label: status || "Unknown", cls: "unknown" };
+    }
+
+    function sparkline(points) {
+      if (!points || points.length < 2) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待更多流量样本</text></svg></div>`;
+      const values = points.map(p => Number(p.value));
+      const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, .01);
+      const coords = values.map((value, i) => `${(i / (values.length - 1) * 316 + 2).toFixed(1)},${(53 - ((value - min) / span) * 45).toFixed(1)}`).join(" ");
+      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M2 53 H318" stroke="#e1e7e3" stroke-width="1"/><polyline points="${coords}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/></svg></div>`;
+    }
+
+    function instanceCard(item) {
+      const status = statusInfo(item.status, item.paused);
+      const percent = item.traffic_percent === null ? 0 : Math.max(0, Math.min(100, item.traffic_percent));
+      const barClass = percent >= 100 ? "danger" : percent >= 85 ? "warn" : "";
+      const bill = !item.billing_enabled ? "已关闭" : item.bill_error ? "查询失败" : item.bill_amount === null ? "--" : `${esc(item.bill_symbol)}${fmtNum(item.bill_amount)} ${esc(item.bill_currency || "")}`;
+      const sched = item.schedule.enabled ? `${esc(item.schedule.start_time)} - ${esc(item.schedule.stop_time)}` : "已关闭";
+      const next = item.schedule.next_at ? `${item.schedule.next_action === "start" ? "开机" : "关机"} ${fmtDate(item.schedule.next_at)}` : "无计划";
+      const powerAction = item.status === "Running" ? "stop" : "start";
+      const powerLabel = powerAction === "start" ? "开机" : "关机";
+      return `<article class="instance-card" data-index="${item.index}">
+        <div class="card-head"><div><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div><div class="status-badge ${status.cls}"><span class="dot ${status.cls === "stopped" || status.cls === "error" ? "bad" : ""}"></span>${esc(status.label)}</div></div>
+        <div class="card-body">
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
+            <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
+          </div>
+          <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
+          <div class="progress"><span class="${barClass}" style="width:${percent}%"></span></div>
+          ${sparkline(item.history)}
+          <div class="instance-meta">下一动作：${esc(next)}</div>
+        </div>
+        <div class="result-line">${esc(item.message)}</div>
+        <div class="card-actions">
+          <button class="button ${powerAction === "stop" ? "danger" : "primary"}" data-action="power" data-power="${powerAction}" ${["Starting","Stopping","Pending"].includes(item.status) ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
+          <button class="button secondary" data-action="schedule">${icon("calendar-clock")}<span>计划</span></button>
+          <button class="button ${item.paused ? "secondary" : "warning"}" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复" : "暂停"}</span></button>
+        </div>
+      </article>`;
+    }
+
+    function renderDashboard(data) {
+      state.dashboard = data;
+      $("appVersion").textContent = `Web Console v${data.version}`;
+      $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
+      $("summaryInstances").textContent = data.users.length;
+      $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
+      $("summaryErrors").textContent = data.users.filter(x => x.level === "error").length;
+      $("summaryCycles").textContent = data.service.cycle_count;
+      const bad = data.service.stale || data.service.last_error_count > 0;
+      $("serviceDot").classList.toggle("bad", bad);
+      $("serviceText").textContent = data.service.stale ? "检测超时" : data.service.last_ok ? "服务正常" : "存在异常";
+      const notices = [];
+      if (data.service.stale) notices.push("后台检测超过预期间隔，请检查服务状态");
+      if (data.service.telegram_error) notices.push(`Telegram：${data.service.telegram_error}`);
+      if (data.job && data.job.error) notices.push(`手动检测：${data.job.error}`);
+      $("notice").hidden = !notices.length;
+      $("noticeText").textContent = notices.join("；");
+      $("runButton").disabled = Boolean(data.job && data.job.running);
+      $("runButton").innerHTML = data.job && data.job.running ? `${icon("refresh-cw", "spin")}检测中` : `${icon("play")}立即检测`;
+      $("instances").innerHTML = data.users.length ? data.users.map(instanceCard).join("") : `<div class="empty"><div>${icon("server")}<p>暂无监控实例</p></div></div>`;
+      $("intervalSeconds").value = data.settings.interval_seconds;
+      $("notificationMode").value = data.settings.notification_mode;
+      $("webEndpoint").value = `http://${data.settings.web_host}:${data.settings.web_port}`;
+      $("networkPolicy").value = data.settings.force_ipv4 ? "IPv4 优先" : "系统默认";
+    }
+
+    async function loadDashboard(showErrors = true) {
+      try { renderDashboard(await api("/api/dashboard")); }
+      catch (error) { if (showErrors) toast(error.message, true); }
+    }
+
+    async function loadLogs() {
+      $("logView").textContent = "正在读取...";
+      try { const data = await api("/api/logs?limit=200"); $("logView").textContent = data.lines.length ? data.lines.join("\n") : "日志尚未生成。"; $("logView").scrollTop = $("logView").scrollHeight; }
+      catch (error) { $("logView").textContent = error.message; }
+    }
+
+    document.querySelectorAll(".tab-button").forEach(button => button.addEventListener("click", () => {
+      document.querySelectorAll(".tab-button").forEach(x => x.classList.toggle("active", x === button));
+      document.querySelectorAll(".tab-panel").forEach(x => x.hidden = x.id !== `${button.dataset.tab}Tab`);
+      if (button.dataset.tab === "logs") loadLogs();
+    }));
+
+    $("loginForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      $("loginError").textContent = "";
+      const submit = event.currentTarget.querySelector("button[type=submit]");
+      submit.disabled = true;
+      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; $("password").value = ""; showApp(); }
+      catch (error) { $("loginError").textContent = error.message; }
+      finally { submit.disabled = false; }
+    });
+
+    $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
+    $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await loadDashboard(); $("refreshButton").querySelector("svg").classList.remove("spin"); });
+    $("logsRefresh").addEventListener("click", loadLogs);
+    $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
+    $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: {} }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+
+    $("instances").addEventListener("click", async event => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const card = button.closest("[data-index]");
+      const index = Number(card.dataset.index);
+      const item = state.dashboard.users.find(x => x.index === index);
+      if (!item) return;
+      if (button.dataset.action === "schedule") {
+        state.scheduleIndex = index;
+        $("scheduleTitle").textContent = `${item.name} · 定时开关机`;
+        $("scheduleEnabled").checked = item.schedule.enabled;
+        $("startTime").value = item.schedule.start_time;
+        $("stopTime").value = item.schedule.stop_time;
+        $("scheduleDialog").showModal();
+        return;
+      }
+      if (button.dataset.action === "pause") {
+        const paused = !item.paused;
+        if (!confirm(`确认${paused ? "暂停" : "恢复"} ${item.name}？`)) return;
+        button.disabled = true;
+        try { await api(`/api/instances/${index}/pause`, { method: "POST", body: { paused } }); toast(paused ? "实例监控已暂停" : "实例监控已恢复"); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+        return;
+      }
+      if (button.dataset.action === "power") {
+        const action = button.dataset.power;
+        if (!confirm(`确认${action === "start" ? "开机" : "关机"} ${item.name}？`)) return;
+        button.disabled = true;
+        try { const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } }); toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error)); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+      }
+    });
+
+    document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => $("scheduleDialog").close()));
+    $("scheduleForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const enabled = $("scheduleEnabled").checked, start_time = $("startTime").value, stop_time = $("stopTime").value;
+      if (enabled && start_time === stop_time) { toast("开机时间和关机时间不能相同", true); return; }
+      try { await api(`/api/instances/${state.scheduleIndex}/schedule`, { method: "POST", body: { enabled, start_time, stop_time } }); $("scheduleDialog").close(); toast("定时计划已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+    });
+
+    $("settingsForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      try { await api("/api/settings", { method: "POST", body: { interval_seconds: Number($("intervalSeconds").value), notification_mode: $("notificationMode").value } }); toast("全局设置已保存"); await loadDashboard(); } catch (error) { toast(error.message, true); }
+    });
+
+    (async function init() {
+      try { const data = await api("/api/session"); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else showLogin(); }
+      catch (error) { $("loginError").textContent = error.message; showLogin(); }
+    })();
+  </script>
+</body>
+</html>

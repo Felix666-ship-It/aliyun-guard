@@ -182,7 +182,7 @@ preserve_local_data() {
         cp "$APP_DIR/bin/sing-box" "$PRESERVE_DIR/bin/sing-box"
     fi
     chmod 600 "$PRESERVE_DIR/config.json"
-    say "${GREEN}已保护现有配置（包括 Telegram 连接方式和节点链接）。${RESET}"
+    say "${GREEN}已保护现有配置（包括 Telegram 连接方式、节点和网页面板设置）。${RESET}"
 }
 
 restore_local_data() {
@@ -200,7 +200,7 @@ restore_local_data() {
         cp "$PRESERVE_DIR/bin/sing-box" "$APP_DIR/bin/sing-box"
         chmod 700 "$APP_DIR/bin/sing-box"
     fi
-    say "${GREEN}已恢复现有配置，Telegram 代理和节点保持不变。${RESET}"
+    say "${GREEN}已恢复现有配置，Telegram 代理、节点和网页面板设置保持不变。${RESET}"
     cleanup_preserved_data
 }
 
@@ -316,6 +316,9 @@ stop_old_backend() {
     if command -v rc-service >/dev/null 2>&1 && [ -f "/etc/init.d/$SERVICE_NAME" ]; then
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
     fi
+    if [ -x "$VENV_DIR/bin/python" ] && [ -f "$APP_DIR/web_panel.py" ]; then
+        "$VENV_DIR/bin/python" "$APP_DIR/web_panel.py" stop >/dev/null 2>&1 || true
+    fi
 }
 
 write_payload() {
@@ -323,7 +326,8 @@ write_payload() {
     mkdir -p "$APP_DIR/logs"
 # __PAYLOAD_BLOCKS__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_panel.py"
+    chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
     [ ! -f "$APP_DIR/config.json" ] || chmod 600 "$APP_DIR/config.json"
@@ -331,7 +335,8 @@ write_payload() {
     "$VENV_DIR/bin/python" -m py_compile \
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
-        "$APP_DIR/telegram_proxy.py"
+        "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"
     sh -n "$APP_DIR/uninstall.sh"
     mkdir -p /usr/local/bin
@@ -458,6 +463,8 @@ setup_cron() {
     grep -v '# aliyun-guard' "$cron_old" > "$cron_new" || :
     printf '* * * * * %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
+        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
     if [ "$START_BACKEND" = yes ]; then
@@ -468,6 +475,10 @@ setup_cron() {
     fi
     printf '%s\n' cron > "$APP_DIR/service_backend"
     start_cron_service
+    if [ "$START_BACKEND" = yes ]; then
+        "$VENV_DIR/bin/python" "$APP_DIR/web_panel.py" ensure >/dev/null 2>&1 || \
+            say "${YELLOW}网页面板暂未启动，cron 将在一分钟内自动重试。${RESET}"
+    fi
 }
 
 setup_backend() {
@@ -519,6 +530,7 @@ finish() {
     say "演练检测: ${CYAN}aliyun-guard dry-run${RESET}"
     say "查看状态: ${CYAN}aliyun-guard status${RESET}"
     say "查看日志: ${CYAN}aliyun-guard logs${RESET}"
+    say "网页面板: ${CYAN}aliyun-guard web${RESET}"
     say "更新版本: ${CYAN}aliyun-guard update${RESET}"
 }
 

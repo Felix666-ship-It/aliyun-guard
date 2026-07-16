@@ -18,6 +18,7 @@ import urllib.request
 
 import aliyun_guard as guard
 import telegram_proxy
+import web_panel
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -27,7 +28,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.3.0"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -914,6 +915,80 @@ def edit_user_schedule(config):
         print("未保存修改。")
 
 
+def _set_web_password(web):
+    while True:
+        password = prompt_secret("网页登录密码")
+        confirm_password = prompt_secret("再次输入网页登录密码")
+        if password != confirm_password:
+            print("两次输入的密码不一致。")
+            continue
+        try:
+            web["password_hash"] = web_panel.hash_password(password)
+            return
+        except ValueError as exc:
+            print(exc)
+
+
+def print_web_panel_access(web):
+    print("网页监听: http://{}:{}".format(web["host"], web["port"]))
+    if web["host"] == "127.0.0.1":
+        print("SSH 隧道: ssh -L {0}:127.0.0.1:{0} root@服务器IP".format(web["port"]))
+        print("浏览器访问: http://127.0.0.1:{}".format(web["port"]))
+    else:
+        print("浏览器访问: http://服务器IP:{}".format(web["port"]))
+
+
+def configure_web_panel(config, initial=False, restart=True):
+    current = web_panel.get_web_config(config)
+    title("网页控制面板")
+    if not initial:
+        print("当前状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        if current["enabled"]:
+            print_web_panel_access(current)
+    enabled = yes_no("启用网页控制面板", current["enabled"] if not initial else True)
+    candidate = dict(current)
+    candidate["enabled"] = enabled
+    if not enabled:
+        config["web_panel"] = candidate
+        save_config(config)
+        if restart:
+            run_control("restart")
+        print("网页控制面板已关闭。")
+        return False
+
+    print("\n监听方式：")
+    print(" 1) 仅本机（推荐，通过 SSH 隧道或 HTTPS 反向代理访问）")
+    print(" 2) 所有 IPv4 网卡（必须配合防火墙，HTTP 会明文传输）")
+    default_host = 2 if current["host"] == "0.0.0.0" else 1
+    host_choice = prompt_int("监听方式序号", default_host, 1, 2)
+    if host_choice == 2 and not yes_no("确认允许其他机器直接连接该端口", False):
+        print("已改为仅本机监听。")
+        host_choice = 1
+    candidate["host"] = "0.0.0.0" if host_choice == 2 else "127.0.0.1"
+    candidate["port"] = prompt_int("网页端口", current["port"], 1024, 65535)
+    candidate["username"] = prompt(
+        "网页登录用户名", current["username"] or "admin", required=True
+    )
+    candidate["cookie_secure"] = yes_no(
+        "浏览器入口已经配置 HTTPS（启用 Secure Cookie）",
+        bool(current.get("cookie_secure", False)),
+    )
+    if not current.get("password_hash") or yes_no("修改网页登录密码", False):
+        _set_web_password(candidate)
+    config["web_panel"] = candidate
+    try:
+        save_config(config)
+    except Exception:
+        config["web_panel"] = current
+        raise
+    if restart:
+        if run_control("restart") != 0:
+            print("配置已保存，但后台服务重启失败。")
+    print("网页控制面板配置已保存。")
+    print_web_panel_access(candidate)
+    return True
+
+
 def toggle_user(config):
     index = choose_user(config, "暂停/恢复")
     if index is None:
@@ -1150,6 +1225,7 @@ def initial_setup(force=False):
             continue
         else:
             break
+    configure_web_panel(config, initial=True, restart=False)
     save_config(config)
     print("\n首次配置完成。")
     return 0
@@ -1183,7 +1259,7 @@ def menu():
             update_checked = True
         title("阿里云保活与通知 v{} - 管理面板".format(APP_VERSION))
         if update_info and update_info.get("available"):
-            print(yellow_text("发现新版本: v{}（请选择 15 更新）".format(update_info["version"])))
+            print(yellow_text("发现新版本: v{}（请选择 16 更新）".format(update_info["version"])))
         print(" 1) 查看运行状态")
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
@@ -1193,17 +1269,18 @@ def menu():
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
         print(" 9) 定时开关机设置")
-        print("10) 暂停/恢复监控实例")
-        print("11) 删除监控实例")
-        print("12) 修改全局设置")
-        print("13) 查看最近日志")
-        print("14) 重启后台服务")
+        print("10) 网页控制面板")
+        print("11) 暂停/恢复监控实例")
+        print("12) 删除监控实例")
+        print("13) 修改全局设置")
+        print("14) 查看最近日志")
+        print("15) 重启后台服务")
         update_hint = ""
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
-        print("15) 更新 GitHub 版本{}".format(update_hint))
-        print("16) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 16)
+        print("16) 更新 GitHub 版本{}".format(update_hint))
+        print("17) 退出")
+        choice = prompt_int("请输入序号", 1, 1, 17)
         try:
             if choice == 1:
                 show_status(config)
@@ -1225,23 +1302,25 @@ def menu():
             elif choice == 9:
                 edit_user_schedule(config)
             elif choice == 10:
-                toggle_user(config)
+                configure_web_panel(config)
             elif choice == 11:
-                delete_user(config)
+                toggle_user(config)
             elif choice == 12:
-                edit_settings(config)
+                delete_user(config)
             elif choice == 13:
-                show_logs()
+                edit_settings(config)
             elif choice == 14:
-                run_control("restart")
+                show_logs()
             elif choice == 15:
+                run_control("restart")
+            elif choice == 16:
                 if update_from_github(release_info=update_info) is True:
                     return 0
-            elif choice == 16:
+            elif choice == 17:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 16:
+        if choice != 17:
             prompt("按回车返回菜单")
 
 
@@ -1255,6 +1334,7 @@ def parse_args(argv=None):
     subparsers.add_parser("add", help="添加实例")
     subparsers.add_parser("update", help="从 GitHub 更新程序")
     subparsers.add_parser("version", help="显示当前版本")
+    subparsers.add_parser("web", help="显示网页控制面板状态")
     return parser.parse_args(argv)
 
 
@@ -1277,6 +1357,8 @@ def main(argv=None):
         if args.command == "version":
             print("Aliyun Guard v{}".format(APP_VERSION))
             return 0
+        if args.command == "web":
+            return web_panel.show_status()
         return menu()
     except guard.GuardError as exc:
         print("错误: {}".format(exc), file=sys.stderr)

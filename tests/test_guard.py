@@ -945,7 +945,20 @@ class InstallerTemplateTests(unittest.TestCase):
         self.assertLess(main.index("write_payload"), main.index("restore_local_data"))
         self.assertIn('cp "$APP_DIR/config.json" "$PRESERVE_DIR/config.json"', template)
         self.assertIn('"$APP_DIR/bin/sing-box"', template)
-        self.assertIn("Telegram 代理和节点保持不变", template)
+        self.assertIn("Telegram 代理、节点和网页面板设置保持不变", template)
+
+    def test_installer_embeds_and_supervises_web_panel(self):
+        builder = (ROOT / "packaging" / "build_installer.py").read_text(
+            encoding="utf-8"
+        )
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"web_panel.py", "web_panel.py"', builder)
+        self.assertIn('"web_panel.html", "web_panel.html"', builder)
+        self.assertIn("web_panel.py ensure", template)
+        self.assertIn('"$APP_DIR/web_panel.py" ensure', template)
+        self.assertIn("网页面板设置保持不变", template)
 
 
 class FirstSetupFlowTests(unittest.TestCase):
@@ -1312,7 +1325,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager,
                 "check_for_github_update",
                 return_value={"available": True, "version": "1.3.0", "release_id": "b" * 64},
-            ) as check, mock.patch.object(manager, "prompt_int", return_value=16), mock.patch(
+            ) as check, mock.patch.object(manager, "prompt_int", return_value=17), mock.patch(
                 "sys.stdout", output
             ):
                 result = manager.menu()
@@ -1321,10 +1334,11 @@ class FirstSetupFlowTests(unittest.TestCase):
             "阿里云保活与通知 v{} - 管理面板".format(manager.APP_VERSION),
             output.getvalue(),
         )
-        self.assertIn("发现新版本: v1.3.0（请选择 15 更新）", output.getvalue())
+        self.assertIn("发现新版本: v1.3.0（请选择 16 更新）", output.getvalue())
         self.assertIn(" 5) Telegram 连接方式", output.getvalue())
         self.assertIn(" 9) 定时开关机设置", output.getvalue())
-        self.assertIn("15) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
+        self.assertIn("10) 网页控制面板", output.getvalue())
+        self.assertIn("16) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
         check.assert_called_once_with()
 
     def test_menu_test_action_does_not_open_connection_settings(self):
@@ -1338,7 +1352,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             ), mock.patch.object(
                 manager, "check_for_github_update", return_value=None
             ), mock.patch.object(
-                manager, "prompt_int", side_effect=[4, 16]
+                manager, "prompt_int", side_effect=[4, 17]
             ), mock.patch.object(
                 manager, "prompt", return_value=""
             ), mock.patch.object(
@@ -1359,7 +1373,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup", return_value=0
             ) as setup, mock.patch.object(manager, "run_control", return_value=0) as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=16):
+            ), mock.patch.object(manager, "prompt_int", return_value=17):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_called_once_with(force=False)
@@ -1374,7 +1388,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup"
             ) as setup, mock.patch.object(manager, "run_control") as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=16):
+            ), mock.patch.object(manager, "prompt_int", return_value=17):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_not_called()

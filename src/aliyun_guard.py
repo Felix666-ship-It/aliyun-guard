@@ -60,6 +60,14 @@ DEFAULT_CONFIG = {
     "notification_mode": "always",
     "notify_on_daemon_start": False,
     "force_ipv4": True,
+    "web_panel": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "username": "admin",
+        "password_hash": "",
+        "cookie_secure": False,
+    },
     "telegram": {
         "bot_token": "",
         "chat_id": "",
@@ -96,6 +104,7 @@ LOGGER = logging.getLogger("aliyun_guard")
 LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
+_CYCLE_THREAD_LOCK = threading.Lock()
 
 
 class GuardError(RuntimeError):
@@ -208,6 +217,14 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    try:
+        import web_panel
+    except ImportError as exc:
+        raise GuardError("网页面板模块缺失: {}".format(exc))
+    try:
+        web_panel.validate_web_config(config)
+    except web_panel.WebPanelError as exc:
+        raise GuardError(str(exc))
     validate_telegram_config(config.get("telegram", {}))
     users = config.get("users")
     if not isinstance(users, list):
@@ -1219,14 +1236,37 @@ def update_state(
                 if field in previous_instance:
                     instance_state[field] = previous_instance[field]
         state["instances"][item["instance_id"]] = instance_state
+    if not dry_run:
+        history = state.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "at": started_at.isoformat(timespec="seconds"),
+                "instances": {
+                    item["instance_id"]: {
+                        "traffic_gb": item.get("traffic_gb"),
+                        "status": item.get("status_after"),
+                        "bill_amount": item.get("bill_amount"),
+                    }
+                    for item in results
+                },
+            }
+        )
+        state["history"] = history[-576:]
 
 
 @contextlib.contextmanager
 def cycle_lock():
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = LOCK_FILE.open("a+")
+    thread_locked = _CYCLE_THREAD_LOCK.acquire(False)
+    if not thread_locked:
+        yield False
+        return
+    handle = None
     locked = True
     try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handle = LOCK_FILE.open("a+")
         if fcntl is not None:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1234,9 +1274,11 @@ def cycle_lock():
                 locked = False
         yield locked
     finally:
-        if locked and fcntl is not None:
+        if handle is not None and locked and fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        if handle is not None:
+            handle.close()
+        _CYCLE_THREAD_LOCK.release()
 
 
 def run_cycle(dry_run=False, no_notify=False, started_at=None):
@@ -1360,6 +1402,13 @@ def run_daemon():
                 "启动通知发送失败: %s",
                 compact_error(exc, secrets=telegram_secrets(telegram)),
             )
+    web_server = None
+    try:
+        import web_panel
+
+        web_server = web_panel.start_background(sys.modules[__name__], config)
+    except Exception as exc:
+        LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
@@ -1393,6 +1442,9 @@ def run_daemon():
         except Exception:
             remaining = 60
         _STOP_EVENT.wait(remaining)
+    if web_server is not None:
+        web_server.shutdown()
+        web_server.server_close()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -1429,6 +1481,17 @@ def show_status():
         )
     print("检测间隔: {} 秒".format(config["interval_seconds"]))
     print("通知模式: {}".format(config["notification_mode"]))
+    try:
+        import web_panel
+
+        web = web_panel.get_web_config(config)
+        print(
+            "网页面板: {} (http://{}:{})".format(
+                "已启用" if web["enabled"] else "已关闭", web["host"], web["port"]
+            )
+        )
+    except Exception:
+        print("网页面板: 配置异常")
     print("累计检测: {} 次".format(state.get("cycle_count", 0)))
     print("最后完成: {}".format(state.get("last_cycle_finished_at", "尚未运行")))
     print("最后结果: {}".format("正常" if state.get("last_cycle_ok") else "有错误或尚未运行"))

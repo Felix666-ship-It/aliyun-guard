@@ -7,3 +7,7 @@ venv/
 config.json
 state.json
 cycle.lock
+.playwright-cli/
+output/
+*.pid
+web-panel-supervisor.lock
