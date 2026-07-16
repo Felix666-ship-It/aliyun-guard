@@ -15,9 +15,16 @@ import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+try:
+    import requests
+    REQUESTS_IMPORT_ERROR = None
+except ImportError as exc:
+    requests = None
+    REQUESTS_IMPORT_ERROR = exc
+
+import telegram_proxy
 
 try:
     import fcntl
@@ -48,7 +55,7 @@ LOG_DIR = Path(os.environ.get("ALIYUN_GUARD_LOG_DIR", APP_DIR / "logs"))
 LOG_FILE = LOG_DIR / "guard.log"
 
 DEFAULT_CONFIG = {
-    "version": 1,
+    "version": 2,
     "interval_seconds": 300,
     "notification_mode": "always",
     "notify_on_daemon_start": False,
@@ -58,6 +65,10 @@ DEFAULT_CONFIG = {
         "chat_id": "",
         "timeout_seconds": 12,
         "retries": 3,
+        "connection_mode": "direct",
+        "proxy_url": "",
+        "node_url": "",
+        "api_base_url": "https://api.telegram.org",
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
@@ -170,6 +181,7 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    validate_telegram_config(config.get("telegram", {}))
     users = config.get("users")
     if not isinstance(users, list):
         raise GuardError("users 必须是数组")
@@ -195,6 +207,53 @@ def validate_config(config):
             for field in ("endpoint", "region", "currency_code", "currency_symbol"):
                 if not str(billing.get(field, "")).strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+
+
+def validate_telegram_config(telegram):
+    if not isinstance(telegram, dict):
+        raise GuardError("telegram 必须是对象")
+    try:
+        timeout = int(telegram.get("timeout_seconds", 12))
+        retries = int(telegram.get("retries", 3))
+    except (TypeError, ValueError):
+        raise GuardError("Telegram 超时和重试次数必须是整数")
+    if timeout < 3 or timeout > 60:
+        raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
+    if retries < 1 or retries > 5:
+        raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
+        raise GuardError("Telegram 连接方式无效")
+    if mode in ("socks5", "http"):
+        proxy_url = str(telegram.get("proxy_url", "")).strip()
+        parsed = urllib.parse.urlsplit(proxy_url)
+        allowed = ("socks5", "socks5h") if mode == "socks5" else ("http", "https")
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if parsed.scheme.lower() not in allowed or not parsed.hostname or not port:
+            raise GuardError("Telegram {} 代理地址无效".format("SOCKS5" if mode == "socks5" else "HTTP"))
+    if mode == "node":
+        try:
+            telegram_proxy.parse_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError as exc:
+            raise GuardError("Telegram 节点链接无效: {}".format(exc))
+    if mode == "api_proxy":
+        base_url = str(telegram.get("api_base_url", "")).strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(base_url)
+        try:
+            parsed.port
+        except ValueError:
+            raise GuardError("Telegram API 反向代理端口无效")
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            raise GuardError("Telegram API 反向代理地址无效")
+        if parsed.scheme.lower() != "https" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise GuardError("远程 Telegram API 反向代理必须使用 HTTPS")
+        if parsed.query or parsed.fragment:
+            raise GuardError("Telegram API 反向代理基础地址不能包含查询参数或片段")
+        if "/bot" in parsed.path.lower():
+            raise GuardError("Telegram API 反向代理只填写基础地址，不要包含 /botTOKEN")
 
 
 def enable_ipv4_only():
@@ -400,31 +459,93 @@ def validate_user_connection(user, force_ipv4=True):
     return result
 
 
+def telegram_secrets(config):
+    secrets = []
+    for field in ("bot_token", "proxy_url", "node_url", "api_base_url"):
+        value = str(config.get(field, "") or "").strip()
+        if value:
+            secrets.append(value)
+    proxy_url = str(config.get("proxy_url", "") or "").strip()
+    if proxy_url:
+        try:
+            parsed = urllib.parse.urlsplit(proxy_url)
+            secrets.extend(
+                value for value in (parsed.username, parsed.password) if value
+            )
+        except ValueError:
+            pass
+    node_url = str(config.get("node_url", "") or "").strip()
+    if node_url:
+        try:
+            outbound = telegram_proxy.parse_node_link(node_url)
+            secrets.extend(
+                str(outbound[field]) for field in ("uuid", "password")
+                if outbound.get(field)
+            )
+        except telegram_proxy.ProxyError:
+            pass
+    return tuple(dict.fromkeys(secrets))
+
+
+def telegram_connection(config):
+    validate_telegram_config(config)
+    mode = str(config.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode != "node":
+        telegram_proxy.stop_node_proxy()
+    base_url = "https://api.telegram.org"
+    proxies = None
+    if mode in ("socks5", "http"):
+        proxy_url = str(config.get("proxy_url", "")).strip()
+        proxies = {"http": proxy_url, "https": proxy_url}
+    elif mode == "node":
+        try:
+            proxy_url = telegram_proxy.ensure_node_proxy(config.get("node_url", ""))
+        except telegram_proxy.ProxyError as exc:
+            detail = compact_error(exc, secrets=telegram_secrets(config))
+            raise GuardError("Telegram 节点代理失败: {}".format(detail)) from exc
+        proxies = {"http": proxy_url, "https": proxy_url}
+    elif mode == "api_proxy":
+        base_url = str(config.get("api_base_url", "")).strip().rstrip("/")
+    return base_url, proxies
+
+
+def _telegram_post(url, data, timeout, proxies):
+    if REQUESTS_IMPORT_ERROR is not None:
+        raise GuardError("Telegram HTTP 依赖未安装: {}".format(REQUESTS_IMPORT_ERROR))
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.post(url, data=data, timeout=timeout, proxies=proxies)
+
+
 def telegram_api(config, method, data=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
     timeout = max(3, int(config.get("timeout_seconds", 12)))
     retries = max(1, min(5, int(config.get("retries", 3))))
-    url = "https://api.telegram.org/bot{}/{}".format(token, method)
-    payload = urllib.parse.urlencode(data or {}).encode("utf-8")
+    base_url, proxies = telegram_connection(config)
+    url = "{}/bot{}/{}".format(base_url, token, method)
+    secrets = telegram_secrets(config)
     body = ""
     for attempt in range(1, retries + 1):
-        request = urllib.request.Request(url, data=payload, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = response.read().decode("utf-8", "replace")
+            response = _telegram_post(url, data or {}, timeout, proxies)
+            body = response.text
+            if response.status_code >= 400:
+                if response.status_code not in (429, 500, 502, 503, 504) or attempt >= retries:
+                    raise GuardError(
+                        "Telegram HTTP {}: {}".format(response.status_code, body[:300])
+                    )
+                time.sleep(min(2 ** attempt, 8))
+                continue
             break
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            if exc.code not in (429, 500, 502, 503, 504) or attempt >= retries:
-                raise GuardError("Telegram HTTP {}: {}".format(exc.code, body[:300]))
-            time.sleep(min(2 ** attempt, 8))
+        except GuardError:
+            raise
         except Exception as exc:
             if attempt >= retries:
                 raise GuardError(
                     "Telegram 网络请求失败（已重试 {} 次）: {}".format(
-                        retries, compact_error(exc, secrets=(token,))
+                        retries, compact_error(exc, secrets=secrets)
                     )
                 )
             time.sleep(min(2 ** attempt, 8))
@@ -810,11 +931,12 @@ def run_cycle(dry_run=False, no_notify=False):
     print(summary)
     notify_error = None
     if not no_notify and should_notify(config, results, previous_state):
+        telegram = config.get("telegram", {})
         try:
-            send_telegram_message(config.get("telegram", {}), summary)
+            send_telegram_message(telegram, summary)
             LOGGER.info("Telegram 本轮汇总通知发送成功")
         except Exception as exc:
-            notify_error = compact_error(exc)
+            notify_error = compact_error(exc, secrets=telegram_secrets(telegram))
             LOGGER.error("Telegram 本轮汇总通知发送失败: %s", notify_error)
     update_state(previous_state, results, started_at, duration, summary, error_count, notify_error)
     save_state(previous_state)
@@ -864,13 +986,17 @@ def run_daemon():
     if config.get("force_ipv4", True):
         enable_ipv4_only()
     if config.get("notify_on_daemon_start", False):
+        telegram = config.get("telegram", {})
         try:
             send_telegram_message(
-                config.get("telegram", {}),
+                telegram,
                 "阿里云保活服务已启动\n时间: {}".format(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
         except Exception as exc:
-            LOGGER.error("启动通知发送失败: %s", compact_error(exc))
+            LOGGER.error(
+                "启动通知发送失败: %s",
+                compact_error(exc, secrets=telegram_secrets(telegram)),
+            )
     LOGGER.info("保活服务已启动")
     while not _STOP_EVENT.is_set():
         cycle_started = time.monotonic()
@@ -879,7 +1005,13 @@ def run_daemon():
                 try:
                     run_cycle()
                 except Exception as exc:
-                    LOGGER.exception("本轮检测发生未处理错误: %s", compact_error(exc))
+                    LOGGER.exception(
+                        "本轮检测发生未处理错误: %s",
+                        compact_error(
+                            exc,
+                            secrets=telegram_secrets(config.get("telegram", {})),
+                        ),
+                    )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
         try:

@@ -260,7 +260,8 @@ create_venv() {
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
         'aliyun-python-sdk-core>=2.16,<3' \
-        'aliyun-python-sdk-ecs>=4.24,<5'
+        'aliyun-python-sdk-ecs>=4.24,<5' \
+        'requests[socks]>=2.31,<3'
 }
 
 stop_old_backend() {
@@ -275,6 +276,559 @@ stop_old_backend() {
 write_payload() {
     say "${YELLOW}[3/6] 写入程序文件...${RESET}"
     mkdir -p "$APP_DIR/logs"
+    cat > "$APP_DIR/telegram_proxy.py" <<'__AG_PROXY_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Telegram proxy helpers backed by an official sing-box binary."""
+
+import atexit
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import socket
+import subprocess
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+
+APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+SING_BOX_VERSION = "1.13.14"
+SING_BOX_BINARY = APP_DIR / "bin" / "sing-box"
+SING_BOX_RELEASE_BASE = (
+    "https://github.com/SagerNet/sing-box/releases/download/v{}".format(SING_BOX_VERSION)
+)
+SING_BOX_ASSETS = {
+    "386": (
+        "sing-box-1.13.14-linux-386.tar.gz",
+        "4d1c66260dfcb2120fde6c1c5ad125ce0f94769843c34aab4eef53c8d3bf3ae9",
+    ),
+    "amd64": (
+        "sing-box-1.13.14-linux-amd64.tar.gz",
+        "f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697",
+    ),
+    "arm64": (
+        "sing-box-1.13.14-linux-arm64.tar.gz",
+        "4742df6a4314e8ecc41736849fca6d73b8f9e91b6e8b06ee794ff17ba180579e",
+    ),
+    "armv7": (
+        "sing-box-1.13.14-linux-armv7.tar.gz",
+        "e01a58d28512b1447ab6156017afdeeaa306169a95d27abc00e112599e4ae46c",
+    ),
+}
+
+_PROCESS = None
+_PROCESS_KEY = None
+_PROCESS_PROXY_URL = None
+_PROCESS_DIR = None
+_PROCESS_LOG = None
+_PROCESS_LOCK = threading.RLock()
+
+
+class ProxyError(RuntimeError):
+    pass
+
+
+def _decode_base64(value):
+    value = urllib.parse.unquote(str(value or "").strip())
+    value += "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+    except Exception:
+        raise ProxyError("节点链接包含无效的 Base64 数据")
+
+
+def _query_value(query, *names, **kwargs):
+    default = kwargs.get("default", "")
+    for name in names:
+        values = query.get(name)
+        if values:
+            return str(values[0])
+    return default
+
+
+def _truthy(value):
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _require_server(parsed):
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ProxyError("节点端口无效")
+    if not parsed.hostname or not port:
+        raise ProxyError("节点链接缺少服务器地址或端口")
+    return parsed.hostname, port
+
+
+def _build_tls(query, server, security):
+    if security not in ("tls", "reality"):
+        return None
+    tls = {
+        "enabled": True,
+        "server_name": _query_value(query, "sni", "serverName", default=server),
+    }
+    if _truthy(_query_value(query, "allowInsecure", "insecure")):
+        tls["insecure"] = True
+    alpn = _query_value(query, "alpn")
+    if alpn:
+        tls["alpn"] = [item.strip() for item in alpn.split(",") if item.strip()]
+    fingerprint = _query_value(query, "fp", "fingerprint")
+    if fingerprint and fingerprint.lower() != "none":
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+    if security == "reality":
+        public_key = _query_value(query, "pbk", "publicKey")
+        if not public_key:
+            raise ProxyError("Reality 节点缺少 public key（pbk）")
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": public_key,
+            "short_id": _query_value(query, "sid", "shortId"),
+        }
+    return tls
+
+
+def _build_transport(network, query, host="", path=""):
+    network = str(network or "tcp").strip().lower()
+    if network in ("", "tcp", "raw"):
+        return None
+    if network == "ws":
+        transport = {
+            "type": "ws",
+            "path": urllib.parse.unquote(path or _query_value(query, "path", default="/")),
+        }
+        ws_host = host or _query_value(query, "host")
+        if ws_host:
+            transport["headers"] = {"Host": ws_host}
+        return transport
+    if network == "grpc":
+        return {
+            "type": "grpc",
+            "service_name": urllib.parse.unquote(
+                path or _query_value(query, "serviceName", "service_name", "path")
+            ),
+        }
+    if network in ("http", "h2"):
+        transport = {
+            "type": "http",
+            "path": urllib.parse.unquote(path or _query_value(query, "path", default="/")),
+        }
+        http_host = host or _query_value(query, "host")
+        if http_host:
+            transport["host"] = [http_host]
+        return transport
+    if network in ("httpupgrade", "http-upgrade"):
+        transport = {
+            "type": "httpupgrade",
+            "path": urllib.parse.unquote(path or _query_value(query, "path", default="/")),
+        }
+        upgrade_host = host or _query_value(query, "host")
+        if upgrade_host:
+            transport["host"] = upgrade_host
+        return transport
+    raise ProxyError("暂不支持节点传输类型: {}".format(network))
+
+
+def parse_vless_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    uuid = urllib.parse.unquote(parsed.username or "").strip()
+    if not uuid:
+        raise ProxyError("VLESS 节点缺少 UUID")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "vless",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "uuid": uuid,
+    }
+    flow = _query_value(query, "flow")
+    if flow:
+        outbound["flow"] = flow
+    packet_encoding = _query_value(query, "packetEncoding", "packet_encoding")
+    if packet_encoding:
+        outbound["packet_encoding"] = packet_encoding
+    security = _query_value(query, "security").lower()
+    tls = _build_tls(query, server, security)
+    if tls:
+        outbound["tls"] = tls
+    transport = _build_transport(
+        _query_value(query, "type", default="tcp"),
+        query,
+        _query_value(query, "host"),
+        _query_value(query, "path"),
+    )
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def parse_vmess_link(link):
+    encoded = link[len("vmess://"):].split("#", 1)[0].strip()
+    try:
+        data = json.loads(_decode_base64(encoded))
+    except ValueError:
+        raise ProxyError("VMess 节点内容不是有效 JSON")
+    if not isinstance(data, dict):
+        raise ProxyError("VMess 节点内容格式无效")
+    server = str(data.get("add", "")).strip()
+    uuid = str(data.get("id", "")).strip()
+    try:
+        port = int(data.get("port", 0))
+        alter_id = int(data.get("aid", 0) or 0)
+    except (TypeError, ValueError):
+        raise ProxyError("VMess 节点端口或 alterId 无效")
+    if not server or not port or not uuid:
+        raise ProxyError("VMess 节点缺少服务器、端口或 UUID")
+    outbound = {
+        "type": "vmess",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "uuid": uuid,
+        "security": str(data.get("scy", "auto") or "auto"),
+        "alter_id": alter_id,
+    }
+    query = {
+        "sni": [str(data.get("sni", ""))],
+        "alpn": [str(data.get("alpn", ""))],
+        "fp": [str(data.get("fp", ""))],
+        "allowInsecure": [str(data.get("allowInsecure", ""))],
+    }
+    security = "tls" if str(data.get("tls", "")).lower() in ("tls", "1", "true") else ""
+    tls = _build_tls(query, server, security)
+    if tls:
+        outbound["tls"] = tls
+    transport = _build_transport(
+        data.get("net", "tcp"),
+        {},
+        str(data.get("host", "")),
+        str(data.get("path", "")),
+    )
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def parse_shadowsocks_link(link):
+    raw = link[len("ss://"):]
+    raw = raw.split("#", 1)[0]
+    main, separator, raw_query = raw.partition("?")
+    if "@" not in main:
+        main = _decode_base64(main)
+    userinfo, marker, server_part = main.rpartition("@")
+    if not marker:
+        raise ProxyError("Shadowsocks 节点格式无效")
+    userinfo = urllib.parse.unquote(userinfo)
+    if ":" not in userinfo:
+        userinfo = _decode_base64(userinfo)
+    method, marker, password = userinfo.partition(":")
+    if not marker or not method or not password:
+        raise ProxyError("Shadowsocks 节点缺少加密方式或密码")
+    parsed = urllib.parse.urlsplit("ss://placeholder@{}".format(server_part))
+    server, port = _require_server(parsed)
+    outbound = {
+        "type": "shadowsocks",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "method": method,
+        "password": urllib.parse.unquote(password),
+    }
+    query = urllib.parse.parse_qs(raw_query, keep_blank_values=True)
+    plugin_spec = urllib.parse.unquote(_query_value(query, "plugin"))
+    if plugin_spec:
+        plugin_parts = plugin_spec.split(";")
+        outbound["plugin"] = plugin_parts[0]
+        if len(plugin_parts) > 1:
+            outbound["plugin_opts"] = ";".join(plugin_parts[1:])
+    return outbound
+
+
+def parse_node_link(link):
+    link = str(link or "").strip()
+    scheme = urllib.parse.urlsplit(link).scheme.lower()
+    if scheme == "vless":
+        return parse_vless_link(link)
+    if scheme == "vmess":
+        return parse_vmess_link(link)
+    if scheme == "ss":
+        return parse_shadowsocks_link(link)
+    raise ProxyError("节点链接必须以 vless://、vmess:// 或 ss:// 开头")
+
+
+def describe_node_link(link):
+    outbound = parse_node_link(link)
+    return "{} 节点（已配置）".format(outbound["type"].upper())
+
+
+def build_sing_box_config(node_link, listen_port):
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "telegram-in",
+                "listen": "127.0.0.1",
+                "listen_port": int(listen_port),
+            }
+        ],
+        "outbounds": [parse_node_link(node_link)],
+    }
+
+
+def _architecture():
+    machine = platform.machine().lower()
+    mapping = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "armv7l": "armv7",
+        "armv7": "armv7",
+        "i386": "386",
+        "i686": "386",
+        "x86": "386",
+    }
+    architecture = mapping.get(machine)
+    if not architecture:
+        raise ProxyError("暂不支持当前 CPU 架构: {}".format(machine or "unknown"))
+    return architecture
+
+
+def find_sing_box():
+    candidates = [
+        os.environ.get("ALIYUN_GUARD_SING_BOX", ""),
+        str(SING_BOX_BINARY),
+        shutil.which("sing-box") or "",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _check_binary(path):
+    try:
+        result = subprocess.run(
+            [str(path), "version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+            text=True,
+        )
+    except Exception as exc:
+        raise ProxyError("无法执行 sing-box: {}".format(exc))
+    if result.returncode != 0:
+        raise ProxyError("sing-box 自检失败")
+
+
+def install_sing_box(progress=None):
+    existing = find_sing_box()
+    if existing:
+        _check_binary(existing)
+        return existing
+    if platform.system().lower() != "linux":
+        raise ProxyError("自动安装 sing-box 仅支持 Linux")
+    architecture = _architecture()
+    asset_name, expected_sha256 = SING_BOX_ASSETS[architecture]
+    url = "{}/{}".format(SING_BOX_RELEASE_BASE, asset_name)
+    if progress:
+        progress("正在下载官方 sing-box {} ({})...".format(SING_BOX_VERSION, architecture))
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    bin_dir = SING_BOX_BINARY.parent
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(bin_dir), 0o700)
+    with tempfile.TemporaryDirectory(prefix="aliyun-guard-sing-box-") as directory:
+        archive_path = Path(directory) / asset_name
+        digest = hashlib.sha256()
+        request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Installer"})
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response, archive_path.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    handle.write(chunk)
+        except Exception as exc:
+            raise ProxyError("sing-box 下载失败: {}".format(exc))
+        if digest.hexdigest() != expected_sha256:
+            raise ProxyError("sing-box SHA-256 校验失败，已拒绝安装")
+        try:
+            with tarfile.open(str(archive_path), "r:gz") as archive:
+                members = [
+                    member for member in archive.getmembers()
+                    if member.isfile() and Path(member.name).name == "sing-box"
+                ]
+                if len(members) != 1:
+                    raise ProxyError("sing-box 压缩包结构无效")
+                source = archive.extractfile(members[0])
+                if source is None:
+                    raise ProxyError("无法读取 sing-box 可执行文件")
+                temporary_binary = bin_dir / "sing-box.tmp"
+                with temporary_binary.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.chmod(str(temporary_binary), 0o700)
+                os.replace(str(temporary_binary), str(SING_BOX_BINARY))
+        except ProxyError:
+            raise
+        except Exception as exc:
+            raise ProxyError("sing-box 解压失败: {}".format(exc))
+    _check_binary(SING_BOX_BINARY)
+    return str(SING_BOX_BINARY)
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def _read_log(directory):
+    if not directory:
+        return ""
+    path = Path(directory) / "sing-box.log"
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-1200:].strip()
+    except OSError:
+        return ""
+
+
+def _terminate_process(process):
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _cleanup_runtime(process=None, log_handle=None, directory=None):
+    try:
+        _terminate_process(process)
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except OSError:
+                pass
+        if directory:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def stop_node_proxy():
+    global _PROCESS, _PROCESS_KEY, _PROCESS_PROXY_URL, _PROCESS_DIR, _PROCESS_LOG
+    with _PROCESS_LOCK:
+        process = _PROCESS
+        log_handle = _PROCESS_LOG
+        directory = _PROCESS_DIR
+        _PROCESS = None
+        _PROCESS_KEY = None
+        _PROCESS_PROXY_URL = None
+        _PROCESS_DIR = None
+        _PROCESS_LOG = None
+        _cleanup_runtime(process, log_handle, directory)
+
+
+def ensure_node_proxy(node_link, startup_timeout=12):
+    global _PROCESS, _PROCESS_KEY, _PROCESS_PROXY_URL, _PROCESS_DIR, _PROCESS_LOG
+    node_link = str(node_link or "").strip()
+    key = hashlib.sha256(node_link.encode("utf-8")).hexdigest()
+    with _PROCESS_LOCK:
+        if _PROCESS is not None and _PROCESS.poll() is None and _PROCESS_KEY == key:
+            return _PROCESS_PROXY_URL
+        stop_node_proxy()
+        binary = find_sing_box()
+        if not binary:
+            raise ProxyError("未安装 sing-box，请在 Telegram 连接设置中重新测试并安装")
+        port = _free_port()
+        config = build_sing_box_config(node_link, port)
+        runtime_root = APP_DIR / "runtime"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(runtime_root), 0o700)
+        directory = None
+        log_handle = None
+        process = None
+        managed = False
+        try:
+            directory = tempfile.mkdtemp(prefix="telegram-node-", dir=str(runtime_root))
+            os.chmod(directory, 0o700)
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(str(config_path), 0o600)
+            try:
+                check = subprocess.run(
+                    [binary, "check", "-c", str(config_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=15,
+                    check=False,
+                    text=True,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ProxyError("无法执行 sing-box 节点配置校验") from exc
+            if check.returncode != 0:
+                raise ProxyError("sing-box 节点配置校验失败")
+            log_path = Path(directory) / "sing-box.log"
+            log_handle = log_path.open("a", encoding="utf-8")
+            os.chmod(str(log_path), 0o600)
+            try:
+                process = subprocess.Popen(
+                    [binary, "run", "-c", str(config_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ProxyError("无法启动 sing-box 进程") from exc
+            deadline = time.monotonic() + max(3, startup_timeout)
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                        _PROCESS = process
+                        _PROCESS_KEY = key
+                        _PROCESS_PROXY_URL = "socks5h://127.0.0.1:{}".format(port)
+                        _PROCESS_DIR = directory
+                        _PROCESS_LOG = log_handle
+                        managed = True
+                        return _PROCESS_PROXY_URL
+                except OSError:
+                    time.sleep(0.15)
+            _terminate_process(process)
+            detail = _read_log(directory)
+            if detail:
+                raise ProxyError("sing-box 启动失败: {}".format(detail))
+            raise ProxyError("sing-box 启动失败或本地代理端口未就绪")
+        finally:
+            if not managed:
+                _cleanup_runtime(process, log_handle, directory)
+
+
+atexit.register(stop_node_proxy)
+__AG_PROXY_PY_EOF__
     cat > "$APP_DIR/aliyun_guard.py" <<'__AG_APP_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -293,9 +847,16 @@ import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+try:
+    import requests
+    REQUESTS_IMPORT_ERROR = None
+except ImportError as exc:
+    requests = None
+    REQUESTS_IMPORT_ERROR = exc
+
+import telegram_proxy
 
 try:
     import fcntl
@@ -326,7 +887,7 @@ LOG_DIR = Path(os.environ.get("ALIYUN_GUARD_LOG_DIR", APP_DIR / "logs"))
 LOG_FILE = LOG_DIR / "guard.log"
 
 DEFAULT_CONFIG = {
-    "version": 1,
+    "version": 2,
     "interval_seconds": 300,
     "notification_mode": "always",
     "notify_on_daemon_start": False,
@@ -336,6 +897,10 @@ DEFAULT_CONFIG = {
         "chat_id": "",
         "timeout_seconds": 12,
         "retries": 3,
+        "connection_mode": "direct",
+        "proxy_url": "",
+        "node_url": "",
+        "api_base_url": "https://api.telegram.org",
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
@@ -448,6 +1013,7 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    validate_telegram_config(config.get("telegram", {}))
     users = config.get("users")
     if not isinstance(users, list):
         raise GuardError("users 必须是数组")
@@ -473,6 +1039,53 @@ def validate_config(config):
             for field in ("endpoint", "region", "currency_code", "currency_symbol"):
                 if not str(billing.get(field, "")).strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+
+
+def validate_telegram_config(telegram):
+    if not isinstance(telegram, dict):
+        raise GuardError("telegram 必须是对象")
+    try:
+        timeout = int(telegram.get("timeout_seconds", 12))
+        retries = int(telegram.get("retries", 3))
+    except (TypeError, ValueError):
+        raise GuardError("Telegram 超时和重试次数必须是整数")
+    if timeout < 3 or timeout > 60:
+        raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
+    if retries < 1 or retries > 5:
+        raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
+        raise GuardError("Telegram 连接方式无效")
+    if mode in ("socks5", "http"):
+        proxy_url = str(telegram.get("proxy_url", "")).strip()
+        parsed = urllib.parse.urlsplit(proxy_url)
+        allowed = ("socks5", "socks5h") if mode == "socks5" else ("http", "https")
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if parsed.scheme.lower() not in allowed or not parsed.hostname or not port:
+            raise GuardError("Telegram {} 代理地址无效".format("SOCKS5" if mode == "socks5" else "HTTP"))
+    if mode == "node":
+        try:
+            telegram_proxy.parse_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError as exc:
+            raise GuardError("Telegram 节点链接无效: {}".format(exc))
+    if mode == "api_proxy":
+        base_url = str(telegram.get("api_base_url", "")).strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(base_url)
+        try:
+            parsed.port
+        except ValueError:
+            raise GuardError("Telegram API 反向代理端口无效")
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            raise GuardError("Telegram API 反向代理地址无效")
+        if parsed.scheme.lower() != "https" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise GuardError("远程 Telegram API 反向代理必须使用 HTTPS")
+        if parsed.query or parsed.fragment:
+            raise GuardError("Telegram API 反向代理基础地址不能包含查询参数或片段")
+        if "/bot" in parsed.path.lower():
+            raise GuardError("Telegram API 反向代理只填写基础地址，不要包含 /botTOKEN")
 
 
 def enable_ipv4_only():
@@ -678,31 +1291,93 @@ def validate_user_connection(user, force_ipv4=True):
     return result
 
 
+def telegram_secrets(config):
+    secrets = []
+    for field in ("bot_token", "proxy_url", "node_url", "api_base_url"):
+        value = str(config.get(field, "") or "").strip()
+        if value:
+            secrets.append(value)
+    proxy_url = str(config.get("proxy_url", "") or "").strip()
+    if proxy_url:
+        try:
+            parsed = urllib.parse.urlsplit(proxy_url)
+            secrets.extend(
+                value for value in (parsed.username, parsed.password) if value
+            )
+        except ValueError:
+            pass
+    node_url = str(config.get("node_url", "") or "").strip()
+    if node_url:
+        try:
+            outbound = telegram_proxy.parse_node_link(node_url)
+            secrets.extend(
+                str(outbound[field]) for field in ("uuid", "password")
+                if outbound.get(field)
+            )
+        except telegram_proxy.ProxyError:
+            pass
+    return tuple(dict.fromkeys(secrets))
+
+
+def telegram_connection(config):
+    validate_telegram_config(config)
+    mode = str(config.get("connection_mode", "direct") or "direct").strip().lower()
+    if mode != "node":
+        telegram_proxy.stop_node_proxy()
+    base_url = "https://api.telegram.org"
+    proxies = None
+    if mode in ("socks5", "http"):
+        proxy_url = str(config.get("proxy_url", "")).strip()
+        proxies = {"http": proxy_url, "https": proxy_url}
+    elif mode == "node":
+        try:
+            proxy_url = telegram_proxy.ensure_node_proxy(config.get("node_url", ""))
+        except telegram_proxy.ProxyError as exc:
+            detail = compact_error(exc, secrets=telegram_secrets(config))
+            raise GuardError("Telegram 节点代理失败: {}".format(detail)) from exc
+        proxies = {"http": proxy_url, "https": proxy_url}
+    elif mode == "api_proxy":
+        base_url = str(config.get("api_base_url", "")).strip().rstrip("/")
+    return base_url, proxies
+
+
+def _telegram_post(url, data, timeout, proxies):
+    if REQUESTS_IMPORT_ERROR is not None:
+        raise GuardError("Telegram HTTP 依赖未安装: {}".format(REQUESTS_IMPORT_ERROR))
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.post(url, data=data, timeout=timeout, proxies=proxies)
+
+
 def telegram_api(config, method, data=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
     timeout = max(3, int(config.get("timeout_seconds", 12)))
     retries = max(1, min(5, int(config.get("retries", 3))))
-    url = "https://api.telegram.org/bot{}/{}".format(token, method)
-    payload = urllib.parse.urlencode(data or {}).encode("utf-8")
+    base_url, proxies = telegram_connection(config)
+    url = "{}/bot{}/{}".format(base_url, token, method)
+    secrets = telegram_secrets(config)
     body = ""
     for attempt in range(1, retries + 1):
-        request = urllib.request.Request(url, data=payload, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = response.read().decode("utf-8", "replace")
+            response = _telegram_post(url, data or {}, timeout, proxies)
+            body = response.text
+            if response.status_code >= 400:
+                if response.status_code not in (429, 500, 502, 503, 504) or attempt >= retries:
+                    raise GuardError(
+                        "Telegram HTTP {}: {}".format(response.status_code, body[:300])
+                    )
+                time.sleep(min(2 ** attempt, 8))
+                continue
             break
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            if exc.code not in (429, 500, 502, 503, 504) or attempt >= retries:
-                raise GuardError("Telegram HTTP {}: {}".format(exc.code, body[:300]))
-            time.sleep(min(2 ** attempt, 8))
+        except GuardError:
+            raise
         except Exception as exc:
             if attempt >= retries:
                 raise GuardError(
                     "Telegram 网络请求失败（已重试 {} 次）: {}".format(
-                        retries, compact_error(exc, secrets=(token,))
+                        retries, compact_error(exc, secrets=secrets)
                     )
                 )
             time.sleep(min(2 ** attempt, 8))
@@ -1088,11 +1763,12 @@ def run_cycle(dry_run=False, no_notify=False):
     print(summary)
     notify_error = None
     if not no_notify and should_notify(config, results, previous_state):
+        telegram = config.get("telegram", {})
         try:
-            send_telegram_message(config.get("telegram", {}), summary)
+            send_telegram_message(telegram, summary)
             LOGGER.info("Telegram 本轮汇总通知发送成功")
         except Exception as exc:
-            notify_error = compact_error(exc)
+            notify_error = compact_error(exc, secrets=telegram_secrets(telegram))
             LOGGER.error("Telegram 本轮汇总通知发送失败: %s", notify_error)
     update_state(previous_state, results, started_at, duration, summary, error_count, notify_error)
     save_state(previous_state)
@@ -1142,13 +1818,17 @@ def run_daemon():
     if config.get("force_ipv4", True):
         enable_ipv4_only()
     if config.get("notify_on_daemon_start", False):
+        telegram = config.get("telegram", {})
         try:
             send_telegram_message(
-                config.get("telegram", {}),
+                telegram,
                 "阿里云保活服务已启动\n时间: {}".format(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
         except Exception as exc:
-            LOGGER.error("启动通知发送失败: %s", compact_error(exc))
+            LOGGER.error(
+                "启动通知发送失败: %s",
+                compact_error(exc, secrets=telegram_secrets(telegram)),
+            )
     LOGGER.info("保活服务已启动")
     while not _STOP_EVENT.is_set():
         cycle_started = time.monotonic()
@@ -1157,7 +1837,13 @@ def run_daemon():
                 try:
                     run_cycle()
                 except Exception as exc:
-                    LOGGER.exception("本轮检测发生未处理错误: %s", compact_error(exc))
+                    LOGGER.exception(
+                        "本轮检测发生未处理错误: %s",
+                        compact_error(
+                            exc,
+                            secrets=telegram_secrets(config.get("telegram", {})),
+                        ),
+                    )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
         try:
@@ -1253,9 +1939,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 import aliyun_guard as guard
+import telegram_proxy
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -1265,8 +1953,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.1.3"
-LOCAL_RELEASE_ID = "83560f993da2e8069a182cab27435cbb33831841d419b9df07a6947e65ac4b08"
+APP_VERSION = "1.2.0"
+LOCAL_RELEASE_ID = "4c4ec660a2a2b24a70f491697b5b6ac4ad259a4600c0f640b3dcd666cb41161e"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -1471,38 +2159,207 @@ def configure_billing(existing_user=None):
     }
 
 
+TELEGRAM_CONNECTION_LABELS = {
+    "direct": "直连",
+    "socks5": "SOCKS5 代理",
+    "http": "HTTP/HTTPS 代理",
+    "node": "节点链接（VLESS / VMess / Shadowsocks）",
+    "api_proxy": "Telegram API 反向代理",
+}
+
+
+def _safe_proxy_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        address = host
+        if parsed.port:
+            address = "{}:{}".format(address, parsed.port)
+        if parsed.username:
+            address = "{}:***@{}".format(parsed.username, address)
+        return "{}://{}".format(parsed.scheme, address)
+    except ValueError:
+        return "地址无效"
+
+
+def _safe_api_base_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        address = host
+        if parsed.port:
+            address = "{}:{}".format(address, parsed.port)
+        if parsed.username:
+            credentials = parsed.username
+            if parsed.password is not None:
+                credentials += ":***"
+            address = "{}@{}".format(credentials, address)
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, address, parsed.path.rstrip("/"), "", "")
+        )
+    except ValueError:
+        return "地址无效"
+
+
+def describe_telegram_connection(telegram):
+    mode = str(telegram.get("connection_mode", "direct") or "direct")
+    label = TELEGRAM_CONNECTION_LABELS.get(mode, "未知")
+    if mode in ("socks5", "http"):
+        return "{}: {}".format(label, _safe_proxy_url(telegram.get("proxy_url")))
+    if mode == "node":
+        try:
+            detail = telegram_proxy.describe_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            detail = "节点链接无效"
+        return "{}: {}".format(label, detail)
+    if mode == "api_proxy":
+        return "{}: {}".format(label, _safe_api_base_url(telegram.get("api_base_url", "")))
+    return label
+
+
+def _set_telegram_identity(candidate):
+    token = prompt_secret(
+        "Telegram Bot Token", keep_existing=bool(candidate.get("bot_token"))
+    )
+    if token:
+        candidate["bot_token"] = token
+    candidate["chat_id"] = prompt(
+        "Telegram Chat ID", candidate.get("chat_id"), required=True
+    )
+
+
+def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
+    while True:
+        title("Telegram 连接方式")
+        print(" 1) 直连")
+        print(" 2) SOCKS5 代理")
+        print(" 3) HTTP/HTTPS 代理")
+        print(" 4) 节点链接（VLESS / VMess / Shadowsocks）")
+        print(" 5) Telegram API 反向代理")
+        print(" 6) 查看当前选择")
+        print(" 7) 取消并返回")
+        print(" 8) 测试并保存")
+        choice = prompt_int("请选择", 8, 1, 8)
+        if choice == 1:
+            candidate["connection_mode"] = "direct"
+            candidate["proxy_url"] = ""
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+            print("已选择 Telegram 直连。")
+        elif choice == 2:
+            candidate["connection_mode"] = "socks5"
+            candidate["proxy_url"] = prompt(
+                "SOCKS5 地址（推荐 socks5h://）",
+                candidate.get("proxy_url") or "socks5h://127.0.0.1:1080",
+                required=True,
+            )
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+        elif choice == 3:
+            candidate["connection_mode"] = "http"
+            candidate["proxy_url"] = prompt(
+                "HTTP/HTTPS 代理地址",
+                candidate.get("proxy_url") or "http://127.0.0.1:8080",
+                required=True,
+            )
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+        elif choice == 4:
+            node_url = prompt_secret(
+                "节点链接（vless://、vmess:// 或 ss://）",
+                keep_existing=bool(candidate.get("node_url")),
+            )
+            if node_url:
+                candidate["node_url"] = node_url
+            candidate["connection_mode"] = "node"
+            candidate["proxy_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+            try:
+                print("已识别: {}".format(telegram_proxy.describe_node_link(candidate.get("node_url"))))
+            except telegram_proxy.ProxyError as exc:
+                print("节点链接无效: {}".format(exc))
+        elif choice == 5:
+            candidate["connection_mode"] = "api_proxy"
+            candidate["api_base_url"] = prompt(
+                "Telegram API 反向代理基础地址",
+                candidate.get("api_base_url") or "https://api.telegram.org",
+                required=True,
+            ).rstrip("/")
+            candidate["proxy_url"] = ""
+            candidate["node_url"] = ""
+        elif choice == 6:
+            print("当前选择: {}".format(describe_telegram_connection(candidate)))
+        elif choice == 7:
+            if initial:
+                print("首次配置必须保存一种 Telegram 连接方式。")
+                continue
+            return None
+        elif choice == 8:
+            try:
+                guard.validate_telegram_config(candidate)
+            except Exception as exc:
+                print("连接配置无效: {}".format(guard.compact_error(exc)))
+                continue
+            if candidate.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
+                if not yes_no(
+                    "未检测到 sing-box，是否从官方 GitHub 下载并校验安装",
+                    default=True,
+                ):
+                    print("节点模式需要 sing-box，未保存。")
+                    continue
+                try:
+                    path = telegram_proxy.install_sing_box(progress=print)
+                    print("sing-box 已安装: {}".format(path))
+                except Exception as exc:
+                    print("sing-box 安装失败: {}".format(guard.compact_error(exc)))
+                    continue
+            if force_ipv4:
+                guard.enable_ipv4_only()
+            print("正在测试当前连接并发送消息...")
+            try:
+                username = guard.test_telegram(candidate)
+                print("Telegram 测试成功，Bot: @{}".format(username))
+                return candidate, True
+            except Exception as exc:
+                print(
+                    "Telegram 测试失败: {}".format(
+                        guard.compact_error(exc, secrets=guard.telegram_secrets(candidate))
+                    )
+                )
+            if yes_no("重新输入 Token 或 Chat ID", default=False):
+                _set_telegram_identity(candidate)
+            if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
+                return candidate, False
+
+
 def configure_telegram(config, initial=False):
     title("Telegram 通知配置")
     current = config.setdefault("telegram", {})
-    print("Token 和 Chat ID 只保存在本机 root 可读的配置文件中。")
-    token = prompt_secret("Telegram Bot Token", keep_existing=bool(current.get("bot_token")))
-    if token:
-        current["bot_token"] = token
-    current["chat_id"] = prompt("Telegram Chat ID", current.get("chat_id"), required=True)
-    current["timeout_seconds"] = prompt_int(
-        "Telegram 请求超时（秒）", current.get("timeout_seconds", 12), 3, 60
+    candidate = json.loads(json.dumps(current, ensure_ascii=False))
+    print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
+    _set_telegram_identity(candidate)
+    candidate["timeout_seconds"] = prompt_int(
+        "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
-    current["retries"] = prompt_int("Telegram 临时失败重试次数", current.get("retries", 3), 1, 5)
-    if config.get("force_ipv4", True):
-        guard.enable_ipv4_only()
-    while True:
-        print("正在发送测试消息...")
-        try:
-            username = guard.test_telegram(current)
-            print("Telegram 测试成功，Bot: @{}".format(username))
-            return True
-        except Exception as exc:
-            print("Telegram 测试失败: {}".format(guard.compact_error(exc)))
-        if yes_no("重新输入 Telegram 配置", default=True):
-            token = prompt_secret("Telegram Bot Token", keep_existing=bool(current.get("bot_token")))
-            if token:
-                current["bot_token"] = token
-            current["chat_id"] = prompt("Telegram Chat ID", current.get("chat_id"), required=True)
-            continue
-        if yes_no("网络可能临时异常，仍保存当前 Telegram 配置", default=False):
-            return False
-        if initial:
-            print("首次安装建议先确认通知链路可用。")
+    candidate["retries"] = prompt_int(
+        "Telegram 临时失败重试次数", candidate.get("retries", 3), 1, 5
+    )
+    result = configure_telegram_connection(
+        candidate,
+        force_ipv4=bool(config.get("force_ipv4", True)),
+        initial=initial,
+    )
+    if result is None:
+        print("已取消 Telegram 配置修改。")
+        return None
+    selected, test_ok = result
+    current.clear()
+    current.update(selected)
+    return test_ok
 
 
 def collect_user(existing=None):
@@ -2300,12 +3157,15 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
     [ ! -f "$APP_DIR/config.json" ] || chmod 600 "$APP_DIR/config.json"
     [ ! -f "$APP_DIR/state.json" ] || chmod 600 "$APP_DIR/state.json"
-    "$VENV_DIR/bin/python" -m py_compile "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py"
+    "$VENV_DIR/bin/python" -m py_compile \
+        "$APP_DIR/aliyun_guard.py" \
+        "$APP_DIR/manager.py" \
+        "$APP_DIR/telegram_proxy.py"
     sh -n "$APP_DIR/control.sh"
     sh -n "$APP_DIR/uninstall.sh"
     mkdir -p /usr/local/bin

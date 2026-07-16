@@ -7,7 +7,6 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-import urllib.error
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,20 +198,153 @@ class GuardNotificationTests(unittest.TestCase):
 
     def test_telegram_retries_transient_network_error(self):
         response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"ok": true, "result": {"id": 1}}'
+        response.status_code = 200
+        response.text = '{"ok": true, "result": {"id": 1}}'
         with mock.patch.object(
-            guard.urllib.request,
-            "urlopen",
-            side_effect=[urllib.error.URLError("temporary"), response],
-        ) as urlopen, mock.patch.object(guard.time, "sleep"):
+            guard, "_telegram_post", side_effect=[OSError("temporary"), response]
+        ) as post, mock.patch.object(guard.time, "sleep"):
             result = guard.telegram_api(
                 {"bot_token": "token", "timeout_seconds": 3, "retries": 3}, "getMe"
             )
         self.assertEqual(result["id"], 1)
-        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(post.call_count, 2)
+
+    def test_telegram_uses_socks5_proxy(self):
+        response = mock.MagicMock(status_code=200)
+        response.text = '{"ok": true, "result": {"id": 1}}'
+        telegram = {
+            "bot_token": "token",
+            "timeout_seconds": 5,
+            "retries": 1,
+            "connection_mode": "socks5",
+            "proxy_url": "socks5h://user:secret@127.0.0.1:1080",
+        }
+        with mock.patch.object(guard, "_telegram_post", return_value=response) as post:
+            guard.telegram_api(telegram, "getMe")
+        self.assertEqual(
+            post.call_args.args[3],
+            {
+                "http": "socks5h://user:secret@127.0.0.1:1080",
+                "https": "socks5h://user:secret@127.0.0.1:1080",
+            },
+        )
+
+    def test_telegram_uses_http_proxy(self):
+        response = mock.MagicMock(status_code=200)
+        response.text = '{"ok": true, "result": {"id": 1}}'
+        telegram = {
+            "bot_token": "token",
+            "timeout_seconds": 5,
+            "retries": 1,
+            "connection_mode": "http",
+            "proxy_url": "http://127.0.0.1:8080",
+        }
+        with mock.patch.object(guard, "_telegram_post", return_value=response) as post:
+            guard.telegram_api(telegram, "getMe")
+        self.assertEqual(post.call_args.args[3]["https"], "http://127.0.0.1:8080")
+
+    def test_non_node_connection_stops_existing_node_proxy(self):
+        with mock.patch.object(guard.telegram_proxy, "stop_node_proxy") as stop:
+            base_url, proxies = guard.telegram_connection(
+                {"connection_mode": "direct"}
+            )
+        stop.assert_called_once_with()
+        self.assertEqual(base_url, "https://api.telegram.org")
+        self.assertIsNone(proxies)
+
+    def test_telegram_uses_api_reverse_proxy(self):
+        response = mock.MagicMock(status_code=200)
+        response.text = '{"ok": true, "result": {"id": 1}}'
+        telegram = {
+            "bot_token": "token",
+            "timeout_seconds": 5,
+            "retries": 1,
+            "connection_mode": "api_proxy",
+            "api_base_url": "https://telegram.example.com",
+        }
+        with mock.patch.object(guard, "_telegram_post", return_value=response) as post:
+            guard.telegram_api(telegram, "getMe")
+        self.assertEqual(post.call_args.args[0], "https://telegram.example.com/bottoken/getMe")
+        self.assertIsNone(post.call_args.args[3])
+
+    def test_telegram_uses_node_proxy(self):
+        response = mock.MagicMock(status_code=200)
+        response.text = '{"ok": true, "result": {"id": 1}}'
+        telegram = {
+            "bot_token": "token",
+            "timeout_seconds": 5,
+            "retries": 1,
+            "connection_mode": "node",
+            "node_url": "vless://test-uuid@example.com:443?security=tls",
+        }
+        with mock.patch.object(
+            guard.telegram_proxy,
+            "ensure_node_proxy",
+            return_value="socks5h://127.0.0.1:19001",
+        ) as ensure, mock.patch.object(guard, "_telegram_post", return_value=response) as post:
+            guard.telegram_api(telegram, "getMe")
+        ensure.assert_called_once_with(telegram["node_url"])
+        self.assertEqual(post.call_args.args[3]["https"], "socks5h://127.0.0.1:19001")
+
+    def test_node_proxy_start_error_redacts_node_credentials(self):
+        node_uuid = "11111111-1111-1111-1111-111111111111"
+        node_url = "vless://{}@example.com:443?security=tls".format(node_uuid)
+        telegram = {
+            "connection_mode": "node",
+            "node_url": node_url,
+        }
+        with mock.patch.object(
+            guard.telegram_proxy,
+            "ensure_node_proxy",
+            side_effect=guard.telegram_proxy.ProxyError(
+                "sing-box failed for {} using {}".format(node_uuid, node_url)
+            ),
+        ):
+            with self.assertRaises(guard.GuardError) as raised:
+                guard.telegram_connection(telegram)
+        message = str(raised.exception)
+        self.assertNotIn(node_uuid, message)
+        self.assertNotIn(node_url, message)
+        self.assertIn("***", message)
+
+    def test_api_reverse_proxy_error_redacts_base_url(self):
+        base_url = "https://user:secret@telegram.example.com/private"
+        text = guard.compact_error(
+            RuntimeError("request failed for {}".format(base_url)),
+            secrets=guard.telegram_secrets({"api_base_url": base_url}),
+        )
+        self.assertNotIn(base_url, text)
+        self.assertNotIn("secret", text)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_rejects_invalid_telegram_proxy(self):
+        config = make_config()
+        config["telegram"].update(
+            {"connection_mode": "socks5", "proxy_url": "socks5h://127.0.0.1"}
+        )
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+
+    def test_rejects_insecure_remote_api_proxy(self):
+        config = make_config()
+        config["telegram"].update(
+            {"connection_mode": "api_proxy", "api_base_url": "http://proxy.example.com"}
+        )
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+
+    def test_rejects_api_proxy_query_string(self):
+        config = make_config()
+        config["telegram"].update(
+            {
+                "connection_mode": "api_proxy",
+                "api_base_url": "https://proxy.example.com/?token=secret",
+            }
+        )
+        with self.assertRaises(guard.GuardError):
+            guard.validate_config(config)
+
     def test_bss_query_uses_selected_endpoint_and_parses_amount(self):
         class FakeRequest:
             def __init__(self):
@@ -382,30 +514,30 @@ class UpdateTests(unittest.TestCase):
         ) as confirm, mock.patch("sys.stdout", output):
             result = manager.update_from_github(release_info=release_info)
         self.assertIsNone(result)
-        self.assertIn("当前版本: v1.1.3", output.getvalue())
+        self.assertIn("当前版本: v{}".format(manager.APP_VERSION), output.getvalue())
         self.assertIn("当前版本已经是最新版本了。", output.getvalue())
         download.assert_not_called()
         confirm.assert_not_called()
 
     def test_update_confirmation_names_target_version(self):
-        release_info = {"available": True, "version": "1.1.3", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "1.3.0", "release_id": "b" * 64}
         with mock.patch.object(manager, "yes_no", return_value=False) as confirm:
             result = manager.update_from_github(release_info=release_info)
         self.assertIsNone(result)
-        confirm.assert_called_once_with("下载并安装 GitHub v1.1.3", True)
+        confirm.assert_called_once_with("下载并安装 GitHub v1.3.0", True)
 
     def test_startup_check_reports_remote_version(self):
         local_release = "a" * 64
         remote_release = "b" * 64
         manifest = json.dumps(
-            {"version": "1.2.0", "release_id": remote_release}
+            {"version": "1.3.0", "release_id": remote_release}
         ).encode("utf-8")
         with mock.patch.object(manager, "LOCAL_RELEASE_ID", local_release), mock.patch.object(
             manager, "download_update_file", return_value=manifest
         ) as download:
             result = manager.check_for_github_update()
         self.assertTrue(result["available"])
-        self.assertEqual(result["version"], "1.2.0")
+        self.assertEqual(result["version"], "1.3.0")
         download.assert_called_once_with(
             manager.UPDATE_BASE_URL + "/version.json",
             timeout=manager.UPDATE_CHECK_TIMEOUT_SECONDS,
@@ -432,7 +564,7 @@ class UpdateTests(unittest.TestCase):
     def test_github_update_verifies_checksum_and_runs_update_mode(self):
         installer = b"#!/bin/sh\nexit 0\n"
         checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
-        release_info = {"available": True, "version": "1.1.3", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "1.3.0", "release_id": "b" * 64}
         output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
@@ -443,8 +575,8 @@ class UpdateTests(unittest.TestCase):
                     release_info=release_info,
                 )
         self.assertTrue(result)
-        self.assertIn("当前版本: v1.1.3", output.getvalue())
-        self.assertIn("最新版本: v1.1.3", output.getvalue())
+        self.assertIn("当前版本: v{}".format(manager.APP_VERSION), output.getvalue())
+        self.assertIn("最新版本: v1.3.0", output.getvalue())
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
@@ -461,6 +593,34 @@ class UpdateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_node_connection_is_tested_before_commit(self):
+        candidate = dict(guard.DEFAULT_CONFIG["telegram"])
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls&type=ws&path=%2Ftelegram"
+        )
+        with mock.patch.object(manager, "prompt_int", side_effect=[4, 8]), mock.patch.object(
+            manager, "prompt_secret", return_value=node_url
+        ), mock.patch.object(
+            manager.telegram_proxy, "find_sing_box", return_value="/usr/bin/sing-box"
+        ), mock.patch.object(
+            manager.guard, "test_telegram", return_value="test_bot"
+        ) as test:
+            result, test_ok = manager.configure_telegram_connection(
+                candidate, force_ipv4=False
+            )
+        self.assertTrue(test_ok)
+        self.assertEqual(result["connection_mode"], "node")
+        self.assertEqual(result["node_url"], node_url)
+        test.assert_called_once_with(result)
+
+    def test_connection_menu_cancel_returns_without_save(self):
+        candidate = dict(guard.DEFAULT_CONFIG["telegram"])
+        with mock.patch.object(manager, "prompt_int", return_value=7):
+            self.assertIsNone(
+                manager.configure_telegram_connection(candidate, force_ipv4=False)
+            )
+
     def test_update_notice_is_yellow_in_terminal(self):
         class TtyOutput(io.StringIO):
             def isatty(self):
@@ -484,15 +644,18 @@ class FirstSetupFlowTests(unittest.TestCase):
             ), mock.patch.object(
                 manager,
                 "check_for_github_update",
-                return_value={"available": True, "version": "1.2.0", "release_id": "b" * 64},
+                return_value={"available": True, "version": "1.3.0", "release_id": "b" * 64},
             ) as check, mock.patch.object(manager, "prompt_int", return_value=14), mock.patch(
                 "sys.stdout", output
             ):
                 result = manager.menu()
         self.assertEqual(result, 0)
-        self.assertIn("阿里云保活与通知 v1.1.3 - 管理面板", output.getvalue())
-        self.assertIn("发现新版本: v1.2.0（请选择 13 更新）", output.getvalue())
-        self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.2.0]", output.getvalue())
+        self.assertIn(
+            "阿里云保活与通知 v{} - 管理面板".format(manager.APP_VERSION),
+            output.getvalue(),
+        )
+        self.assertIn("发现新版本: v1.3.0（请选择 13 更新）", output.getvalue())
+        self.assertIn("13) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
         check.assert_called_once_with()
 
     def test_first_manual_open_runs_setup_then_starts_backend(self):

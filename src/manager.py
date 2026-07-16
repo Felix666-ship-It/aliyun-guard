@@ -12,9 +12,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 import aliyun_guard as guard
+import telegram_proxy
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -24,7 +26,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.2.0"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -230,38 +232,207 @@ def configure_billing(existing_user=None):
     }
 
 
+TELEGRAM_CONNECTION_LABELS = {
+    "direct": "直连",
+    "socks5": "SOCKS5 代理",
+    "http": "HTTP/HTTPS 代理",
+    "node": "节点链接（VLESS / VMess / Shadowsocks）",
+    "api_proxy": "Telegram API 反向代理",
+}
+
+
+def _safe_proxy_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        address = host
+        if parsed.port:
+            address = "{}:{}".format(address, parsed.port)
+        if parsed.username:
+            address = "{}:***@{}".format(parsed.username, address)
+        return "{}://{}".format(parsed.scheme, address)
+    except ValueError:
+        return "地址无效"
+
+
+def _safe_api_base_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = "[{}]".format(host)
+        address = host
+        if parsed.port:
+            address = "{}:{}".format(address, parsed.port)
+        if parsed.username:
+            credentials = parsed.username
+            if parsed.password is not None:
+                credentials += ":***"
+            address = "{}@{}".format(credentials, address)
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, address, parsed.path.rstrip("/"), "", "")
+        )
+    except ValueError:
+        return "地址无效"
+
+
+def describe_telegram_connection(telegram):
+    mode = str(telegram.get("connection_mode", "direct") or "direct")
+    label = TELEGRAM_CONNECTION_LABELS.get(mode, "未知")
+    if mode in ("socks5", "http"):
+        return "{}: {}".format(label, _safe_proxy_url(telegram.get("proxy_url")))
+    if mode == "node":
+        try:
+            detail = telegram_proxy.describe_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            detail = "节点链接无效"
+        return "{}: {}".format(label, detail)
+    if mode == "api_proxy":
+        return "{}: {}".format(label, _safe_api_base_url(telegram.get("api_base_url", "")))
+    return label
+
+
+def _set_telegram_identity(candidate):
+    token = prompt_secret(
+        "Telegram Bot Token", keep_existing=bool(candidate.get("bot_token"))
+    )
+    if token:
+        candidate["bot_token"] = token
+    candidate["chat_id"] = prompt(
+        "Telegram Chat ID", candidate.get("chat_id"), required=True
+    )
+
+
+def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
+    while True:
+        title("Telegram 连接方式")
+        print(" 1) 直连")
+        print(" 2) SOCKS5 代理")
+        print(" 3) HTTP/HTTPS 代理")
+        print(" 4) 节点链接（VLESS / VMess / Shadowsocks）")
+        print(" 5) Telegram API 反向代理")
+        print(" 6) 查看当前选择")
+        print(" 7) 取消并返回")
+        print(" 8) 测试并保存")
+        choice = prompt_int("请选择", 8, 1, 8)
+        if choice == 1:
+            candidate["connection_mode"] = "direct"
+            candidate["proxy_url"] = ""
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+            print("已选择 Telegram 直连。")
+        elif choice == 2:
+            candidate["connection_mode"] = "socks5"
+            candidate["proxy_url"] = prompt(
+                "SOCKS5 地址（推荐 socks5h://）",
+                candidate.get("proxy_url") or "socks5h://127.0.0.1:1080",
+                required=True,
+            )
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+        elif choice == 3:
+            candidate["connection_mode"] = "http"
+            candidate["proxy_url"] = prompt(
+                "HTTP/HTTPS 代理地址",
+                candidate.get("proxy_url") or "http://127.0.0.1:8080",
+                required=True,
+            )
+            candidate["node_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+        elif choice == 4:
+            node_url = prompt_secret(
+                "节点链接（vless://、vmess:// 或 ss://）",
+                keep_existing=bool(candidate.get("node_url")),
+            )
+            if node_url:
+                candidate["node_url"] = node_url
+            candidate["connection_mode"] = "node"
+            candidate["proxy_url"] = ""
+            candidate["api_base_url"] = "https://api.telegram.org"
+            try:
+                print("已识别: {}".format(telegram_proxy.describe_node_link(candidate.get("node_url"))))
+            except telegram_proxy.ProxyError as exc:
+                print("节点链接无效: {}".format(exc))
+        elif choice == 5:
+            candidate["connection_mode"] = "api_proxy"
+            candidate["api_base_url"] = prompt(
+                "Telegram API 反向代理基础地址",
+                candidate.get("api_base_url") or "https://api.telegram.org",
+                required=True,
+            ).rstrip("/")
+            candidate["proxy_url"] = ""
+            candidate["node_url"] = ""
+        elif choice == 6:
+            print("当前选择: {}".format(describe_telegram_connection(candidate)))
+        elif choice == 7:
+            if initial:
+                print("首次配置必须保存一种 Telegram 连接方式。")
+                continue
+            return None
+        elif choice == 8:
+            try:
+                guard.validate_telegram_config(candidate)
+            except Exception as exc:
+                print("连接配置无效: {}".format(guard.compact_error(exc)))
+                continue
+            if candidate.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
+                if not yes_no(
+                    "未检测到 sing-box，是否从官方 GitHub 下载并校验安装",
+                    default=True,
+                ):
+                    print("节点模式需要 sing-box，未保存。")
+                    continue
+                try:
+                    path = telegram_proxy.install_sing_box(progress=print)
+                    print("sing-box 已安装: {}".format(path))
+                except Exception as exc:
+                    print("sing-box 安装失败: {}".format(guard.compact_error(exc)))
+                    continue
+            if force_ipv4:
+                guard.enable_ipv4_only()
+            print("正在测试当前连接并发送消息...")
+            try:
+                username = guard.test_telegram(candidate)
+                print("Telegram 测试成功，Bot: @{}".format(username))
+                return candidate, True
+            except Exception as exc:
+                print(
+                    "Telegram 测试失败: {}".format(
+                        guard.compact_error(exc, secrets=guard.telegram_secrets(candidate))
+                    )
+                )
+            if yes_no("重新输入 Token 或 Chat ID", default=False):
+                _set_telegram_identity(candidate)
+            if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
+                return candidate, False
+
+
 def configure_telegram(config, initial=False):
     title("Telegram 通知配置")
     current = config.setdefault("telegram", {})
-    print("Token 和 Chat ID 只保存在本机 root 可读的配置文件中。")
-    token = prompt_secret("Telegram Bot Token", keep_existing=bool(current.get("bot_token")))
-    if token:
-        current["bot_token"] = token
-    current["chat_id"] = prompt("Telegram Chat ID", current.get("chat_id"), required=True)
-    current["timeout_seconds"] = prompt_int(
-        "Telegram 请求超时（秒）", current.get("timeout_seconds", 12), 3, 60
+    candidate = json.loads(json.dumps(current, ensure_ascii=False))
+    print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
+    _set_telegram_identity(candidate)
+    candidate["timeout_seconds"] = prompt_int(
+        "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
-    current["retries"] = prompt_int("Telegram 临时失败重试次数", current.get("retries", 3), 1, 5)
-    if config.get("force_ipv4", True):
-        guard.enable_ipv4_only()
-    while True:
-        print("正在发送测试消息...")
-        try:
-            username = guard.test_telegram(current)
-            print("Telegram 测试成功，Bot: @{}".format(username))
-            return True
-        except Exception as exc:
-            print("Telegram 测试失败: {}".format(guard.compact_error(exc)))
-        if yes_no("重新输入 Telegram 配置", default=True):
-            token = prompt_secret("Telegram Bot Token", keep_existing=bool(current.get("bot_token")))
-            if token:
-                current["bot_token"] = token
-            current["chat_id"] = prompt("Telegram Chat ID", current.get("chat_id"), required=True)
-            continue
-        if yes_no("网络可能临时异常，仍保存当前 Telegram 配置", default=False):
-            return False
-        if initial:
-            print("首次安装建议先确认通知链路可用。")
+    candidate["retries"] = prompt_int(
+        "Telegram 临时失败重试次数", candidate.get("retries", 3), 1, 5
+    )
+    result = configure_telegram_connection(
+        candidate,
+        force_ipv4=bool(config.get("force_ipv4", True)),
+        initial=initial,
+    )
+    if result is None:
+        print("已取消 Telegram 配置修改。")
+        return None
+    selected, test_ok = result
+    current.clear()
+    current.update(selected)
+    return test_ok
 
 
 def collect_user(existing=None):

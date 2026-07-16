@@ -260,7 +260,8 @@ create_venv() {
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
         'aliyun-python-sdk-core>=2.16,<3' \
-        'aliyun-python-sdk-ecs>=4.24,<5'
+        'aliyun-python-sdk-ecs>=4.24,<5' \
+        'requests[socks]>=2.31,<3'
 }
 
 stop_old_backend() {
@@ -277,12 +278,15 @@ write_payload() {
     mkdir -p "$APP_DIR/logs"
 # __PAYLOAD_BLOCKS__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
     [ ! -f "$APP_DIR/config.json" ] || chmod 600 "$APP_DIR/config.json"
     [ ! -f "$APP_DIR/state.json" ] || chmod 600 "$APP_DIR/state.json"
-    "$VENV_DIR/bin/python" -m py_compile "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py"
+    "$VENV_DIR/bin/python" -m py_compile \
+        "$APP_DIR/aliyun_guard.py" \
+        "$APP_DIR/manager.py" \
+        "$APP_DIR/telegram_proxy.py"
     sh -n "$APP_DIR/control.sh"
     sh -n "$APP_DIR/uninstall.sh"
     mkdir -p /usr/local/bin
