@@ -639,11 +639,14 @@ def send_telegram_message(telegram, text):
     return results
 
 
-def test_telegram(telegram):
+def test_telegram(telegram, node_latency_ms=None):
     bot = telegram_api(telegram, "getMe")
     username = bot.get("username", "unknown") if isinstance(bot, dict) else "unknown"
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_telegram_message(telegram, "阿里云保活通知测试成功\n时间: {}\nBot: @{}".format(now, username))
+    message = "阿里云保活通知测试成功\n时间: {}\nBot: @{}".format(now, username)
+    if node_latency_ms is not None:
+        message += "\n节点延迟: {:.0f} ms（TCP）".format(float(node_latency_ms))
+    send_telegram_message(telegram, message)
     return username
 
 

@@ -10,6 +10,7 @@ BIN_LINK="/usr/local/bin/aliyun-guard"
 SHORT_BIN_LINK="/usr/local/bin/ag"
 MIN_PYTHON="3.8"
 SHORTCUT_AVAILABLE=no
+PRESERVE_DIR=""
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -76,6 +77,16 @@ confirm() {
         *) return 1 ;;
     esac
 }
+
+cleanup_preserved_data() {
+    if [ -n "$PRESERVE_DIR" ] && [ -d "$PRESERVE_DIR" ]; then
+        rm -rf "$PRESERVE_DIR"
+    fi
+    PRESERVE_DIR=""
+}
+
+trap cleanup_preserved_data EXIT
+trap 'exit 130' HUP INT TERM
 
 say "${CYAN}==============================================================${RESET}"
 say "${CYAN}       阿里云 ECS 保活 + CDT 止损 + Telegram 通知${RESET}"
@@ -157,6 +168,40 @@ existing_menu() {
             die "无效选择。"
             ;;
     esac
+}
+
+preserve_local_data() {
+    if [ ! -f "$APP_DIR/config.json" ]; then
+        return
+    fi
+    PRESERVE_DIR=$(mktemp -d)
+    cp "$APP_DIR/config.json" "$PRESERVE_DIR/config.json"
+    [ ! -f "$APP_DIR/state.json" ] || cp "$APP_DIR/state.json" "$PRESERVE_DIR/state.json"
+    if [ -f "$APP_DIR/bin/sing-box" ]; then
+        mkdir -p "$PRESERVE_DIR/bin"
+        cp "$APP_DIR/bin/sing-box" "$PRESERVE_DIR/bin/sing-box"
+    fi
+    chmod 600 "$PRESERVE_DIR/config.json"
+    say "${GREEN}已保护现有配置（包括 Telegram 连接方式和节点链接）。${RESET}"
+}
+
+restore_local_data() {
+    if [ -z "$PRESERVE_DIR" ] || [ ! -f "$PRESERVE_DIR/config.json" ]; then
+        return
+    fi
+    cp "$PRESERVE_DIR/config.json" "$APP_DIR/config.json"
+    chmod 600 "$APP_DIR/config.json"
+    if [ -f "$PRESERVE_DIR/state.json" ]; then
+        cp "$PRESERVE_DIR/state.json" "$APP_DIR/state.json"
+        chmod 600 "$APP_DIR/state.json"
+    fi
+    if [ -f "$PRESERVE_DIR/bin/sing-box" ] && [ ! -x "$APP_DIR/bin/sing-box" ]; then
+        mkdir -p "$APP_DIR/bin"
+        cp "$PRESERVE_DIR/bin/sing-box" "$APP_DIR/bin/sing-box"
+        chmod 700 "$APP_DIR/bin/sing-box"
+    fi
+    say "${GREEN}已恢复现有配置，Telegram 代理和节点保持不变。${RESET}"
+    cleanup_preserved_data
 }
 
 handle_legacy_monitor() {
@@ -596,6 +641,27 @@ def describe_node_link(link):
     if remark:
         return "{} 节点（{}）".format(outbound["type"].upper(), remark)
     return "{} 节点".format(outbound["type"].upper())
+
+
+def measure_node_latency(link, attempts=3, timeout=2.0):
+    outbound = parse_node_link(link)
+    server = str(outbound.get("server", "")).strip()
+    port = int(outbound.get("server_port", 0) or 0)
+    attempts = max(1, min(5, int(attempts)))
+    timeout = max(0.5, min(10.0, float(timeout)))
+    latencies = []
+    last_error = None
+    for _index in range(attempts):
+        started = time.perf_counter()
+        try:
+            with socket.create_connection((server, port), timeout=timeout):
+                latencies.append((time.perf_counter() - started) * 1000.0)
+        except OSError as exc:
+            last_error = exc
+    if not latencies:
+        detail = "{}:{}".format(server, port)
+        raise ProxyError("无法连接节点服务器 {}".format(detail)) from last_error
+    return sum(latencies) / len(latencies)
 
 
 def build_sing_box_config(node_link, listen_port):
@@ -1499,11 +1565,14 @@ def send_telegram_message(telegram, text):
     return results
 
 
-def test_telegram(telegram):
+def test_telegram(telegram, node_latency_ms=None):
     bot = telegram_api(telegram, "getMe")
     username = bot.get("username", "unknown") if isinstance(bot, dict) else "unknown"
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    send_telegram_message(telegram, "阿里云保活通知测试成功\n时间: {}\nBot: @{}".format(now, username))
+    message = "阿里云保活通知测试成功\n时间: {}\nBot: @{}".format(now, username)
+    if node_latency_ms is not None:
+        message += "\n节点延迟: {:.0f} ms（TCP）".format(float(node_latency_ms))
+    send_telegram_message(telegram, message)
     return username
 
 
@@ -2028,8 +2097,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.1"
-LOCAL_RELEASE_ID = "e89043a8c2ed69be06c1e970ee746f5e7b0b1c74655bf3a75904a5bc6cf6d6ae"
+APP_VERSION = "1.2.2"
+LOCAL_RELEASE_ID = "1c7aab0461edc2abd7a8f7fa457f6622aacecee863bc43db269de775005100e8"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -2296,6 +2365,51 @@ def describe_telegram_connection(telegram):
     return label
 
 
+def telegram_connection_status_lines(telegram, prefix="当前"):
+    mode = str(telegram.get("connection_mode", "direct") or "direct")
+    label = TELEGRAM_CONNECTION_LABELS.get(mode, "未知")
+    lines = ["{}方式: {}".format(prefix, label)]
+    if mode in ("socks5", "http"):
+        lines.append("{}代理: {}".format(prefix, _safe_proxy_url(telegram.get("proxy_url"))))
+    elif mode == "node":
+        try:
+            node = telegram_proxy.describe_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            node = "节点链接无效"
+        lines.append("{}节点: {}".format(prefix, node))
+    elif mode == "api_proxy":
+        lines.append(
+            "{}反代: {}".format(prefix, _safe_api_base_url(telegram.get("api_base_url", "")))
+        )
+    return lines
+
+
+def _telegram_connection_signature(telegram):
+    return tuple(
+        str(telegram.get(field, "") or "").strip()
+        for field in ("connection_mode", "proxy_url", "node_url", "api_base_url")
+    )
+
+
+def test_selected_node_latency(telegram):
+    if str(telegram.get("connection_mode", "direct") or "direct") != "node":
+        return None
+    print("正在测试所选节点延迟（TCP，3 次）...")
+    try:
+        latency_ms = telegram_proxy.measure_node_latency(
+            telegram.get("node_url", ""), attempts=3, timeout=2.0
+        )
+        print("当前节点延迟: {:.0f} ms（TCP）".format(latency_ms))
+        return latency_ms
+    except Exception as exc:
+        print(
+            "节点延迟测试失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            )
+        )
+        return None
+
+
 def _set_telegram_identity(candidate):
     token = prompt_secret(
         "Telegram Bot Token", keep_existing=bool(candidate.get("bot_token"))
@@ -2307,9 +2421,16 @@ def _set_telegram_identity(candidate):
     )
 
 
-def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
+def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
         title("Telegram 连接方式")
+        status_source = active if active is not None else candidate
+        for line in telegram_connection_status_lines(status_source):
+            print(line)
+        if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
+            for line in telegram_connection_status_lines(candidate, prefix="待保存"):
+                print(line)
+        print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
         print(" 3) HTTP/HTTPS 代理")
@@ -2394,9 +2515,13 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
                     continue
             if force_ipv4:
                 guard.enable_ipv4_only()
+            node_latency_ms = test_selected_node_latency(candidate)
             print("正在测试当前连接并发送消息...")
             try:
-                username = guard.test_telegram(candidate)
+                username = guard.test_telegram(
+                    candidate,
+                    node_latency_ms=node_latency_ms,
+                )
                 print("Telegram 测试成功，Bot: @{}".format(username))
                 return candidate, True
             except Exception as exc:
@@ -2443,9 +2568,13 @@ def test_current_telegram(config):
     print("当前连接: {}".format(describe_telegram_connection(telegram)))
     if config.get("force_ipv4", True):
         guard.enable_ipv4_only()
+    node_latency_ms = test_selected_node_latency(telegram)
     print("正在发送测试消息...")
     try:
-        username = guard.test_telegram(telegram)
+        username = guard.test_telegram(
+            telegram,
+            node_latency_ms=node_latency_ms,
+        )
         print("Telegram 测试成功，Bot: @{}".format(username))
         return True
     except Exception as exc:
@@ -2464,6 +2593,7 @@ def configure_telegram_connection_settings(config):
         candidate,
         force_ipv4=bool(config.get("force_ipv4", True)),
         initial=False,
+        active=current,
     )
     if result is None:
         print("已取消 Telegram 连接方式修改。")
@@ -3479,7 +3609,9 @@ find_python
 mkdir -p "$APP_DIR"
 create_venv
 stop_old_backend
+preserve_local_data
 write_payload
+restore_local_data
 prepare_configuration
 setup_backend
 finish

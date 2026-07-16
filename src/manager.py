@@ -26,7 +26,7 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -294,6 +294,51 @@ def describe_telegram_connection(telegram):
     return label
 
 
+def telegram_connection_status_lines(telegram, prefix="当前"):
+    mode = str(telegram.get("connection_mode", "direct") or "direct")
+    label = TELEGRAM_CONNECTION_LABELS.get(mode, "未知")
+    lines = ["{}方式: {}".format(prefix, label)]
+    if mode in ("socks5", "http"):
+        lines.append("{}代理: {}".format(prefix, _safe_proxy_url(telegram.get("proxy_url"))))
+    elif mode == "node":
+        try:
+            node = telegram_proxy.describe_node_link(telegram.get("node_url", ""))
+        except telegram_proxy.ProxyError:
+            node = "节点链接无效"
+        lines.append("{}节点: {}".format(prefix, node))
+    elif mode == "api_proxy":
+        lines.append(
+            "{}反代: {}".format(prefix, _safe_api_base_url(telegram.get("api_base_url", "")))
+        )
+    return lines
+
+
+def _telegram_connection_signature(telegram):
+    return tuple(
+        str(telegram.get(field, "") or "").strip()
+        for field in ("connection_mode", "proxy_url", "node_url", "api_base_url")
+    )
+
+
+def test_selected_node_latency(telegram):
+    if str(telegram.get("connection_mode", "direct") or "direct") != "node":
+        return None
+    print("正在测试所选节点延迟（TCP，3 次）...")
+    try:
+        latency_ms = telegram_proxy.measure_node_latency(
+            telegram.get("node_url", ""), attempts=3, timeout=2.0
+        )
+        print("当前节点延迟: {:.0f} ms（TCP）".format(latency_ms))
+        return latency_ms
+    except Exception as exc:
+        print(
+            "节点延迟测试失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            )
+        )
+        return None
+
+
 def _set_telegram_identity(candidate):
     token = prompt_secret(
         "Telegram Bot Token", keep_existing=bool(candidate.get("bot_token"))
@@ -305,9 +350,16 @@ def _set_telegram_identity(candidate):
     )
 
 
-def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
+def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
         title("Telegram 连接方式")
+        status_source = active if active is not None else candidate
+        for line in telegram_connection_status_lines(status_source):
+            print(line)
+        if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
+            for line in telegram_connection_status_lines(candidate, prefix="待保存"):
+                print(line)
+        print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
         print(" 3) HTTP/HTTPS 代理")
@@ -392,9 +444,13 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False):
                     continue
             if force_ipv4:
                 guard.enable_ipv4_only()
+            node_latency_ms = test_selected_node_latency(candidate)
             print("正在测试当前连接并发送消息...")
             try:
-                username = guard.test_telegram(candidate)
+                username = guard.test_telegram(
+                    candidate,
+                    node_latency_ms=node_latency_ms,
+                )
                 print("Telegram 测试成功，Bot: @{}".format(username))
                 return candidate, True
             except Exception as exc:
@@ -441,9 +497,13 @@ def test_current_telegram(config):
     print("当前连接: {}".format(describe_telegram_connection(telegram)))
     if config.get("force_ipv4", True):
         guard.enable_ipv4_only()
+    node_latency_ms = test_selected_node_latency(telegram)
     print("正在发送测试消息...")
     try:
-        username = guard.test_telegram(telegram)
+        username = guard.test_telegram(
+            telegram,
+            node_latency_ms=node_latency_ms,
+        )
         print("Telegram 测试成功，Bot: @{}".format(username))
         return True
     except Exception as exc:
@@ -462,6 +522,7 @@ def configure_telegram_connection_settings(config):
         candidate,
         force_ipv4=bool(config.get("force_ipv4", True)),
         initial=False,
+        active=current,
     )
     if result is None:
         print("已取消 Telegram 连接方式修改。")

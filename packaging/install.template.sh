@@ -10,6 +10,7 @@ BIN_LINK="/usr/local/bin/aliyun-guard"
 SHORT_BIN_LINK="/usr/local/bin/ag"
 MIN_PYTHON="3.8"
 SHORTCUT_AVAILABLE=no
+PRESERVE_DIR=""
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -76,6 +77,16 @@ confirm() {
         *) return 1 ;;
     esac
 }
+
+cleanup_preserved_data() {
+    if [ -n "$PRESERVE_DIR" ] && [ -d "$PRESERVE_DIR" ]; then
+        rm -rf "$PRESERVE_DIR"
+    fi
+    PRESERVE_DIR=""
+}
+
+trap cleanup_preserved_data EXIT
+trap 'exit 130' HUP INT TERM
 
 say "${CYAN}==============================================================${RESET}"
 say "${CYAN}       阿里云 ECS 保活 + CDT 止损 + Telegram 通知${RESET}"
@@ -157,6 +168,40 @@ existing_menu() {
             die "无效选择。"
             ;;
     esac
+}
+
+preserve_local_data() {
+    if [ ! -f "$APP_DIR/config.json" ]; then
+        return
+    fi
+    PRESERVE_DIR=$(mktemp -d)
+    cp "$APP_DIR/config.json" "$PRESERVE_DIR/config.json"
+    [ ! -f "$APP_DIR/state.json" ] || cp "$APP_DIR/state.json" "$PRESERVE_DIR/state.json"
+    if [ -f "$APP_DIR/bin/sing-box" ]; then
+        mkdir -p "$PRESERVE_DIR/bin"
+        cp "$APP_DIR/bin/sing-box" "$PRESERVE_DIR/bin/sing-box"
+    fi
+    chmod 600 "$PRESERVE_DIR/config.json"
+    say "${GREEN}已保护现有配置（包括 Telegram 连接方式和节点链接）。${RESET}"
+}
+
+restore_local_data() {
+    if [ -z "$PRESERVE_DIR" ] || [ ! -f "$PRESERVE_DIR/config.json" ]; then
+        return
+    fi
+    cp "$PRESERVE_DIR/config.json" "$APP_DIR/config.json"
+    chmod 600 "$APP_DIR/config.json"
+    if [ -f "$PRESERVE_DIR/state.json" ]; then
+        cp "$PRESERVE_DIR/state.json" "$APP_DIR/state.json"
+        chmod 600 "$APP_DIR/state.json"
+    fi
+    if [ -f "$PRESERVE_DIR/bin/sing-box" ] && [ ! -x "$APP_DIR/bin/sing-box" ]; then
+        mkdir -p "$APP_DIR/bin"
+        cp "$PRESERVE_DIR/bin/sing-box" "$APP_DIR/bin/sing-box"
+        chmod 700 "$APP_DIR/bin/sing-box"
+    fi
+    say "${GREEN}已恢复现有配置，Telegram 代理和节点保持不变。${RESET}"
+    cleanup_preserved_data
 }
 
 handle_legacy_monitor() {
@@ -485,7 +530,9 @@ find_python
 mkdir -p "$APP_DIR"
 create_venv
 stop_old_backend
+preserve_local_data
 write_payload
+restore_local_data
 prepare_configuration
 setup_backend
 finish

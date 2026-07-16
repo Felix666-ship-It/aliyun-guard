@@ -323,6 +323,15 @@ class GuardNotificationTests(unittest.TestCase):
             guard.send_telegram_message(telegram, "保活检测完成")
         self.assertEqual(api.call_args.args[2]["text"], "保活检测完成")
 
+    def test_telegram_test_message_includes_node_latency(self):
+        telegram = {"chat_id": "123", "connection_mode": "node"}
+        with mock.patch.object(
+            guard, "telegram_api", return_value={"username": "test_bot"}
+        ), mock.patch.object(guard, "send_telegram_message") as send:
+            username = guard.test_telegram(telegram, node_latency_ms=42.4)
+        self.assertEqual(username, "test_bot")
+        self.assertIn("节点延迟: 42 ms（TCP）", send.call_args.args[1])
+
     def test_node_proxy_start_error_redacts_node_credentials(self):
         node_uuid = "11111111-1111-1111-1111-111111111111"
         node_url = "vless://{}@example.com:443?security=tls".format(node_uuid)
@@ -629,6 +638,19 @@ class UpdateTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class InstallerTemplateTests(unittest.TestCase):
+    def test_update_preserves_telegram_node_configuration(self):
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        main = template[template.rfind("\ndetect_os\n"):]
+        self.assertLess(main.index("preserve_local_data"), main.index("write_payload"))
+        self.assertLess(main.index("write_payload"), main.index("restore_local_data"))
+        self.assertIn('cp "$APP_DIR/config.json" "$PRESERVE_DIR/config.json"', template)
+        self.assertIn('"$APP_DIR/bin/sing-box"', template)
+        self.assertIn("Telegram 代理和节点保持不变", template)
+
+
 class FirstSetupFlowTests(unittest.TestCase):
     def test_node_connection_is_tested_before_commit(self):
         candidate = dict(guard.DEFAULT_CONFIG["telegram"])
@@ -641,6 +663,8 @@ class FirstSetupFlowTests(unittest.TestCase):
         ), mock.patch.object(
             manager.telegram_proxy, "find_sing_box", return_value="/usr/bin/sing-box"
         ), mock.patch.object(
+            manager.telegram_proxy, "measure_node_latency", return_value=42.4
+        ), mock.patch.object(
             manager.guard, "test_telegram", return_value="test_bot"
         ) as test:
             result, test_ok = manager.configure_telegram_connection(
@@ -649,7 +673,7 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertTrue(test_ok)
         self.assertEqual(result["connection_mode"], "node")
         self.assertEqual(result["node_url"], node_url)
-        test.assert_called_once_with(result)
+        test.assert_called_once_with(result, node_latency_ms=42.4)
 
     def test_connection_menu_cancel_returns_without_save(self):
         candidate = dict(guard.DEFAULT_CONFIG["telegram"])
@@ -657,6 +681,24 @@ class FirstSetupFlowTests(unittest.TestCase):
             self.assertIsNone(
                 manager.configure_telegram_connection(candidate, force_ipv4=False)
             )
+
+    def test_connection_menu_shows_current_node(self):
+        node_url = (
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+            "?security=tls#Hong%20Kong%2001"
+        )
+        candidate = dict(guard.DEFAULT_CONFIG["telegram"])
+        candidate.update({"connection_mode": "node", "node_url": node_url})
+        output = io.StringIO()
+        with mock.patch.object(manager, "prompt_int", return_value=7), mock.patch(
+            "sys.stdout", output
+        ):
+            manager.configure_telegram_connection(candidate, force_ipv4=False)
+        self.assertIn(
+            "当前方式: 节点链接（VLESS / VMess / Shadowsocks）",
+            output.getvalue(),
+        )
+        self.assertIn("当前节点: VLESS 节点（Hong Kong 01）", output.getvalue())
 
     def test_standalone_connection_cancel_keeps_config(self):
         config = make_config()
@@ -667,6 +709,32 @@ class FirstSetupFlowTests(unittest.TestCase):
             result = manager.configure_telegram_connection_settings(config)
         self.assertIsNone(result)
         self.assertEqual(config["telegram"], original)
+
+    def test_node_latency_failure_does_not_skip_telegram_test(self):
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {
+                "connection_mode": "node",
+                "node_url": (
+                    "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+                    "?security=tls"
+                ),
+            }
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            manager.telegram_proxy,
+            "measure_node_latency",
+            side_effect=manager.telegram_proxy.ProxyError("timeout"),
+        ), mock.patch.object(
+            manager.guard, "test_telegram", return_value="test_bot"
+        ) as test, mock.patch("sys.stdout", output):
+            result = manager.test_current_telegram(
+                {"telegram": telegram, "force_ipv4": False}
+            )
+        self.assertTrue(result)
+        test.assert_called_once_with(telegram, node_latency_ms=None)
+        self.assertIn("节点延迟测试失败", output.getvalue())
 
     def test_update_notice_is_yellow_in_terminal(self):
         class TtyOutput(io.StringIO):
