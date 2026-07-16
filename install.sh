@@ -936,7 +936,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -1513,8 +1513,20 @@ class PanelHandler(BaseHTTPRequestHandler):
             jar.load(raw)
         except cookies.CookieError:
             return ""
-        morsel = jar.get("ag_session")
+        morsel = jar.get(self._session_cookie_name())
         return morsel.value if morsel else ""
+
+    def _session_cookie_name(self):
+        return "ag_session_secure" if self._browser_uses_https() else "ag_session"
+
+    def _session_cookie_header(self, value, max_age=SESSION_SECONDS):
+        secure = self._browser_uses_https()
+        cookie = "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
+            self._session_cookie_name(), value, int(max_age)
+        )
+        if secure:
+            cookie += "; Secure"
+        return cookie
 
     def _authenticated(self, require_csrf=False):
         session_id = self._session_id()
@@ -1545,13 +1557,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "session"]:
                 session = self.server.get_session(self._session_id())
-                web = get_web_config(self.server.guard.load_config())
                 self._json(
                     {
                         "authenticated": bool(session),
                         "csrf": session.get("csrf") if session else None,
                         "version": APP_VERSION,
-                        "secure_cookie": web["cookie_secure"],
+                        "secure_cookie": self._browser_uses_https(),
                     }
                 )
                 return
@@ -1588,12 +1599,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self.server.delete_session(session_id)
                 self._json(
                     {"ok": True},
-                    extra=[
-                        (
-                            "Set-Cookie",
-                            "ag_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-                        )
-                    ],
+                    extra=[("Set-Cookie", self._session_cookie_header("", max_age=0))],
                 )
                 return
             if parts == ["api", "run"]:
@@ -1643,25 +1649,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.server.record_login_failure(address)
             raise WebPanelError("用户名或密码错误", 401)
         self.server.clear_login_failures(address)
-        if web["cookie_secure"] and not self._browser_uses_https():
-            raise WebPanelError(
-                "当前使用 HTTP 访问，但配置启用了 Secure Cookie。请改用 HTTPS，"
-                "或在终端进入网页控制面板设置并关闭 HTTPS 选项。",
-                409,
-            )
         session_id, session = self.server.create_session()
-        cookie = "ag_session={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
-            session_id, SESSION_SECONDS
-        )
-        if web["cookie_secure"]:
-            cookie += "; Secure"
+        secure = self._browser_uses_https()
         self._json(
             {
                 "ok": True,
                 "csrf": session["csrf"],
-                "secure_cookie": web["cookie_secure"],
+                "secure_cookie": secure,
             },
-            extra=[("Set-Cookie", cookie)],
+            extra=[("Set-Cookie", self._session_cookie_header(session_id))],
         )
 
     def _browser_uses_https(self):
@@ -1844,10 +1840,8 @@ def show_status():
     web = get_web_config(config)
     print("网页面板: {}".format("已启用" if web["enabled"] else "已关闭"))
     print("监听地址: http://{}:{}".format(web["host"], web["port"]))
-    if web["cookie_secure"]:
-        print("浏览器访问: 请使用已配置的 HTTPS 反向代理地址（Secure Cookie 已启用）")
-    else:
-        print("浏览器访问: {}".format(browser_access_url(web)))
+    print("浏览器访问: {}".format(browser_access_url(web)))
+    print("HTTPS 反向代理: 支持（会话 Cookie 自动适配）")
     backend = BACKEND_FILE.read_text(encoding="utf-8").strip() if BACKEND_FILE.exists() else "unknown"
     if backend == "cron":
         print("进程状态: {}".format("运行中" if _pid_is_web_process(_read_pid()) else "未运行"))
@@ -2417,7 +2411,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null, secureCookie: false };
+    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -2558,13 +2552,9 @@ __AG_WEB_PY_EOF__
     $("loginForm").addEventListener("submit", async event => {
       event.preventDefault();
       $("loginError").textContent = "";
-      if (state.secureCookie && location.protocol !== "https:") {
-        $("loginError").textContent = "当前配置要求使用 HTTPS；请改用 HTTPS，或在终端网页面板设置中关闭 HTTPS 选项。";
-        return;
-      }
       const submit = event.currentTarget.querySelector("button[type=submit]");
       submit.disabled = true;
-      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; state.secureCookie = Boolean(data.secure_cookie); $("password").value = ""; showApp(); }
+      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; $("password").value = ""; showApp(); }
       catch (error) { $("loginError").textContent = error.message; }
       finally { submit.disabled = false; }
     });
@@ -2620,7 +2610,7 @@ __AG_WEB_PY_EOF__
     });
 
     (async function init() {
-      try { const data = await api("/api/session"); state.secureCookie = Boolean(data.secure_cookie); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else { showLogin(); if (state.secureCookie && location.protocol !== "https:") $("loginError").textContent = "当前配置要求使用 HTTPS，HTTP 登录无法保存安全会话。"; } }
+      try { const data = await api("/api/session"); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else showLogin(); }
       catch (error) { $("loginError").textContent = error.message; showLogin(); }
     })();
   </script>
@@ -4221,8 +4211,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.3.1"
-LOCAL_RELEASE_ID = "75bdc9ed19e949885ef1ae42c40d927fd1ffc811a4c60367a66d5019475af5a3"
+APP_VERSION = "1.3.2"
+LOCAL_RELEASE_ID = "795382114f2112d80ee012837312f6b6ae21b70e03c7c1e4254fe8e890e21447"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -5124,12 +5114,10 @@ def _set_web_password(web):
 
 def print_web_panel_access(web):
     print("网页监听: http://{}:{}".format(web["host"], web["port"]))
-    if web.get("cookie_secure", False):
-        print("浏览器访问: 请使用已配置的 HTTPS 反向代理地址（Secure Cookie 已启用）")
-        return
     if web["host"] == "127.0.0.1":
         print("SSH 隧道: ssh -L {0}:127.0.0.1:{0} root@服务器IP".format(web["port"]))
     print("浏览器访问: {}".format(web_panel.browser_access_url(web)))
+    print("HTTPS 反向代理: 支持（会话 Cookie 自动适配）")
 
 
 def configure_web_panel(config, initial=False, restart=True):
@@ -5163,10 +5151,7 @@ def configure_web_panel(config, initial=False, restart=True):
     candidate["username"] = prompt(
         "网页登录用户名", current["username"] or "admin", required=True
     )
-    candidate["cookie_secure"] = yes_no(
-        "浏览器实际使用 HTTPS 访问（启用 Secure Cookie）",
-        bool(current.get("cookie_secure", False)),
-    )
+    candidate["cookie_secure"] = False
     if not current.get("password_hash") or yes_no("修改网页登录密码", False):
         _set_web_password(candidate)
     config["web_panel"] = candidate

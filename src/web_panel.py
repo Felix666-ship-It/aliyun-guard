@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -605,8 +605,20 @@ class PanelHandler(BaseHTTPRequestHandler):
             jar.load(raw)
         except cookies.CookieError:
             return ""
-        morsel = jar.get("ag_session")
+        morsel = jar.get(self._session_cookie_name())
         return morsel.value if morsel else ""
+
+    def _session_cookie_name(self):
+        return "ag_session_secure" if self._browser_uses_https() else "ag_session"
+
+    def _session_cookie_header(self, value, max_age=SESSION_SECONDS):
+        secure = self._browser_uses_https()
+        cookie = "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
+            self._session_cookie_name(), value, int(max_age)
+        )
+        if secure:
+            cookie += "; Secure"
+        return cookie
 
     def _authenticated(self, require_csrf=False):
         session_id = self._session_id()
@@ -637,13 +649,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "session"]:
                 session = self.server.get_session(self._session_id())
-                web = get_web_config(self.server.guard.load_config())
                 self._json(
                     {
                         "authenticated": bool(session),
                         "csrf": session.get("csrf") if session else None,
                         "version": APP_VERSION,
-                        "secure_cookie": web["cookie_secure"],
+                        "secure_cookie": self._browser_uses_https(),
                     }
                 )
                 return
@@ -680,12 +691,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self.server.delete_session(session_id)
                 self._json(
                     {"ok": True},
-                    extra=[
-                        (
-                            "Set-Cookie",
-                            "ag_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-                        )
-                    ],
+                    extra=[("Set-Cookie", self._session_cookie_header("", max_age=0))],
                 )
                 return
             if parts == ["api", "run"]:
@@ -735,25 +741,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.server.record_login_failure(address)
             raise WebPanelError("用户名或密码错误", 401)
         self.server.clear_login_failures(address)
-        if web["cookie_secure"] and not self._browser_uses_https():
-            raise WebPanelError(
-                "当前使用 HTTP 访问，但配置启用了 Secure Cookie。请改用 HTTPS，"
-                "或在终端进入网页控制面板设置并关闭 HTTPS 选项。",
-                409,
-            )
         session_id, session = self.server.create_session()
-        cookie = "ag_session={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict".format(
-            session_id, SESSION_SECONDS
-        )
-        if web["cookie_secure"]:
-            cookie += "; Secure"
+        secure = self._browser_uses_https()
         self._json(
             {
                 "ok": True,
                 "csrf": session["csrf"],
-                "secure_cookie": web["cookie_secure"],
+                "secure_cookie": secure,
             },
-            extra=[("Set-Cookie", cookie)],
+            extra=[("Set-Cookie", self._session_cookie_header(session_id))],
         )
 
     def _browser_uses_https(self):
@@ -936,10 +932,8 @@ def show_status():
     web = get_web_config(config)
     print("网页面板: {}".format("已启用" if web["enabled"] else "已关闭"))
     print("监听地址: http://{}:{}".format(web["host"], web["port"]))
-    if web["cookie_secure"]:
-        print("浏览器访问: 请使用已配置的 HTTPS 反向代理地址（Secure Cookie 已启用）")
-    else:
-        print("浏览器访问: {}".format(browser_access_url(web)))
+    print("浏览器访问: {}".format(browser_access_url(web)))
+    print("HTTPS 反向代理: 支持（会话 Cookie 自动适配）")
     backend = BACKEND_FILE.read_text(encoding="utf-8").strip() if BACKEND_FILE.exists() else "unknown"
     if backend == "cron":
         print("进程状态: {}".format("运行中" if _pid_is_web_process(_read_pid()) else "未运行"))

@@ -534,7 +534,7 @@
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null, secureCookie: false };
+    const state = { csrf: null, dashboard: null, scheduleIndex: null, timer: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -675,13 +675,9 @@
     $("loginForm").addEventListener("submit", async event => {
       event.preventDefault();
       $("loginError").textContent = "";
-      if (state.secureCookie && location.protocol !== "https:") {
-        $("loginError").textContent = "当前配置要求使用 HTTPS；请改用 HTTPS，或在终端网页面板设置中关闭 HTTPS 选项。";
-        return;
-      }
       const submit = event.currentTarget.querySelector("button[type=submit]");
       submit.disabled = true;
-      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; state.secureCookie = Boolean(data.secure_cookie); $("password").value = ""; showApp(); }
+      try { const data = await api("/api/login", { method: "POST", body: { username: $("username").value, password: $("password").value } }); state.csrf = data.csrf; $("password").value = ""; showApp(); }
       catch (error) { $("loginError").textContent = error.message; }
       finally { submit.disabled = false; }
     });
@@ -737,7 +733,7 @@
     });
 
     (async function init() {
-      try { const data = await api("/api/session"); state.secureCookie = Boolean(data.secure_cookie); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else { showLogin(); if (state.secureCookie && location.protocol !== "https:") $("loginError").textContent = "当前配置要求使用 HTTPS，HTTP 登录无法保存安全会话。"; } }
+      try { const data = await api("/api/session"); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else showLogin(); }
       catch (error) { $("loginError").textContent = error.message; showLogin(); }
     })();
   </script>

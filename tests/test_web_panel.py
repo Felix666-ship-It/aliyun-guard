@@ -105,13 +105,14 @@ class WebAddressTests(unittest.TestCase):
 
     def test_manager_prints_detected_browser_address(self):
         output = io.StringIO()
-        web = {"host": "0.0.0.0", "port": 8765}
+        web = {"host": "0.0.0.0", "port": 8765, "cookie_secure": True}
         with mock.patch.object(
             web_panel, "detect_primary_ipv4", return_value="10.20.30.40"
         ), mock.patch("sys.stdout", output):
             manager.print_web_panel_access(web)
         self.assertIn("网页监听: http://0.0.0.0:8765", output.getvalue())
         self.assertIn("浏览器访问: http://10.20.30.40:8765", output.getvalue())
+        self.assertIn("HTTPS 反向代理: 支持", output.getvalue())
 
 
 class PayloadTests(unittest.TestCase):
@@ -237,7 +238,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
 
-    def test_session_reports_secure_cookie_requirement(self):
+    def test_session_reports_current_http_transport(self):
         status, data, _headers = self.request("GET", "/api/session")
         self.assertEqual(status, 200)
         self.assertFalse(data["secure_cookie"])
@@ -281,7 +282,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(saved["interval_seconds"], 600)
         self.assertEqual(saved["notification_mode"], "events")
 
-    def test_secure_cookie_rejects_direct_http_login_with_clear_error(self):
+    def test_http_login_works_with_legacy_secure_option_enabled(self):
         self.config["web_panel"]["cookie_secure"] = True
         guard.atomic_write_json(guard.CONFIG_FILE, self.config)
         status, data, headers = self.request(
@@ -290,12 +291,13 @@ class WebApiTests(unittest.TestCase):
             {"username": "admin", "password": "correct-horse"},
             extra_headers={"Origin": "http://127.0.0.1:{}".format(self.port)},
         )
-        self.assertEqual(status, 409)
-        self.assertIn("Secure Cookie", data["error"])
-        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(data["secure_cookie"])
+        self.assertTrue(headers["Set-Cookie"].startswith("ag_session="))
+        self.assertNotIn("; Secure", headers["Set-Cookie"])
 
-    def test_secure_cookie_allows_https_reverse_proxy_origin(self):
-        self.config["web_panel"]["cookie_secure"] = True
+    def test_https_reverse_proxy_uses_independent_secure_cookie(self):
+        self.config["web_panel"]["cookie_secure"] = False
         guard.atomic_write_json(guard.CONFIG_FILE, self.config)
         status, data, headers = self.request(
             "POST",
@@ -305,7 +307,20 @@ class WebApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(data["secure_cookie"])
+        self.assertTrue(headers["Set-Cookie"].startswith("ag_session_secure="))
         self.assertIn("; Secure", headers["Set-Cookie"])
+        secure_cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _data, _headers = self.request(
+            "GET", "/api/dashboard", cookie=secure_cookie
+        )
+        self.assertEqual(status, 401)
+        status, _data, _headers = self.request(
+            "GET",
+            "/api/dashboard",
+            cookie=secure_cookie,
+            extra_headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(status, 200)
 
     def test_run_endpoint_starts_and_finishes_one_cycle(self):
         cookie, csrf = self.login()
