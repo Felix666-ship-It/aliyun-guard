@@ -55,14 +55,22 @@ def private_message(text, user_id=123):
 
 
 def callback(token, user_id=123, callback_id="callback-1"):
+    return button_callback(
+        "ag:confirm:{}".format(token),
+        user_id=user_id,
+        callback_id=callback_id,
+    )
+
+
+def button_callback(data, user_id=123, callback_id="callback-1", message_id=10):
     return {
         "id": callback_id,
         "from": {"id": user_id},
         "message": {
-            "message_id": 10,
+            "message_id": message_id,
             "chat": {"id": user_id, "type": "private"},
         },
-        "data": "ag:confirm:{}".format(token),
+        "data": data,
     }
 
 
@@ -120,6 +128,198 @@ class TelegramControlTests(unittest.TestCase):
         pending = next(iter(self.service.pending.values()))
         self.assertEqual(pending["action"], "check")
 
+    def test_button_navigation_edits_original_message_without_sending(self):
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(self.service, "_send") as send:
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:instances", message_id=77),
+            )
+        send.assert_not_called()
+        api.assert_called_once()
+        method = api.call_args.args[1]
+        data = api.call_args.args[2]
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(data["chat_id"], "123")
+        self.assertEqual(data["message_id"], "77")
+        self.assertIn("监控实例", data["text"])
+        self.assertIn("返回主菜单", data["reply_markup"])
+
+    def test_check_confirmation_and_result_keep_original_message(self):
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(self.service, "_send") as send:
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:req:check", message_id=79),
+            )
+        send.assert_not_called()
+        token, pending = next(iter(self.service.pending.items()))
+        self.assertEqual(pending["message_id"], 79)
+        self.assertEqual(api.call_args.args[1], "editMessageText")
+
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(self.service, "_send") as send, mock.patch.object(
+            guard, "cycle_lock", return_value=contextlib.nullcontext(True)
+        ), mock.patch.object(
+            guard, "run_cycle", return_value=0
+        ), mock.patch.object(
+            guard, "load_state", return_value={"last_summary": "检测完成"}
+        ):
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:confirm:{}".format(token), message_id=79),
+            )
+        send.assert_not_called()
+        self.assertGreaterEqual(api.call_count, 2)
+        for call in api.call_args_list:
+            self.assertEqual(call.args[1], "editMessageText")
+            self.assertEqual(call.args[2]["message_id"], "79")
+        self.assertIn("检测完成", api.call_args.args[2]["text"])
+
+    def test_leaving_confirmation_page_invalidates_pending_action(self):
+        with mock.patch.object(self.service, "_send"), mock.patch.object(
+            guard, "load_config", return_value=self.config
+        ):
+            self.service._handle_message(
+                self.config,
+                self.telegram,
+                {123},
+                private_message("/poweroff 1"),
+            )
+        self.assertTrue(self.service.pending)
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ):
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:menu", message_id=80),
+            )
+        self.assertFalse(self.service.pending)
+
+    def test_schedule_menu_is_part_of_single_message_panel(self):
+        markup = self.service._menu_markup()
+        serialized = str(markup)
+        self.assertIn("定时计划", serialized)
+        self.assertIn("ag:schedule", serialized)
+        self.assertIn("/schedule", self.service._main_text())
+
+    def test_schedule_detail_and_back_navigation_edit_original_message(self):
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(self.service, "_send") as send:
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:sched:view:0", message_id=88),
+            )
+        send.assert_not_called()
+        data = api.call_args.args[2]
+        self.assertEqual(api.call_args.args[1], "editMessageText")
+        self.assertEqual(data["message_id"], "88")
+        self.assertIn("定时开关机", data["text"])
+        self.assertIn("修改时间", data["reply_markup"])
+        self.assertIn("返回实例列表", data["reply_markup"])
+
+    def test_schedule_toggle_saves_and_updates_same_message(self):
+        config = make_config()
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(
+            guard, "cycle_lock", return_value=contextlib.nullcontext(True)
+        ), mock.patch.object(
+            guard, "load_config", return_value=config
+        ), mock.patch.object(
+            guard, "atomic_write_json"
+        ) as write:
+            self.service._handle_callback(
+                config,
+                config["telegram"],
+                {123},
+                button_callback("ag:sched:set:0:1", message_id=91),
+            )
+        self.assertTrue(config["users"][0]["schedule"]["enabled"])
+        write.assert_called_once_with(guard.CONFIG_FILE, config, mode=0o600)
+        data = api.call_args.args[2]
+        self.assertEqual(api.call_args.args[1], "editMessageText")
+        self.assertEqual(data["message_id"], "91")
+        self.assertIn("计划状态: 已启用", data["text"])
+
+    def test_schedule_time_input_updates_original_panel_message(self):
+        config = make_config()
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ):
+            self.service._handle_callback(
+                config,
+                config["telegram"],
+                {123},
+                button_callback("ag:sched:edit:0", message_id=92),
+            )
+        self.assertIn(123, self.service.schedule_inputs)
+        with mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(
+            guard, "cycle_lock", return_value=contextlib.nullcontext(True)
+        ), mock.patch.object(
+            guard, "load_config", return_value=config
+        ), mock.patch.object(
+            guard, "atomic_write_json"
+        ) as write:
+            self.service._handle_message(
+                config,
+                config["telegram"],
+                {123},
+                private_message("22:30 06:15"),
+            )
+        self.assertEqual(
+            config["users"][0]["schedule"],
+            {"enabled": False, "start_time": "22:30", "stop_time": "06:15"},
+        )
+        self.assertNotIn(123, self.service.schedule_inputs)
+        write.assert_called_once_with(guard.CONFIG_FILE, config, mode=0o600)
+        data = api.call_args.args[2]
+        self.assertEqual(api.call_args.args[1], "editMessageText")
+        self.assertEqual(data["message_id"], "92")
+        self.assertIn("每日开机: 22:30", data["text"])
+
+    def test_invalid_schedule_time_keeps_input_open_on_same_message(self):
+        config = make_config()
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ):
+            self.service._handle_callback(
+                config,
+                config["telegram"],
+                {123},
+                button_callback("ag:sched:edit:0", message_id=93),
+            )
+        with mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api, mock.patch.object(guard, "atomic_write_json") as write:
+            self.service._handle_message(
+                config,
+                config["telegram"],
+                {123},
+                private_message("08:00 08:00"),
+            )
+        self.assertIn(123, self.service.schedule_inputs)
+        write.assert_not_called()
+        data = api.call_args.args[2]
+        self.assertEqual(data["message_id"], "93")
+        self.assertIn("不能相同", data["text"])
+
     def test_stopped_instance_needs_two_confirmations_and_threshold_override(self):
         with mock.patch.object(self.service, "_send"), mock.patch.object(
             guard, "load_config", return_value=self.config
@@ -135,7 +335,7 @@ class TelegramControlTests(unittest.TestCase):
 
         with mock.patch.object(self.service, "_send"), mock.patch.object(
             self.service, "_answer_callback"
-        ), mock.patch.object(self.service, "_remove_buttons"), mock.patch.object(
+        ), mock.patch.object(
             guard, "cycle_lock", return_value=contextlib.nullcontext(True)
         ), mock.patch.object(
             guard, "load_config", return_value=self.config
@@ -163,7 +363,7 @@ class TelegramControlTests(unittest.TestCase):
         }
         with mock.patch.object(self.service, "_send"), mock.patch.object(
             self.service, "_answer_callback"
-        ), mock.patch.object(self.service, "_remove_buttons"), mock.patch.object(
+        ), mock.patch.object(
             guard, "load_config", return_value=self.config
         ), mock.patch.object(
             web_panel, "control_instance", return_value=result
@@ -199,7 +399,7 @@ class TelegramControlTests(unittest.TestCase):
         first_token = next(iter(self.service.pending))
         with mock.patch.object(self.service, "_send"), mock.patch.object(
             self.service, "_answer_callback"
-        ), mock.patch.object(self.service, "_remove_buttons"), mock.patch.object(
+        ), mock.patch.object(
             guard, "cycle_lock", return_value=contextlib.nullcontext(True)
         ), mock.patch.object(
             guard, "load_config", return_value=self.config
