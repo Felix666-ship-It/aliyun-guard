@@ -322,6 +322,30 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(data["secure_cookie"])
 
+    def test_update_progress_is_available_during_service_restart(self):
+        progress_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_panel.web_actions, "APP_DIR", progress_dir):
+            status, data, _headers = self.request("GET", "/api/update/progress")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "idle")
+        self.assertEqual(data["progress"], 0)
+
+    def test_update_install_passes_target_version(self):
+        cookie, csrf = self.login()
+        with mock.patch.object(
+            web_panel.web_actions, "install_update", return_value="update-unit"
+        ) as install:
+            status, data, _headers = self.request(
+                "POST",
+                "/api/update/install",
+                {"target_version": "1.5.4"},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 202)
+        self.assertEqual(data["pid"], "update-unit")
+        install.assert_called_once_with("1.5.4")
+
     def test_login_dashboard_and_session_do_not_leak_credentials(self):
         cookie, _csrf = self.login()
         status, data, _headers = self.request("GET", "/api/dashboard", cookie=cookie)
@@ -646,6 +670,15 @@ class ManualControlTests(unittest.TestCase):
 
 
 class WebHtmlTests(unittest.TestCase):
+    def test_update_panel_has_real_progress_and_reconnect_polling(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertIn('id="updateProgressBar"', html)
+        self.assertIn('id="updateProgressPercent"', html)
+        self.assertIn('/api/update/progress', html)
+        self.assertIn('async function pollUpdateProgress()', html)
+        self.assertIn('后台服务重启中，正在重新连接', html)
+        self.assertIn('target_version: state.update.latest_version', html)
+
     def test_sparkline_points_keep_fixed_size_and_edge_padding(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertIn("const chartLeft = 4, chartRight = 316", html)

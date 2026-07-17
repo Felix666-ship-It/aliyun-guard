@@ -1106,7 +1106,7 @@ class UpdateTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
-        ), mock.patch.object(manager.subprocess, "call", return_value=0) as run:
+        ) as download, mock.patch.object(manager.subprocess, "call", return_value=0) as run:
             with mock.patch("sys.stdout", output):
                 result = manager.update_from_github(
                     confirm_update=False,
@@ -1118,6 +1118,11 @@ class UpdateTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
+        release_base = manager.UPDATE_RELEASES_URL + "/download/v1.3.0"
+        self.assertEqual(
+            [call.args[0] for call in download.call_args_list],
+            [release_base + "/install.sh", release_base + "/install.sh.sha256"],
+        )
 
     def test_github_update_rejects_checksum_mismatch(self):
         installer = b"#!/bin/sh\nexit 0\n"

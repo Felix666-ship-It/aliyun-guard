@@ -214,6 +214,52 @@ class TelegramControlTests(unittest.TestCase):
         self.assertIn("ag:schedule", serialized)
         self.assertIn("/schedule", self.service._main_text())
 
+    def test_main_menu_has_icons_and_close_button(self):
+        serialized = str(self.service._menu_markup())
+        for icon in ("📊", "🖥", "🔍", "▶", "⏹", "🕒", "✖"):
+            self.assertIn(icon, serialized)
+        self.assertIn("关闭菜单", serialized)
+        self.assertIn("ag:close", serialized)
+
+    def test_close_button_deletes_original_menu_message(self):
+        with mock.patch.object(self.service, "_answer_callback") as answer, mock.patch.object(
+            self.service, "_telegram_api", return_value=True
+        ) as api:
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:close", message_id=81),
+            )
+        answer.assert_called_once_with(self.telegram, "callback-1", "菜单已关闭")
+        api.assert_called_once_with(
+            self.telegram,
+            "deleteMessage",
+            {"chat_id": "123", "message_id": "81"},
+        )
+
+    def test_close_button_falls_back_to_collapsed_message(self):
+        calls = []
+
+        def telegram_api(_telegram, method, data):
+            calls.append((method, data))
+            if method == "deleteMessage":
+                raise RuntimeError("message is too old")
+            return True
+
+        with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
+            self.service, "_telegram_api", side_effect=telegram_api
+        ):
+            self.service._handle_callback(
+                self.config,
+                self.telegram,
+                {123},
+                button_callback("ag:close", message_id=82),
+            )
+        self.assertEqual([item[0] for item in calls], ["deleteMessage", "editMessageText"])
+        self.assertIn("菜单已关闭", calls[-1][1]["text"])
+        self.assertIn('"inline_keyboard": []', calls[-1][1]["reply_markup"])
+
     def test_schedule_detail_and_back_navigation_edit_original_message(self):
         with mock.patch.object(self.service, "_answer_callback"), mock.patch.object(
             self.service, "_telegram_api", return_value=True

@@ -283,7 +283,7 @@ class WebActionTests(unittest.TestCase):
         ) as run, mock.patch.object(
             web_actions, "detached_process"
         ) as detached:
-            unit = web_actions.install_update()
+            unit = web_actions.install_update("1.5.4")
         self.assertTrue(unit.startswith("aliyun-guard-update-"))
         detached.assert_not_called()
         launcher = run.call_args.args[0]
@@ -292,6 +292,15 @@ class WebActionTests(unittest.TestCase):
         self.assertIn("--unit={}".format(unit), launcher)
         self.assertIn(str(manager_path), launcher)
         self.assertIn(str(app_dir / "logs" / "web-update.log"), launcher)
+        self.assertIn("-u", launcher)
+        self.assertIn(web_actions.UPDATE_EXIT_MARKER, launcher[6])
+        state = json.loads(
+            (app_dir / "logs" / web_actions.UPDATE_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["target_version"], "1.5.4")
+        self.assertEqual(state["job"], unit)
 
     def test_systemd_update_without_systemd_run_reports_cli_fallback(self):
         app_dir = Path(self.temp.name) / "app"
@@ -317,10 +326,57 @@ class WebActionTests(unittest.TestCase):
             web_actions, "detached_process", return_value=77
         ) as detached:
             self.assertEqual(web_actions.install_update(), 77)
-        detached.assert_called_once_with(
-            [sys.executable, str(manager_path), "update", "--yes"],
-            "web-update.log",
-        )
+        command, log_name = detached.call_args.args
+        self.assertEqual(command[:2], ["/bin/sh", "-c"])
+        self.assertIn(web_actions.UPDATE_EXIT_MARKER, command[2])
+        self.assertIn(sys.executable, command)
+        self.assertIn("-u", command)
+        self.assertIn(str(manager_path), command)
+        self.assertEqual(log_name, web_actions.UPDATE_LOG_NAME)
+
+    def test_update_progress_tracks_installer_stages_and_success(self):
+        app_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            log_path = app_dir / "logs" / web_actions.UPDATE_LOG_NAME
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("正在下载更新和校验文件...\n")
+                handle.write("SHA-256 校验通过\n")
+                handle.write("[3/6] 写入程序文件...\n")
+            running = web_actions.update_progress()
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(running["progress"], 62)
+            self.assertEqual(running["target_version"], "1.5.4")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("GitHub 最新版本已安装，后台服务已重启。\n")
+                handle.write(web_actions.UPDATE_EXIT_MARKER + "0\n")
+            complete = web_actions.update_progress()
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["progress"], 100)
+
+    def test_update_progress_reports_nonzero_exit(self):
+        app_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            log_path = app_dir / "logs" / web_actions.UPDATE_LOG_NAME
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("[2/6] 创建 Python 独立环境...\n")
+                handle.write(web_actions.UPDATE_EXIT_MARKER + "2\n")
+            result = web_actions.update_progress()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["progress"], 48)
+
+    def test_second_web_update_is_rejected_while_job_is_running(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        (app_dir / "manager.py").write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.install_update("1.5.4")
+        self.assertEqual(raised.exception.status, 409)
+        self.assertIn("正在运行", str(raised.exception))
 
     def test_update_check_identifies_container_deployment(self):
         with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "1"}), mock.patch(

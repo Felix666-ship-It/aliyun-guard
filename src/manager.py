@@ -24,16 +24,25 @@ import web_panel
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 CONTROL_FILE = APP_DIR / "control.sh"
-UPDATE_BASE_URL = os.environ.get(
-    "ALIYUN_GUARD_UPDATE_BASE",
-    "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
-).rstrip("/")
-APP_VERSION = "1.5.3"
+UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
+UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
+UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
+UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
+APP_VERSION = "1.5.4"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
+
+
+def update_asset_base_url(version=None):
+    if UPDATE_CUSTOM_BASE_URL:
+        return UPDATE_CUSTOM_BASE_URL
+    if version:
+        normalized = str(version).strip().lstrip("v")
+        return UPDATE_RELEASES_URL + "/download/v" + normalized
+    return UPDATE_BASE_URL
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -1248,7 +1257,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("最新版本: v{}".format(target_version))
     else:
         print("最新版本: 暂时无法获取（仍可继续更新）")
-    print("更新来源: {}".format(UPDATE_BASE_URL))
+    asset_base_url = update_asset_base_url(target_version)
+    print("更新来源: {}".format(asset_base_url))
     print("现有 config.json、state.json 和日志会保留。")
     confirm_text = "下载并安装 GitHub main 分支最新版本"
     if target_version:
@@ -1257,8 +1267,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("已取消更新。")
         return None
 
-    installer_url = UPDATE_BASE_URL + "/install.sh"
-    checksum_url = UPDATE_BASE_URL + "/install.sh.sha256"
+    installer_url = asset_base_url + "/install.sh"
+    checksum_url = asset_base_url + "/install.sh.sha256"
     print("正在下载更新和校验文件...")
     try:
         installer = download_update_file(installer_url)

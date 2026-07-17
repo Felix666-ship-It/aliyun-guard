@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -927,6 +927,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parts == ["api", "update", "progress"]:
+                self._json(web_actions.update_progress())
+                return
             self._authenticated()
             if parts == ["api", "dashboard"]:
                 with self.server.job_lock:
@@ -1066,8 +1069,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": "后台服务重启已安排"}, 202)
                 return
             if parts == ["api", "update", "install"]:
-                self._read_json()
-                pid = web_actions.install_update()
+                data = self._read_json()
+                pid = web_actions.install_update(data.get("target_version"))
                 self._json({"ok": True, "pid": pid}, 202)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "instances"]:

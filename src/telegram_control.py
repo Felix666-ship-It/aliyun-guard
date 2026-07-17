@@ -303,20 +303,43 @@ class TelegramControlService:
         except Exception as exc:
             self.guard.LOGGER.warning("Telegram 回调确认失败: %s", self.guard.compact_error(exc))
 
+    def _close_menu(self, telegram, callback):
+        chat_id, message_id = self._callback_message_ref(callback)
+        if chat_id is None:
+            return None
+        try:
+            return self._telegram_api(
+                telegram,
+                "deleteMessage",
+                {"chat_id": str(chat_id), "message_id": str(message_id)},
+            )
+        except Exception as exc:
+            self.guard.LOGGER.warning(
+                "Telegram 菜单删除失败，改为收起按钮: %s",
+                self.guard.compact_error(exc),
+            )
+            return self._edit(
+                telegram,
+                chat_id,
+                message_id,
+                "Aliyun Guard Bot 菜单已关闭。\n\n发送 /help 可重新打开菜单。",
+            )
+
     @staticmethod
     def _menu_markup():
         return {
             "inline_keyboard": [
                 [
-                    {"text": "状态", "callback_data": "ag:status"},
-                    {"text": "实例", "callback_data": "ag:instances"},
+                    {"text": "📊 状态", "callback_data": "ag:status"},
+                    {"text": "🖥 实例", "callback_data": "ag:instances"},
                 ],
-                [{"text": "立即检测", "callback_data": "ag:req:check"}],
+                [{"text": "🔍 立即检测", "callback_data": "ag:req:check"}],
                 [
-                    {"text": "实例开机", "callback_data": "ag:list:start"},
-                    {"text": "实例关机", "callback_data": "ag:list:stop"},
+                    {"text": "▶ 实例开机", "callback_data": "ag:list:start"},
+                    {"text": "⏹ 实例关机", "callback_data": "ag:list:stop"},
                 ],
-                [{"text": "定时计划", "callback_data": "ag:schedule"}],
+                [{"text": "🕒 定时计划", "callback_data": "ag:schedule"}],
+                [{"text": "✖ 关闭菜单", "callback_data": "ag:close"}],
             ]
         }
 
@@ -1052,6 +1075,10 @@ class TelegramControlService:
         if data == "ag:menu":
             self._answer_callback(telegram, callback_id)
             self._send_help(telegram, chat_id, message_id=message_id)
+            return
+        if data == "ag:close":
+            self._answer_callback(telegram, callback_id, "菜单已关闭")
+            self._close_menu(telegram, callback)
             return
         if data == "ag:status":
             self._answer_callback(telegram, callback_id)

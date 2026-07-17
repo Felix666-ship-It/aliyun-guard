@@ -3,6 +3,7 @@
 """Management operations exposed by the authenticated web panel."""
 
 import copy
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,9 @@ import telegram_proxy
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+UPDATE_LOG_NAME = "web-update.log"
+UPDATE_STATE_NAME = "web-update-state.json"
+UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -699,6 +703,140 @@ def check_update():
     }
 
 
+def _update_paths():
+    log_dir = APP_DIR / "logs"
+    return log_dir / UPDATE_LOG_NAME, log_dir / UPDATE_STATE_NAME
+
+
+def _write_update_state(data):
+    _log_path, state_path = _update_paths()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_name(state_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(str(temporary), str(state_path))
+
+
+def _read_update_state():
+    _log_path, state_path = _update_paths()
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _prepare_update_tracking(target_version=None, backend=""):
+    log_path, _state_path = _update_paths()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("网页更新任务已启动。\n", encoding="utf-8")
+    os.chmod(log_path, 0o600)
+    version = str(target_version or "").strip()
+    if len(version) > 32 or any(
+        character not in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+"
+        for character in version
+    ):
+        version = ""
+    state = {
+        "status": "running",
+        "started_at": int(time.time()),
+        "target_version": version or None,
+        "backend": str(backend or ""),
+        "job": None,
+    }
+    _write_update_state(state)
+    return state
+
+
+def _update_log_text(limit=262144):
+    log_path, _state_path = _update_paths()
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - int(limit)), os.SEEK_SET)
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def update_progress():
+    state = _read_update_state()
+    text = _update_log_text()
+    if not state and not text:
+        return {
+            "status": "idle",
+            "progress": 0,
+            "message": "尚未启动更新",
+            "target_version": None,
+        }
+
+    stages = [
+        ("网页更新任务已启动", 3, "正在启动更新任务"),
+        ("正在下载更新和校验文件", 12, "正在下载正式版文件"),
+        ("SHA-256 校验通过", 25, "文件校验通过"),
+        ("[1/6]", 35, "正在检查系统依赖"),
+        ("[2/6]", 48, "正在更新 Python 环境"),
+        ("[3/6]", 62, "正在写入程序文件"),
+        ("[4/6]", 74, "正在恢复本机配置"),
+        ("[5/6]", 86, "正在重启后台服务"),
+        ("[6/6]", 95, "正在验证更新结果"),
+        ("安装完成。", 98, "程序文件已安装"),
+    ]
+    progress = 0
+    message = "等待更新进程输出"
+    for marker, value, label in stages:
+        if marker in text and value >= progress:
+            progress = value
+            message = label
+
+    exit_code = None
+    if UPDATE_EXIT_MARKER in text:
+        tail = text.rsplit(UPDATE_EXIT_MARKER, 1)[-1].splitlines()[0].strip()
+        try:
+            exit_code = int(tail)
+        except ValueError:
+            exit_code = None
+    success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
+    started_at = int(state.get("started_at", 0) or 0)
+    timed_out = bool(started_at and time.time() - started_at > 3600)
+    failure = (
+        state.get("status") == "error"
+        or timed_out
+        or exit_code not in (None, 0)
+        or any(
+            marker in text
+            for marker in (
+                "更新下载失败:",
+                "执行更新失败:",
+                "更新安装器退出码:",
+                "错误:",
+            )
+        )
+    )
+    if success:
+        status = "success"
+        progress = 100
+        message = "更新完成，后台服务已重新加载"
+    elif failure:
+        status = "error"
+        message = "更新失败，请查看 web-update.log"
+    else:
+        status = "running"
+
+    return {
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "target_version": state.get("target_version"),
+        "started_at": state.get("started_at"),
+        "job": state.get("job"),
+    }
+
+
 def detached_process(command, log_name):
     log_path = APP_DIR / "logs" / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -719,6 +857,21 @@ def detached_process(command, log_name):
     return process.pid
 
 
+def _update_wrapper_command(command, log_path):
+    shell_command = (
+        'log_path=$1; shift; "$@" >>"$log_path" 2>&1; '
+        'rc=$?; printf "\\n{}%s\\n" "$rc" >>"$log_path"; exit "$rc"'
+    ).format(UPDATE_EXIT_MARKER)
+    return [
+        "/bin/sh",
+        "-c",
+        shell_command,
+        "aliyun-guard-update",
+        str(log_path),
+        *command,
+    ]
+
+
 def systemd_update_process(command, log_name):
     systemd_run = shutil.which("systemd-run")
     if not systemd_run:
@@ -732,18 +885,12 @@ def systemd_update_process(command, log_name):
     log_path.touch(mode=0o600, exist_ok=True)
     os.chmod(log_path, 0o600)
     unit = "aliyun-guard-update-{}-{}".format(os.getpid(), int(time.time() * 1000))
-    shell_command = 'log_path=$1; shift; exec "$@" >>"$log_path" 2>&1'
     launcher = [
         systemd_run,
         "--quiet",
         "--no-block",
         "--unit={}".format(unit),
-        "/bin/sh",
-        "-c",
-        shell_command,
-        "aliyun-guard-update",
-        str(log_path),
-        *command,
+        *_update_wrapper_command(command, log_path),
     ]
     try:
         result = subprocess.run(
@@ -783,7 +930,7 @@ def service_command(action):
         raise ManagementError("服务重启失败: {}".format(exc), 500)
 
 
-def install_update():
+def install_update(target_version=None):
     if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
         raise ManagementError(
             "Docker 部署请在宿主机执行 git pull && docker compose up -d --build",
@@ -792,17 +939,33 @@ def install_update():
     manager_path = APP_DIR / "manager.py"
     if not manager_path.exists():
         raise ManagementError("更新程序不存在", 500)
-    command = [sys.executable, str(manager_path), "update", "--yes"]
+    if update_progress().get("status") == "running":
+        raise ManagementError("已有更新任务正在运行，请等待当前任务完成", 409)
+    command = [sys.executable, "-u", str(manager_path), "update", "--yes"]
     backend_path = APP_DIR / "service_backend"
     try:
         backend = backend_path.read_text(encoding="utf-8").strip().lower()
     except OSError:
         backend = ""
+    state = _prepare_update_tracking(target_version=target_version, backend=backend)
     try:
         if backend == "systemd":
-            return systemd_update_process(command, "web-update.log")
-        return detached_process(command, "web-update.log")
-    except ManagementError:
+            job = systemd_update_process(command, UPDATE_LOG_NAME)
+        else:
+            log_path, _state_path = _update_paths()
+            job = detached_process(
+                _update_wrapper_command(command, log_path), UPDATE_LOG_NAME
+            )
+        state["job"] = str(job)
+        _write_update_state(state)
+        return job
+    except ManagementError as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise
     except Exception as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise ManagementError("启动更新失败: {}".format(exc), 500)

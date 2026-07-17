@@ -1211,20 +1211,43 @@ class TelegramControlService:
         except Exception as exc:
             self.guard.LOGGER.warning("Telegram 回调确认失败: %s", self.guard.compact_error(exc))
 
+    def _close_menu(self, telegram, callback):
+        chat_id, message_id = self._callback_message_ref(callback)
+        if chat_id is None:
+            return None
+        try:
+            return self._telegram_api(
+                telegram,
+                "deleteMessage",
+                {"chat_id": str(chat_id), "message_id": str(message_id)},
+            )
+        except Exception as exc:
+            self.guard.LOGGER.warning(
+                "Telegram 菜单删除失败，改为收起按钮: %s",
+                self.guard.compact_error(exc),
+            )
+            return self._edit(
+                telegram,
+                chat_id,
+                message_id,
+                "Aliyun Guard Bot 菜单已关闭。\n\n发送 /help 可重新打开菜单。",
+            )
+
     @staticmethod
     def _menu_markup():
         return {
             "inline_keyboard": [
                 [
-                    {"text": "状态", "callback_data": "ag:status"},
-                    {"text": "实例", "callback_data": "ag:instances"},
+                    {"text": "📊 状态", "callback_data": "ag:status"},
+                    {"text": "🖥 实例", "callback_data": "ag:instances"},
                 ],
-                [{"text": "立即检测", "callback_data": "ag:req:check"}],
+                [{"text": "🔍 立即检测", "callback_data": "ag:req:check"}],
                 [
-                    {"text": "实例开机", "callback_data": "ag:list:start"},
-                    {"text": "实例关机", "callback_data": "ag:list:stop"},
+                    {"text": "▶ 实例开机", "callback_data": "ag:list:start"},
+                    {"text": "⏹ 实例关机", "callback_data": "ag:list:stop"},
                 ],
-                [{"text": "定时计划", "callback_data": "ag:schedule"}],
+                [{"text": "🕒 定时计划", "callback_data": "ag:schedule"}],
+                [{"text": "✖ 关闭菜单", "callback_data": "ag:close"}],
             ]
         }
 
@@ -1961,6 +1984,10 @@ class TelegramControlService:
             self._answer_callback(telegram, callback_id)
             self._send_help(telegram, chat_id, message_id=message_id)
             return
+        if data == "ag:close":
+            self._answer_callback(telegram, callback_id, "菜单已关闭")
+            self._close_menu(telegram, callback)
+            return
         if data == "ag:status":
             self._answer_callback(telegram, callback_id)
             self._show_status(telegram, chat_id, config, message_id=message_id)
@@ -2243,6 +2270,7 @@ __AG_CONTROL_PY_EOF__
 """Management operations exposed by the authenticated web panel."""
 
 import copy
+import json
 import os
 from pathlib import Path
 import shutil
@@ -2254,6 +2282,9 @@ import telegram_proxy
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+UPDATE_LOG_NAME = "web-update.log"
+UPDATE_STATE_NAME = "web-update-state.json"
+UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -2939,6 +2970,140 @@ def check_update():
     }
 
 
+def _update_paths():
+    log_dir = APP_DIR / "logs"
+    return log_dir / UPDATE_LOG_NAME, log_dir / UPDATE_STATE_NAME
+
+
+def _write_update_state(data):
+    _log_path, state_path = _update_paths()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_name(state_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(str(temporary), str(state_path))
+
+
+def _read_update_state():
+    _log_path, state_path = _update_paths()
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _prepare_update_tracking(target_version=None, backend=""):
+    log_path, _state_path = _update_paths()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("网页更新任务已启动。\n", encoding="utf-8")
+    os.chmod(log_path, 0o600)
+    version = str(target_version or "").strip()
+    if len(version) > 32 or any(
+        character not in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+"
+        for character in version
+    ):
+        version = ""
+    state = {
+        "status": "running",
+        "started_at": int(time.time()),
+        "target_version": version or None,
+        "backend": str(backend or ""),
+        "job": None,
+    }
+    _write_update_state(state)
+    return state
+
+
+def _update_log_text(limit=262144):
+    log_path, _state_path = _update_paths()
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - int(limit)), os.SEEK_SET)
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def update_progress():
+    state = _read_update_state()
+    text = _update_log_text()
+    if not state and not text:
+        return {
+            "status": "idle",
+            "progress": 0,
+            "message": "尚未启动更新",
+            "target_version": None,
+        }
+
+    stages = [
+        ("网页更新任务已启动", 3, "正在启动更新任务"),
+        ("正在下载更新和校验文件", 12, "正在下载正式版文件"),
+        ("SHA-256 校验通过", 25, "文件校验通过"),
+        ("[1/6]", 35, "正在检查系统依赖"),
+        ("[2/6]", 48, "正在更新 Python 环境"),
+        ("[3/6]", 62, "正在写入程序文件"),
+        ("[4/6]", 74, "正在恢复本机配置"),
+        ("[5/6]", 86, "正在重启后台服务"),
+        ("[6/6]", 95, "正在验证更新结果"),
+        ("安装完成。", 98, "程序文件已安装"),
+    ]
+    progress = 0
+    message = "等待更新进程输出"
+    for marker, value, label in stages:
+        if marker in text and value >= progress:
+            progress = value
+            message = label
+
+    exit_code = None
+    if UPDATE_EXIT_MARKER in text:
+        tail = text.rsplit(UPDATE_EXIT_MARKER, 1)[-1].splitlines()[0].strip()
+        try:
+            exit_code = int(tail)
+        except ValueError:
+            exit_code = None
+    success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
+    started_at = int(state.get("started_at", 0) or 0)
+    timed_out = bool(started_at and time.time() - started_at > 3600)
+    failure = (
+        state.get("status") == "error"
+        or timed_out
+        or exit_code not in (None, 0)
+        or any(
+            marker in text
+            for marker in (
+                "更新下载失败:",
+                "执行更新失败:",
+                "更新安装器退出码:",
+                "错误:",
+            )
+        )
+    )
+    if success:
+        status = "success"
+        progress = 100
+        message = "更新完成，后台服务已重新加载"
+    elif failure:
+        status = "error"
+        message = "更新失败，请查看 web-update.log"
+    else:
+        status = "running"
+
+    return {
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "target_version": state.get("target_version"),
+        "started_at": state.get("started_at"),
+        "job": state.get("job"),
+    }
+
+
 def detached_process(command, log_name):
     log_path = APP_DIR / "logs" / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2959,6 +3124,21 @@ def detached_process(command, log_name):
     return process.pid
 
 
+def _update_wrapper_command(command, log_path):
+    shell_command = (
+        'log_path=$1; shift; "$@" >>"$log_path" 2>&1; '
+        'rc=$?; printf "\\n{}%s\\n" "$rc" >>"$log_path"; exit "$rc"'
+    ).format(UPDATE_EXIT_MARKER)
+    return [
+        "/bin/sh",
+        "-c",
+        shell_command,
+        "aliyun-guard-update",
+        str(log_path),
+        *command,
+    ]
+
+
 def systemd_update_process(command, log_name):
     systemd_run = shutil.which("systemd-run")
     if not systemd_run:
@@ -2972,18 +3152,12 @@ def systemd_update_process(command, log_name):
     log_path.touch(mode=0o600, exist_ok=True)
     os.chmod(log_path, 0o600)
     unit = "aliyun-guard-update-{}-{}".format(os.getpid(), int(time.time() * 1000))
-    shell_command = 'log_path=$1; shift; exec "$@" >>"$log_path" 2>&1'
     launcher = [
         systemd_run,
         "--quiet",
         "--no-block",
         "--unit={}".format(unit),
-        "/bin/sh",
-        "-c",
-        shell_command,
-        "aliyun-guard-update",
-        str(log_path),
-        *command,
+        *_update_wrapper_command(command, log_path),
     ]
     try:
         result = subprocess.run(
@@ -3023,7 +3197,7 @@ def service_command(action):
         raise ManagementError("服务重启失败: {}".format(exc), 500)
 
 
-def install_update():
+def install_update(target_version=None):
     if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
         raise ManagementError(
             "Docker 部署请在宿主机执行 git pull && docker compose up -d --build",
@@ -3032,19 +3206,35 @@ def install_update():
     manager_path = APP_DIR / "manager.py"
     if not manager_path.exists():
         raise ManagementError("更新程序不存在", 500)
-    command = [sys.executable, str(manager_path), "update", "--yes"]
+    if update_progress().get("status") == "running":
+        raise ManagementError("已有更新任务正在运行，请等待当前任务完成", 409)
+    command = [sys.executable, "-u", str(manager_path), "update", "--yes"]
     backend_path = APP_DIR / "service_backend"
     try:
         backend = backend_path.read_text(encoding="utf-8").strip().lower()
     except OSError:
         backend = ""
+    state = _prepare_update_tracking(target_version=target_version, backend=backend)
     try:
         if backend == "systemd":
-            return systemd_update_process(command, "web-update.log")
-        return detached_process(command, "web-update.log")
-    except ManagementError:
+            job = systemd_update_process(command, UPDATE_LOG_NAME)
+        else:
+            log_path, _state_path = _update_paths()
+            job = detached_process(
+                _update_wrapper_command(command, log_path), UPDATE_LOG_NAME
+            )
+        state["job"] = str(job)
+        _write_update_state(state)
+        return job
+    except ManagementError as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise
     except Exception as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise ManagementError("启动更新失败: {}".format(exc), 500)
 __AG_WEB_ACTIONS_PY_EOF__
     cat > "$APP_DIR/web_panel.py" <<'__AG_WEB_PY_EOF__'
@@ -3080,7 +3270,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -3977,6 +4167,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parts == ["api", "update", "progress"]:
+                self._json(web_actions.update_progress())
+                return
             self._authenticated()
             if parts == ["api", "dashboard"]:
                 with self.server.job_lock:
@@ -4116,8 +4309,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": "后台服务重启已安排"}, 202)
                 return
             if parts == ["api", "update", "install"]:
-                self._read_json()
-                pid = web_actions.install_update()
+                data = self._read_json()
+                pid = web_actions.install_update(data.get("target_version"))
                 self._json({"ok": True, "pid": pid}, 202)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "instances"]:
@@ -4828,6 +5021,17 @@ __AG_WEB_PY_EOF__
     .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
     .inline-result { min-height: 40px; margin-top: 12px; padding: 10px 11px; border-left: 3px solid var(--cyan); background: #eef7f8; color: #30545c; border-radius: 3px; overflow-wrap: anywhere; }
     .inline-result.error { border-left-color: var(--red); background: #fff3f2; color: #7f302c; }
+    .update-progress { margin-top: 12px; display: grid; gap: 7px; }
+    .update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
+    .update-progress-head span { min-width: 0; overflow-wrap: anywhere; }
+    .update-progress-head strong { color: var(--ink); flex: 0 0 auto; }
+    .update-progress progress { width: 100%; height: 10px; display: block; border: 0; border-radius: 3px; overflow: hidden; background: #e2e8e4; accent-color: var(--brand); }
+    .update-progress progress::-webkit-progress-bar { background: #e2e8e4; }
+    .update-progress progress::-webkit-progress-value { background: var(--brand); transition: width .25s ease; }
+    .update-progress progress::-moz-progress-bar { background: var(--brand); }
+    .update-progress.error progress { accent-color: var(--red); }
+    .update-progress.error progress::-webkit-progress-value { background: var(--red); }
+    .update-progress.error progress::-moz-progress-bar { background: var(--red); }
     .system-list { display: grid; gap: 10px; }
     .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #edf1ee; }
     .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
@@ -5117,6 +5321,10 @@ __AG_WEB_PY_EOF__
               <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
               <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
               <div id="updateResult" class="inline-result" hidden></div>
+              <div id="updateProgress" class="update-progress" hidden>
+                <div class="update-progress-head"><span id="updateProgressText">准备更新</span><strong id="updateProgressPercent">0%</strong></div>
+                <progress id="updateProgressBar" max="100" value="0" aria-label="更新进度"></progress>
+              </div>
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
           </div>
@@ -5208,7 +5416,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -5257,7 +5465,7 @@ __AG_WEB_PY_EOF__
       $("appView").hidden = false;
       loadDashboard();
       loadManagement();
-      checkForUpdate(false);
+      resumeUpdateProgress().then(running => { if (!running) checkForUpdate(false); });
       clearInterval(state.timer);
       state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
     }
@@ -5836,13 +6044,92 @@ __AG_WEB_PY_EOF__
       } catch (error) {
         setInlineResult($("updateResult"), error.message, true);
         if (showErrors) toast(error.message, true);
-      } finally { $("checkUpdateButton").disabled = false; }
+      } finally { $("checkUpdateButton").disabled = state.updatePolling; }
     }
+
+    function renderUpdateProgress(progress, message, isError = false) {
+      const value = Math.max(0, Math.min(100, Number(progress) || 0));
+      $("updateProgress").hidden = false;
+      $("updateProgress").classList.toggle("error", isError);
+      $("updateProgressBar").value = value;
+      $("updateProgressBar").setAttribute("aria-valuenow", String(value));
+      $("updateProgressText").textContent = message || "正在更新";
+      $("updateProgressPercent").textContent = `${Math.round(value)}%`;
+    }
+
+    async function readUpdateProgress() {
+      const response = await fetch("/api/update/progress", { headers: { "Accept": "application/json" }, cache: "no-store" });
+      if (!response.ok) throw new Error(`进度接口暂不可用 (${response.status})`);
+      return response.json();
+    }
+
+    async function pollUpdateProgress() {
+      if (state.updatePolling) return;
+      state.updatePolling = true;
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      let lastProgress = Number($("updateProgressBar").value) || 3;
+      while (state.updatePolling) {
+        try {
+          const data = await readUpdateProgress();
+          lastProgress = Math.max(lastProgress, Number(data.progress) || 0);
+          renderUpdateProgress(lastProgress, data.message, data.status === "error");
+          if (data.status === "success") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `已更新到 v${data.target_version || state.update?.latest_version || "最新版本"}`);
+            toast("更新完成，正在重新加载网页");
+            setTimeout(() => window.location.reload(), 1600);
+            return;
+          }
+          if (data.status === "error") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `${data.message}；请查看 /opt/aliyun-guard/logs/web-update.log`, true);
+            toast("更新失败，已保留当前版本", true);
+            $("checkUpdateButton").disabled = false;
+            loadDashboard(false);
+            state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+            return;
+          }
+        } catch (_) {
+          lastProgress = Math.max(lastProgress, 86);
+          renderUpdateProgress(lastProgress, "后台服务重启中，正在重新连接...");
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    async function resumeUpdateProgress() {
+      try {
+        const data = await readUpdateProgress();
+        if (data.status === "running") {
+          renderUpdateProgress(data.progress, data.message);
+          pollUpdateProgress();
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
     $("checkUpdateButton").addEventListener("click", () => checkForUpdate(true));
     $("installUpdateButton").addEventListener("click", async () => {
       if (!state.update?.available || !confirm(`确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`)) return;
-      try { await api("/api/update/install", { method: "POST", body: {} }); toast("更新程序已启动，完成后后台服务会重新加载"); $("installUpdateButton").disabled = true; }
-      catch (error) { toast(error.message, true); }
+      renderUpdateProgress(2, "正在提交更新任务");
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      clearInterval(state.timer);
+      state.timer = null;
+      try {
+        await api("/api/update/install", { method: "POST", body: { target_version: state.update.latest_version } });
+        toast("更新程序已启动");
+        pollUpdateProgress();
+      } catch (error) {
+        renderUpdateProgress(0, error.message, true);
+        setInlineResult($("updateResult"), error.message, true);
+        $("checkUpdateButton").disabled = false;
+        $("installUpdateButton").disabled = false;
+        state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+        toast(error.message, true);
+      }
     });
     $("restartServiceButton").addEventListener("click", async () => {
       if (!confirm("确认重启后台服务？网页可能短暂断开。")) return;
@@ -7712,16 +7999,25 @@ import web_panel
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 CONTROL_FILE = APP_DIR / "control.sh"
-UPDATE_BASE_URL = os.environ.get(
-    "ALIYUN_GUARD_UPDATE_BASE",
-    "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
-).rstrip("/")
-APP_VERSION = "1.5.3"
-LOCAL_RELEASE_ID = "907a56ef60aa8797d9cf6d1c23e52f233bbbe29bcd192fef0ff76cc2fd6a4638"
+UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
+UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
+UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
+UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
+APP_VERSION = "1.5.4"
+LOCAL_RELEASE_ID = "da334b3871c335486de1d5e2dad0960ac35c3b33d5caabbc17598ce33d4570b1"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
+
+
+def update_asset_base_url(version=None):
+    if UPDATE_CUSTOM_BASE_URL:
+        return UPDATE_CUSTOM_BASE_URL
+    if version:
+        normalized = str(version).strip().lstrip("v")
+        return UPDATE_RELEASES_URL + "/download/v" + normalized
+    return UPDATE_BASE_URL
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -8936,7 +9232,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("最新版本: v{}".format(target_version))
     else:
         print("最新版本: 暂时无法获取（仍可继续更新）")
-    print("更新来源: {}".format(UPDATE_BASE_URL))
+    asset_base_url = update_asset_base_url(target_version)
+    print("更新来源: {}".format(asset_base_url))
     print("现有 config.json、state.json 和日志会保留。")
     confirm_text = "下载并安装 GitHub main 分支最新版本"
     if target_version:
@@ -8945,8 +9242,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("已取消更新。")
         return None
 
-    installer_url = UPDATE_BASE_URL + "/install.sh"
-    checksum_url = UPDATE_BASE_URL + "/install.sh.sha256"
+    installer_url = asset_base_url + "/install.sh"
+    checksum_url = asset_base_url + "/install.sh.sha256"
     print("正在下载更新和校验文件...")
     try:
         installer = download_update_file(installer_url)

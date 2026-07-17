@@ -419,6 +419,17 @@
     .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
     .inline-result { min-height: 40px; margin-top: 12px; padding: 10px 11px; border-left: 3px solid var(--cyan); background: #eef7f8; color: #30545c; border-radius: 3px; overflow-wrap: anywhere; }
     .inline-result.error { border-left-color: var(--red); background: #fff3f2; color: #7f302c; }
+    .update-progress { margin-top: 12px; display: grid; gap: 7px; }
+    .update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
+    .update-progress-head span { min-width: 0; overflow-wrap: anywhere; }
+    .update-progress-head strong { color: var(--ink); flex: 0 0 auto; }
+    .update-progress progress { width: 100%; height: 10px; display: block; border: 0; border-radius: 3px; overflow: hidden; background: #e2e8e4; accent-color: var(--brand); }
+    .update-progress progress::-webkit-progress-bar { background: #e2e8e4; }
+    .update-progress progress::-webkit-progress-value { background: var(--brand); transition: width .25s ease; }
+    .update-progress progress::-moz-progress-bar { background: var(--brand); }
+    .update-progress.error progress { accent-color: var(--red); }
+    .update-progress.error progress::-webkit-progress-value { background: var(--red); }
+    .update-progress.error progress::-moz-progress-bar { background: var(--red); }
     .system-list { display: grid; gap: 10px; }
     .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #edf1ee; }
     .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
@@ -708,6 +719,10 @@
               <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
               <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
               <div id="updateResult" class="inline-result" hidden></div>
+              <div id="updateProgress" class="update-progress" hidden>
+                <div class="update-progress-head"><span id="updateProgressText">准备更新</span><strong id="updateProgressPercent">0%</strong></div>
+                <progress id="updateProgressBar" max="100" value="0" aria-label="更新进度"></progress>
+              </div>
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
           </div>
@@ -799,7 +814,7 @@
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -848,7 +863,7 @@
       $("appView").hidden = false;
       loadDashboard();
       loadManagement();
-      checkForUpdate(false);
+      resumeUpdateProgress().then(running => { if (!running) checkForUpdate(false); });
       clearInterval(state.timer);
       state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
     }
@@ -1427,13 +1442,92 @@
       } catch (error) {
         setInlineResult($("updateResult"), error.message, true);
         if (showErrors) toast(error.message, true);
-      } finally { $("checkUpdateButton").disabled = false; }
+      } finally { $("checkUpdateButton").disabled = state.updatePolling; }
     }
+
+    function renderUpdateProgress(progress, message, isError = false) {
+      const value = Math.max(0, Math.min(100, Number(progress) || 0));
+      $("updateProgress").hidden = false;
+      $("updateProgress").classList.toggle("error", isError);
+      $("updateProgressBar").value = value;
+      $("updateProgressBar").setAttribute("aria-valuenow", String(value));
+      $("updateProgressText").textContent = message || "正在更新";
+      $("updateProgressPercent").textContent = `${Math.round(value)}%`;
+    }
+
+    async function readUpdateProgress() {
+      const response = await fetch("/api/update/progress", { headers: { "Accept": "application/json" }, cache: "no-store" });
+      if (!response.ok) throw new Error(`进度接口暂不可用 (${response.status})`);
+      return response.json();
+    }
+
+    async function pollUpdateProgress() {
+      if (state.updatePolling) return;
+      state.updatePolling = true;
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      let lastProgress = Number($("updateProgressBar").value) || 3;
+      while (state.updatePolling) {
+        try {
+          const data = await readUpdateProgress();
+          lastProgress = Math.max(lastProgress, Number(data.progress) || 0);
+          renderUpdateProgress(lastProgress, data.message, data.status === "error");
+          if (data.status === "success") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `已更新到 v${data.target_version || state.update?.latest_version || "最新版本"}`);
+            toast("更新完成，正在重新加载网页");
+            setTimeout(() => window.location.reload(), 1600);
+            return;
+          }
+          if (data.status === "error") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `${data.message}；请查看 /opt/aliyun-guard/logs/web-update.log`, true);
+            toast("更新失败，已保留当前版本", true);
+            $("checkUpdateButton").disabled = false;
+            loadDashboard(false);
+            state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+            return;
+          }
+        } catch (_) {
+          lastProgress = Math.max(lastProgress, 86);
+          renderUpdateProgress(lastProgress, "后台服务重启中，正在重新连接...");
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    async function resumeUpdateProgress() {
+      try {
+        const data = await readUpdateProgress();
+        if (data.status === "running") {
+          renderUpdateProgress(data.progress, data.message);
+          pollUpdateProgress();
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
     $("checkUpdateButton").addEventListener("click", () => checkForUpdate(true));
     $("installUpdateButton").addEventListener("click", async () => {
       if (!state.update?.available || !confirm(`确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`)) return;
-      try { await api("/api/update/install", { method: "POST", body: {} }); toast("更新程序已启动，完成后后台服务会重新加载"); $("installUpdateButton").disabled = true; }
-      catch (error) { toast(error.message, true); }
+      renderUpdateProgress(2, "正在提交更新任务");
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      clearInterval(state.timer);
+      state.timer = null;
+      try {
+        await api("/api/update/install", { method: "POST", body: { target_version: state.update.latest_version } });
+        toast("更新程序已启动");
+        pollUpdateProgress();
+      } catch (error) {
+        renderUpdateProgress(0, error.message, true);
+        setInlineResult($("updateResult"), error.message, true);
+        $("checkUpdateButton").disabled = false;
+        $("installUpdateButton").disabled = false;
+        state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+        toast(error.message, true);
+      }
     });
     $("restartServiceButton").addEventListener("click", async () => {
       if (!confirm("确认重启后台服务？网页可能短暂断开。")) return;
