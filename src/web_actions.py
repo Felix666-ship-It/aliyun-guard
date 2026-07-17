@@ -889,6 +889,7 @@ def systemd_update_process(command, log_name):
         systemd_run,
         "--quiet",
         "--no-block",
+        "--property=StandardInput=null",
         "--unit={}".format(unit),
         *_update_wrapper_command(command, log_path),
     ]

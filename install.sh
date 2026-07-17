@@ -41,13 +41,13 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 TTY_AVAILABLE=no
-if { : </dev/tty; } 2>/dev/null; then
+if [ "$INSTALL_ACTION" = update ]; then
+    # Web/systemd updates are deliberately non-interactive and need no controlling terminal.
+    exec 3</dev/null
+elif { : </dev/tty; } 2>/dev/null; then
     exec 3</dev/tty
     TTY_AVAILABLE=yes
 else
-    exec 3<&0
-fi
-if [ "$TTY_AVAILABLE" != yes ] && [ "$INSTALL_ACTION" = interactive ]; then
     die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
 fi
 
@@ -3158,6 +3158,7 @@ def systemd_update_process(command, log_name):
         systemd_run,
         "--quiet",
         "--no-block",
+        "--property=StandardInput=null",
         "--unit={}".format(unit),
         *_update_wrapper_command(command, log_path),
     ]
@@ -8006,7 +8007,7 @@ UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
 APP_VERSION = "1.5.7"
-LOCAL_RELEASE_ID = "39f81c72b6dfe3c6d530297aa941d0663d40dd6b64ff9ebfaa561e1cf9b00d33"
+LOCAL_RELEASE_ID = "be4b121ddb40f0acb0bab4309bb459084844c51ca83545866209750c1b9090b2"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -9267,7 +9268,10 @@ def update_from_github(confirm_update=True, release_info=None):
             temporary_path = handle.name
         os.chmod(temporary_path, 0o700)
         print("SHA-256 校验通过: {}".format(actual))
-        result = subprocess.call(["/bin/sh", temporary_path, "--update"])
+        result = subprocess.call(
+            ["/bin/sh", temporary_path, "--update"],
+            stdin=subprocess.DEVNULL,
+        )
     except Exception as exc:
         print("执行更新失败: {}".format(guard.compact_error(exc)))
         return False

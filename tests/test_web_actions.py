@@ -289,11 +289,12 @@ class WebActionTests(unittest.TestCase):
         launcher = run.call_args.args[0]
         self.assertEqual(launcher[0], "/usr/bin/systemd-run")
         self.assertIn("--no-block", launcher)
+        self.assertIn("--property=StandardInput=null", launcher)
         self.assertIn("--unit={}".format(unit), launcher)
         self.assertIn(str(manager_path), launcher)
         self.assertIn(str(app_dir / "logs" / "web-update.log"), launcher)
         self.assertIn("-u", launcher)
-        self.assertIn(web_actions.UPDATE_EXIT_MARKER, launcher[6])
+        self.assertTrue(any(web_actions.UPDATE_EXIT_MARKER in item for item in launcher))
         state = json.loads(
             (app_dir / "logs" / web_actions.UPDATE_STATE_NAME).read_text(
                 encoding="utf-8"

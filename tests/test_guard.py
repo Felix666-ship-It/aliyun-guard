@@ -1118,6 +1118,7 @@ class UpdateTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
+        self.assertIs(run.call_args.kwargs["stdin"], manager.subprocess.DEVNULL)
         release_base = manager.UPDATE_RELEASES_URL + "/download/v1.3.0"
         self.assertEqual(
             [call.args[0] for call in download.call_args_list],
@@ -1136,13 +1137,14 @@ class UpdateTests(unittest.TestCase):
 
 
 class InstallerTemplateTests(unittest.TestCase):
-    def test_noninteractive_update_probes_tty_before_opening_it(self):
+    def test_noninteractive_update_never_opens_tty(self):
         template = (ROOT / "packaging" / "install.template.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("if { : </dev/tty; } 2>/dev/null; then", template)
-        self.assertIn('if [ "$TTY_AVAILABLE" != yes ]', template)
-        self.assertNotIn("if [ -r /dev/tty ]", template)
+        update_branch = template[template.index('if [ "$INSTALL_ACTION" = update ]'):]
+        update_branch = update_branch[:update_branch.index("elif { : </dev/tty;")]
+        self.assertIn("exec 3</dev/null", update_branch)
+        self.assertNotIn("/dev/tty", update_branch)
 
     def test_update_preserves_telegram_node_configuration(self):
         template = (ROOT / "packaging" / "install.template.sh").read_text(

@@ -1290,7 +1290,10 @@ def update_from_github(confirm_update=True, release_info=None):
             temporary_path = handle.name
         os.chmod(temporary_path, 0o700)
         print("SHA-256 校验通过: {}".format(actual))
-        result = subprocess.call(["/bin/sh", temporary_path, "--update"])
+        result = subprocess.call(
+            ["/bin/sh", temporary_path, "--update"],
+            stdin=subprocess.DEVNULL,
+        )
     except Exception as exc:
         print("执行更新失败: {}".format(guard.compact_error(exc)))
         return False
