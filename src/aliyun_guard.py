@@ -689,6 +689,33 @@ def query_cdt_traffic_gb(user):
     return total_bytes / (1024.0 ** 3)
 
 
+def cdt_account_cache_key(user):
+    """Return an in-memory fingerprint for one configured credential pair."""
+    credentials = "{}\0{}".format(
+        str(user.get("ak", "") or "").strip(),
+        str(user.get("sk", "") or "").strip(),
+    )
+    return hashlib.sha256(credentials.encode("utf-8")).digest()
+
+
+def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
+    """Reuse one account-level CDT result within a single monitoring cycle."""
+    if cycle_cache is None:
+        return query_cdt_traffic_gb(user)
+
+    cache_key = cdt_account_cache_key(user)
+    if cache_key not in cycle_cache:
+        try:
+            cycle_cache[cache_key] = (query_cdt_traffic_gb(user), None)
+        except Exception as exc:
+            cycle_cache[cache_key] = (None, exc)
+
+    traffic_gb, error = cycle_cache[cache_key]
+    if error is not None:
+        raise error
+    return traffic_gb
+
+
 def query_instance_status(user):
     require_sdk()
     request = DescribeInstancesRequest()
@@ -985,7 +1012,14 @@ def wait_for_status(user, expected, timeout, poll_seconds):
     return latest, latest_error
 
 
-def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
+def check_one(
+    user,
+    config,
+    dry_run=False,
+    now=None,
+    scheduled_action=None,
+    cdt_cycle_cache=None,
+):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
     schedule = get_schedule_config(user)
@@ -1023,7 +1057,7 @@ def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
     user_secrets = (user.get("ak"), user.get("sk"))
 
     try:
-        result["traffic_gb"] = query_cdt_traffic_gb(user)
+        result["traffic_gb"] = query_cdt_traffic_gb_for_cycle(user, cdt_cycle_cache)
     except Exception as exc:
         message = "CDT 流量查询失败: {}".format(compact_error(exc, secrets=user_secrets))
         result["errors"].append(message)
@@ -1449,6 +1483,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
     if not isinstance(previous_instances, dict):
         previous_instances = {}
     results = []
+    cdt_cycle_cache = {}
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
@@ -1462,6 +1497,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             dry_run=dry_run,
             now=started_at,
             scheduled_action=transition,
+            cdt_cycle_cache=cdt_cycle_cache,
         )
         results.append(result)
         write_instance_log(user, result, dry_run=dry_run)

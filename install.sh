@@ -1675,7 +1675,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5103,6 +5103,33 @@ def query_cdt_traffic_gb(user):
     return total_bytes / (1024.0 ** 3)
 
 
+def cdt_account_cache_key(user):
+    """Return an in-memory fingerprint for one configured credential pair."""
+    credentials = "{}\0{}".format(
+        str(user.get("ak", "") or "").strip(),
+        str(user.get("sk", "") or "").strip(),
+    )
+    return hashlib.sha256(credentials.encode("utf-8")).digest()
+
+
+def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
+    """Reuse one account-level CDT result within a single monitoring cycle."""
+    if cycle_cache is None:
+        return query_cdt_traffic_gb(user)
+
+    cache_key = cdt_account_cache_key(user)
+    if cache_key not in cycle_cache:
+        try:
+            cycle_cache[cache_key] = (query_cdt_traffic_gb(user), None)
+        except Exception as exc:
+            cycle_cache[cache_key] = (None, exc)
+
+    traffic_gb, error = cycle_cache[cache_key]
+    if error is not None:
+        raise error
+    return traffic_gb
+
+
 def query_instance_status(user):
     require_sdk()
     request = DescribeInstancesRequest()
@@ -5399,7 +5426,14 @@ def wait_for_status(user, expected, timeout, poll_seconds):
     return latest, latest_error
 
 
-def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
+def check_one(
+    user,
+    config,
+    dry_run=False,
+    now=None,
+    scheduled_action=None,
+    cdt_cycle_cache=None,
+):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
     schedule = get_schedule_config(user)
@@ -5437,7 +5471,7 @@ def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
     user_secrets = (user.get("ak"), user.get("sk"))
 
     try:
-        result["traffic_gb"] = query_cdt_traffic_gb(user)
+        result["traffic_gb"] = query_cdt_traffic_gb_for_cycle(user, cdt_cycle_cache)
     except Exception as exc:
         message = "CDT 流量查询失败: {}".format(compact_error(exc, secrets=user_secrets))
         result["errors"].append(message)
@@ -5863,6 +5897,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
     if not isinstance(previous_instances, dict):
         previous_instances = {}
     results = []
+    cdt_cycle_cache = {}
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
@@ -5876,6 +5911,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             dry_run=dry_run,
             now=started_at,
             scheduled_action=transition,
+            cdt_cycle_cache=cdt_cycle_cache,
         )
         results.append(result)
         write_instance_log(user, result, dry_run=dry_run)
@@ -6162,8 +6198,8 @@ UPDATE_BASE_URL = os.environ.get(
     "ALIYUN_GUARD_UPDATE_BASE",
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
-APP_VERSION = "1.5.0"
-LOCAL_RELEASE_ID = "ab32a0ca2ceecf6abba4245cd3f85da04aad01ca7b1154cbe69f2cc1471a0f23"
+APP_VERSION = "1.5.1"
+LOCAL_RELEASE_ID = "b33376bac9264c553bba99954d7b714ccb9b12da4bfe5adaed2b2a24b60afcaf"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

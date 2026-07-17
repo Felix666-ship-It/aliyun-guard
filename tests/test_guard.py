@@ -513,6 +513,7 @@ class GuardNotificationTests(unittest.TestCase):
             guard.run_cycle()
         send.assert_not_called()
 
+
     def test_telegram_retries_transient_network_error(self):
         response = mock.MagicMock()
         response.status_code = 200
@@ -732,6 +733,54 @@ class GuardNotificationTests(unittest.TestCase):
         )
         self.assertNotIn(node_url, text)
         self.assertNotIn(node_uuid, text)
+
+
+class GuardCdtAccountCacheTests(unittest.TestCase):
+    def run_cycle_with_users(self, users, traffic_side_effect):
+        config = make_config(users[0])
+        config["users"] = users
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "load_state", return_value={}
+        ), mock.patch.object(guard, "save_state"), mock.patch.object(
+            guard, "query_cdt_traffic_gb", side_effect=traffic_side_effect
+        ) as traffic, mock.patch.object(
+            guard, "query_instance_status", return_value="Running"
+        ):
+            code = guard.run_cycle(no_notify=True)
+        return code, traffic
+
+    def test_same_credentials_query_cdt_once_per_cycle(self):
+        users = [
+            make_user(name="HK-1", instance_id="i-test-1"),
+            make_user(name="HK-2", instance_id="i-test-2"),
+        ]
+        code, traffic = self.run_cycle_with_users(users, [46.22])
+        self.assertEqual(code, 0)
+        traffic.assert_called_once_with(users[0])
+
+    def test_different_credentials_are_not_merged(self):
+        users = [
+            make_user(name="HK", instance_id="i-test-1"),
+            make_user(
+                name="SG",
+                ak="other-ak",
+                sk="other-sk",
+                region="ap-southeast-1",
+                instance_id="i-test-2",
+            ),
+        ]
+        code, traffic = self.run_cycle_with_users(users, [46.22, 12.5])
+        self.assertEqual(code, 0)
+        self.assertEqual(traffic.call_count, 2)
+
+    def test_same_credentials_reuse_cdt_failure(self):
+        users = [
+            make_user(name="HK-1", instance_id="i-test-1"),
+            make_user(name="HK-2", instance_id="i-test-2"),
+        ]
+        code, traffic = self.run_cycle_with_users(users, RuntimeError("temporary"))
+        self.assertEqual(code, 1)
+        traffic.assert_called_once_with(users[0])
 
 
 class ConfigTests(unittest.TestCase):
