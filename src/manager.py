@@ -521,15 +521,60 @@ def _set_telegram_identity(candidate):
     )
 
 
+def telegram_control_status(telegram):
+    if not telegram.get("control_enabled", True):
+        return "已关闭"
+    admins = guard.telegram_control_admin_ids(telegram)
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    if not admins:
+        return "已启用，但未配置有效管理员"
+    source = "独立名单" if explicit else "使用私聊 Chat ID"
+    return "已启用，{} 个管理员（{}）".format(len(admins), source)
+
+
+def configure_telegram_control(telegram):
+    title("Telegram Bot 控制")
+    print("当前状态: {}".format(telegram_control_status(telegram)))
+    enabled = yes_no(
+        "启用 Telegram Bot 控制", bool(telegram.get("control_enabled", True))
+    )
+    telegram["control_enabled"] = enabled
+    if not enabled:
+        print("Bot 控制已关闭，Telegram 通知不受影响。")
+        return telegram
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    default = ",".join(str(value) for value in explicit) if explicit else "auto"
+    raw = prompt(
+        "管理员 Telegram 用户 ID（逗号分隔；auto 使用私聊 Chat ID）",
+        default,
+        required=True,
+    )
+    if raw.strip().lower() == "auto":
+        telegram["control_admin_ids"] = []
+    else:
+        telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(raw)
+    admins = guard.telegram_control_admin_ids(telegram)
+    if admins:
+        print("Bot 控制管理员: {}".format(", ".join(str(value) for value in admins)))
+    else:
+        print("警告: 当前没有有效管理员，Bot 控制不会接受任何命令。")
+    return telegram
+
+
 def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
-        title("Telegram 连接方式")
+        title("Telegram 连接与 Bot 控制")
         status_source = active if active is not None else candidate
         for line in telegram_connection_status_lines(status_source):
             print(line)
         if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
             for line in telegram_connection_status_lines(candidate, prefix="待保存"):
                 print(line)
+        print("Bot 控制: {}".format(telegram_control_status(candidate)))
         print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
@@ -544,7 +589,8 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 7) 取消并返回")
         print(" 8) 单独检测当前选择（不保存）")
         print(" 9) 测试并保存")
-        choice = prompt_int("请选择", 9, 1, 9)
+        print("10) Bot 控制设置")
+        choice = prompt_int("请选择", 10, 1, 10)
         if choice == 1:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
             candidate["connection_mode"] = "direct"
@@ -615,6 +661,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 _set_telegram_identity(candidate)
             if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
                 return candidate, False
+        elif choice == 10:
+            configure_telegram_control(candidate)
+            return candidate, True
 
 
 def configure_telegram(config, initial=False):
@@ -623,6 +672,10 @@ def configure_telegram(config, initial=False):
     candidate = json.loads(json.dumps(current, ensure_ascii=False))
     print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
     _set_telegram_identity(candidate)
+    candidate.setdefault("control_enabled", True)
+    candidate.setdefault("control_admin_ids", [])
+    if initial:
+        print("Telegram Bot 控制默认开启，未单独设置时使用正数私聊 Chat ID 授权。")
     candidate["timeout_seconds"] = prompt_int(
         "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
@@ -1316,7 +1369,7 @@ def menu():
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
         print(" 4) 测试 Telegram 通知")
-        print(" 5) Telegram 连接方式")
+        print(" 5) Telegram 连接与 Bot 控制")
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")

@@ -522,6 +522,8 @@ class WebApiTests(unittest.TestCase):
                 "chat_id": "456",
                 "timeout_seconds": 15,
                 "retries": 2,
+                "control_enabled": True,
+                "control_admin_ids": "7001,7002",
             },
             cookie=cookie,
             csrf=csrf,
@@ -531,6 +533,8 @@ class WebApiTests(unittest.TestCase):
         saved = guard.load_config()["telegram"]
         self.assertEqual(saved["bot_token"], "test-bot-token-private")
         self.assertEqual(saved["chat_id"], "456")
+        self.assertTrue(saved["control_enabled"])
+        self.assertEqual(saved["control_admin_ids"], [7001, 7002])
 
 
 class ManualControlTests(unittest.TestCase):
@@ -581,6 +585,65 @@ class ManualControlTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 409)
         stop.assert_not_called()
 
+    def test_bot_threshold_override_pauses_monitor_before_start(self):
+        config = make_config()
+        config["users"][0]["paused"] = False
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=200.0
+        ), mock.patch.object(guard, "start_instance") as start, mock.patch.object(
+            guard, "wait_for_status", return_value=("Running", None)
+        ), mock.patch.object(guard, "atomic_write_json") as save_config, mock.patch.object(
+            guard, "send_telegram_message"
+        ) as notify, mock.patch.object(
+            guard, "load_state", return_value={"instances": {}, "history": []}
+        ), mock.patch.object(guard, "save_state"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            result = web_panel.control_instance(
+                guard,
+                0,
+                "start",
+                source="Telegram Bot",
+                notify=False,
+                allow_threshold_override=True,
+                pause_on_threshold_override=True,
+            )
+        start.assert_called_once()
+        save_config.assert_called_once()
+        notify.assert_not_called()
+        self.assertTrue(config["users"][0]["paused"])
+        self.assertTrue(result["threshold_overridden"])
+        self.assertTrue(result["monitor_paused"])
+        self.assertIn("已自动暂停", result["message"])
+
+    def test_failed_threshold_override_reports_monitor_remains_paused(self):
+        config = make_config()
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=200.0
+        ), mock.patch.object(
+            guard, "start_instance", side_effect=RuntimeError("StartFailed")
+        ), mock.patch.object(guard, "atomic_write_json"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            with self.assertRaises(web_panel.WebPanelError) as raised:
+                web_panel.control_instance(
+                    guard,
+                    0,
+                    "start",
+                    source="Telegram Bot",
+                    notify=False,
+                    allow_threshold_override=True,
+                    pause_on_threshold_override=True,
+                )
+        self.assertTrue(config["users"][0]["paused"])
+        self.assertIn("监控已暂停", str(raised.exception))
+
 
 class WebHtmlTests(unittest.TestCase):
     def test_sparkline_points_keep_fixed_size_and_edge_padding(self):
@@ -601,6 +664,9 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn("记录该实例独立日志", html)
         self.assertIn("instanceLogToggle", html)
         self.assertIn("删除监控实例", html)
+        self.assertIn('id="tgControlEnabled"', html)
+        self.assertIn('id="tgControlAdmins"', html)
+        self.assertIn("control_admin_ids", html)
 
 if __name__ == "__main__":
     unittest.main()

@@ -461,6 +461,7 @@ def _write_manual_instance_log(
     message="",
     errors=None,
     level="error",
+    source="网页",
 ):
     guard.write_instance_log(
         user,
@@ -481,11 +482,19 @@ def _write_manual_instance_log(
             "message": message,
             "errors": list(errors or []),
         },
-        event="网页手动{}".format("开机" if action == "start" else "关机"),
+        event="{}手动{}".format(source, "开机" if action == "start" else "关机"),
     )
 
 
-def control_instance(guard, index, action):
+def control_instance(
+    guard,
+    index,
+    action,
+    source="网页控制台",
+    notify=True,
+    allow_threshold_override=False,
+    pause_on_threshold_override=False,
+):
     if action not in ("start", "stop"):
         raise WebPanelError("开关机动作无效")
     with guard.cycle_lock() as locked:
@@ -503,6 +512,8 @@ def control_instance(guard, index, action):
         traffic = None
         performed = False
         poll_error = None
+        threshold_overridden = False
+        monitor_paused = False
         try:
             schedule_target = guard.schedule_target(user)
             automation_active = bool(user.get("actions_enabled", True)) and not bool(
@@ -522,13 +533,20 @@ def control_instance(guard, index, action):
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
                 if traffic >= limit:
-                    raise WebPanelError(
-                        "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
-                            traffic, limit
-                        ),
-                        409,
-                    )
+                    if not allow_threshold_override:
+                        raise WebPanelError(
+                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                                traffic, limit
+                            ),
+                            409,
+                        )
+                    threshold_overridden = True
                 if before != "Running":
+                    if threshold_overridden and pause_on_threshold_override:
+                        user["paused"] = True
+                        guard.validate_config(config)
+                        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
+                        monitor_paused = True
                     guard.start_instance(user)
                     performed = True
                     after, poll_error = guard.wait_for_status(
@@ -551,8 +569,8 @@ def control_instance(guard, index, action):
             else:
                 after = before
         except WebPanelError as exc:
-            message = "网页控制台手动{}未执行: {}".format(
-                "开机" if action == "start" else "关机", exc
+            message = "{}手动{}未执行: {}".format(
+                source, "开机" if action == "start" else "关机", exc
             )
             _write_manual_instance_log(
                 guard,
@@ -564,6 +582,7 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[str(exc)],
+                source="网页" if source == "网页控制台" else source,
             )
             raise
         except Exception as exc:
@@ -571,6 +590,8 @@ def control_instance(guard, index, action):
             message = "实例{}失败: {}".format(
                 "开机" if action == "start" else "关机", error
             )
+            if monitor_paused:
+                message += "；该实例监控已暂停，请处理后按需恢复"
             _write_manual_instance_log(
                 guard,
                 user,
@@ -581,10 +602,12 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[error],
+                source="网页" if source == "网页控制台" else source,
             )
             raise WebPanelError(message, 502)
 
-        message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+        message = "{}手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+            source,
             "开机" if action == "start" else "关机",
             name,
             user.get("instance_id"),
@@ -593,13 +616,16 @@ def control_instance(guard, index, action):
         )
         if poll_error:
             message += "\n状态复查: {}".format(poll_error)
+        if monitor_paused:
+            message += "\n监控: 已自动暂停（流量阈值强制开机）"
         notify_error = None
-        try:
-            guard.send_telegram_message(config.get("telegram", {}), message)
-        except Exception as exc:
-            notify_error = guard.compact_error(
-                exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
-            )
+        if notify:
+            try:
+                guard.send_telegram_message(config.get("telegram", {}), message)
+            except Exception as exc:
+                notify_error = guard.compact_error(
+                    exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
+                )
         log_errors = []
         if poll_error:
             log_errors.append("ECS 状态复查失败: {}".format(poll_error))
@@ -625,6 +651,7 @@ def control_instance(guard, index, action):
             message=message,
             errors=log_errors,
             level=level,
+            source="网页" if source == "网页控制台" else source,
         )
         instances[str(user.get("instance_id", ""))] = dict(
             previous,
@@ -662,6 +689,8 @@ def control_instance(guard, index, action):
             "after": after or "Unknown",
             "message": message,
             "notification_error": notify_error,
+            "threshold_overridden": threshold_overridden,
+            "monitor_paused": monitor_paused,
         }
 
 

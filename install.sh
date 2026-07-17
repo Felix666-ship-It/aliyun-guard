@@ -905,6 +905,738 @@ def ensure_node_proxy(node_link, startup_timeout=12):
 
 atexit.register(stop_node_proxy)
 __AG_PROXY_PY_EOF__
+    cat > "$APP_DIR/telegram_control.py" <<'__AG_CONTROL_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Secure Telegram command polling for Aliyun Guard."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import threading
+import time
+
+
+POLL_TIMEOUT_SECONDS = 20
+RETRY_WAIT_SECONDS = 5
+CONFIRM_TTL_SECONDS = 90
+
+BOT_COMMANDS = [
+    {"command": "status", "description": "查看最近检测状态"},
+    {"command": "instances", "description": "查看监控实例"},
+    {"command": "check", "description": "立即执行一轮检测"},
+    {"command": "poweron", "description": "选择实例开机"},
+    {"command": "poweroff", "description": "选择实例关机"},
+    {"command": "help", "description": "显示控制菜单"},
+]
+
+
+def _token_fingerprint(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _control_state_path(guard):
+    configured = os.environ.get("ALIYUN_GUARD_TELEGRAM_CONTROL_STATE")
+    if configured:
+        return Path(configured)
+    return guard.STATE_FILE.with_name("telegram-control-state.json")
+
+
+def _load_offset(guard, fingerprint):
+    path = _control_state_path(guard)
+    try:
+        data = guard.load_json(path, {})
+        if data.get("token_fingerprint") != fingerprint:
+            return None
+        offset = int(data.get("offset", 0))
+        return max(0, offset)
+    except Exception:
+        return None
+
+
+def _save_offset(guard, fingerprint, offset):
+    guard.atomic_write_json(
+        _control_state_path(guard),
+        {"token_fingerprint": fingerprint, "offset": max(0, int(offset))},
+        mode=0o600,
+    )
+
+
+def _format_traffic(value):
+    try:
+        return "{:.2f} GB".format(float(value))
+    except (TypeError, ValueError):
+        return "暂无"
+
+
+def build_status_text(guard, config=None, state=None):
+    config = config or guard.load_config()
+    state = state or guard.load_state()
+    finished = state.get("last_cycle_finished_at") or "尚未完成检测"
+    if state.get("last_cycle_finished_at"):
+        result = "正常" if state.get("last_cycle_ok") else "存在错误"
+    else:
+        result = "暂无"
+    lines = [
+        "Aliyun Guard 状态",
+        "最近检测: {}".format(finished),
+        "检测结果: {}".format(result),
+        "检测次数: {}".format(int(state.get("cycle_count", 0) or 0)),
+        "监控实例: {} 个".format(len(config.get("users", []))),
+    ]
+    telegram_error = str(state.get("telegram_error", "") or "").strip()
+    if telegram_error:
+        lines.append("通知状态: 上次发送失败")
+    return "\n".join(lines)
+
+
+def build_instances_text(guard, config=None, state=None):
+    config = config or guard.load_config()
+    state = state or guard.load_state()
+    previous = state.get("instances", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    users = config.get("users", [])
+    if not users:
+        return "尚未配置监控实例。"
+    lines = ["监控实例"]
+    for index, user in enumerate(users, 1):
+        instance_id = str(user.get("instance_id", ""))
+        current = previous.get(instance_id, {})
+        if not isinstance(current, dict):
+            current = {}
+        status = current.get("status_after") or "Unknown"
+        mode = "已暂停" if user.get("paused") else "监控中"
+        lines.extend(
+            [
+                "",
+                "#{:d} {}".format(index, user.get("name") or instance_id),
+                "ID: {}".format(instance_id),
+                "状态: {} · {}".format(status, mode),
+                "流量: {} / {:.2f} GB".format(
+                    _format_traffic(current.get("traffic_gb")),
+                    float(user.get("traffic_limit_gb", 0) or 0),
+                ),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def resolve_instance(config, selector):
+    users = config.get("users", [])
+    selector = str(selector or "").strip()
+    if selector.isdigit():
+        index = int(selector) - 1
+        if 0 <= index < len(users):
+            return users[index]
+    exact = [
+        user
+        for user in users
+        if selector
+        and selector.casefold()
+        in {
+            str(user.get("instance_id", "")).casefold(),
+            str(user.get("name", "")).casefold(),
+        }
+    ]
+    return exact[0] if len(exact) == 1 else None
+
+
+class TelegramControlService:
+    def __init__(self, guard):
+        self.guard = guard
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="aliyun-guard-telegram-control",
+            daemon=True,
+        )
+        self.pending = {}
+        self.offset = None
+        self.fingerprint = None
+        self.commands_fingerprint = None
+        self.last_error = None
+        self.last_inactive_reason = None
+        self.drain_pending = True
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def shutdown(self):
+        self.stop_event.set()
+        self.thread.join(timeout=POLL_TIMEOUT_SECONDS + 5)
+
+    def _log_inactive(self, reason):
+        if reason != self.last_inactive_reason:
+            self.guard.LOGGER.info("Telegram Bot 控制未运行: %s", reason)
+            self.last_inactive_reason = reason
+
+    def _poll_config(self):
+        config = self.guard.load_config()
+        telegram = config.get("telegram", {})
+        if not telegram.get("control_enabled", True):
+            self.drain_pending = True
+            self._log_inactive("已在配置中关闭")
+            return None, None, None
+        if not str(telegram.get("bot_token", "") or "").strip():
+            self.drain_pending = True
+            self._log_inactive("Bot Token 未配置")
+            return None, None, None
+        admins = self.guard.telegram_control_admin_ids(telegram)
+        if not admins:
+            self.drain_pending = True
+            self._log_inactive("未配置有效的管理员用户 ID")
+            return None, None, None
+        self.last_inactive_reason = None
+        return config, telegram, set(admins)
+
+    def _telegram_api(self, telegram, method, data=None, long_poll=False):
+        candidate = dict(telegram)
+        if long_poll:
+            candidate["retries"] = 1
+        request_timeout = POLL_TIMEOUT_SECONDS + 10 if long_poll else None
+        return self.guard.telegram_api(
+            candidate,
+            method,
+            data or {},
+            request_timeout=request_timeout,
+        )
+
+    def _send(self, telegram, chat_id, text, reply_markup=None):
+        chunks = self.guard.split_message(str(text or ""))
+        result = None
+        for index, chunk in enumerate(chunks):
+            data = {"chat_id": str(chat_id), "text": chunk}
+            if reply_markup is not None and index == len(chunks) - 1:
+                data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            result = self._telegram_api(telegram, "sendMessage", data)
+        return result
+
+    def _answer_callback(self, telegram, callback_id, text="", alert=False):
+        data = {
+            "callback_query_id": str(callback_id),
+            "text": str(text or "")[:190],
+            "show_alert": "true" if alert else "false",
+        }
+        try:
+            self._telegram_api(telegram, "answerCallbackQuery", data)
+        except Exception as exc:
+            self.guard.LOGGER.warning("Telegram 回调确认失败: %s", self.guard.compact_error(exc))
+
+    def _remove_buttons(self, telegram, callback):
+        message = callback.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+        if chat_id is None or message_id is None:
+            return
+        try:
+            self._telegram_api(
+                telegram,
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": str(chat_id),
+                    "message_id": str(message_id),
+                    "reply_markup": json.dumps({"inline_keyboard": []}),
+                },
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _menu_markup():
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "状态", "callback_data": "ag:status"},
+                    {"text": "实例", "callback_data": "ag:instances"},
+                ],
+                [{"text": "立即检测", "callback_data": "ag:req:check"}],
+                [
+                    {"text": "实例开机", "callback_data": "ag:list:start"},
+                    {"text": "实例关机", "callback_data": "ag:list:stop"},
+                ],
+            ]
+        }
+
+    def _send_help(self, telegram, chat_id):
+        self._send(
+            telegram,
+            chat_id,
+            "Aliyun Guard Bot 控制\n\n"
+            "/status - 查看最近检测状态\n"
+            "/instances - 查看监控实例\n"
+            "/check - 立即执行一轮检测\n"
+            "/poweron <序号或实例ID> - 开机\n"
+            "/poweroff <序号或实例ID> - 关机\n"
+            "/help - 显示控制菜单\n\n"
+            "检测和关机需要确认；关机状态开机需要连续确认两次。",
+            self._menu_markup(),
+        )
+
+    def _instance_choices(self, telegram, chat_id, config, action):
+        label = "开机" if action == "start" else "关机"
+        rows = []
+        for index, user in enumerate(config.get("users", [])):
+            name = str(user.get("name") or user.get("instance_id"))[:32]
+            rows.append(
+                [
+                    {
+                        "text": "{} {}".format(label, name),
+                        "callback_data": "ag:req:{}:{}".format(action, index),
+                    }
+                ]
+            )
+        if not rows:
+            self._send(telegram, chat_id, "尚未配置监控实例。")
+            return
+        self._send(
+            telegram,
+            chat_id,
+            "请选择需要{}的实例：".format(label),
+            {"inline_keyboard": rows},
+        )
+
+    def _new_confirmation(
+        self,
+        telegram,
+        chat_id,
+        user_id,
+        action,
+        instance_id=None,
+        stage=1,
+        threshold_override=False,
+        traffic_gb=None,
+        limit_gb=None,
+    ):
+        self._expire_pending()
+        self.pending = {
+            token: item
+            for token, item in self.pending.items()
+            if item.get("user_id") != int(user_id)
+        }
+        token = secrets.token_urlsafe(9)
+        self.pending[token] = {
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "action": action,
+            "instance_id": instance_id,
+            "stage": int(stage),
+            "threshold_override": bool(threshold_override),
+            "expires": time.monotonic() + CONFIRM_TTL_SECONDS,
+        }
+        if action == "check":
+            text = "确认立即执行一轮真实检测？检测可能根据当前规则执行开关机。"
+        else:
+            config = self.guard.load_config()
+            user = next(
+                (
+                    item
+                    for item in config.get("users", [])
+                    if str(item.get("instance_id", "")) == str(instance_id)
+                ),
+                None,
+            )
+            if user is None:
+                self.pending.pop(token, None)
+                self._send(telegram, chat_id, "实例不存在或配置已经变化。")
+                return
+            label = "开机" if action == "start" else "关机"
+            if action == "start" and int(stage) == 1:
+                text = "第一次确认：准备{}实例 {}（{}）？".format(
+                    label,
+                    user.get("name") or instance_id,
+                    instance_id,
+                )
+            elif action == "start" and threshold_override:
+                text = (
+                    "第二次确认：当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值。\n"
+                    "继续将强制开机，并自动暂停该实例监控。"
+                ).format(float(traffic_gb), float(limit_gb))
+            elif action == "start":
+                text = "第二次确认：实例当前已关机，确认执行开机？"
+            else:
+                text = "确认{}实例 {}（{}）？".format(
+                    label,
+                    user.get("name") or instance_id,
+                    instance_id,
+                )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "确认执行", "callback_data": "ag:confirm:{}".format(token)},
+                    {"text": "取消", "callback_data": "ag:cancel:{}".format(token)},
+                ]
+            ]
+        }
+        self._send(telegram, chat_id, text, markup)
+
+    def _expire_pending(self):
+        now = time.monotonic()
+        self.pending = {
+            token: item
+            for token, item in self.pending.items()
+            if float(item.get("expires", 0)) > now
+        }
+
+    def _authorized(self, telegram, admins, source, callback_id=None):
+        user_id = source.get("from", {}).get("id")
+        chat = source.get("chat")
+        if chat is None:
+            chat = source.get("message", {}).get("chat", {})
+        chat_id = chat.get("id")
+        if chat.get("type") != "private":
+            self.guard.LOGGER.warning("Telegram Bot 控制忽略非私聊命令: %s", chat_id)
+            if callback_id:
+                self._answer_callback(telegram, callback_id, "仅支持私聊", alert=True)
+            return None
+        if user_id not in admins:
+            self.guard.LOGGER.warning("Telegram Bot 控制拒绝未授权用户: %s", user_id)
+            if callback_id:
+                self._answer_callback(telegram, callback_id, "无权限", alert=True)
+            elif chat_id is not None:
+                self._send(telegram, chat_id, "无权限。")
+            return None
+        return int(user_id), int(chat_id)
+
+    def _handle_message(self, config, telegram, admins, message):
+        auth = self._authorized(telegram, admins, message)
+        if auth is None:
+            return
+        user_id, chat_id = auth
+        text = str(message.get("text", "") or "").strip()
+        if not text.startswith("/"):
+            self._send_help(telegram, chat_id)
+            return
+        parts = text.split()
+        command = parts[0].split("@", 1)[0].lower()
+        argument = " ".join(parts[1:]).strip()
+        if command in ("/start", "/help", "/menu"):
+            self._send_help(telegram, chat_id)
+        elif command == "/status":
+            self._send(telegram, chat_id, build_status_text(self.guard, config=config))
+        elif command in ("/instances", "/list"):
+            self._send(telegram, chat_id, build_instances_text(self.guard, config=config))
+        elif command == "/check":
+            self._new_confirmation(telegram, chat_id, user_id, "check")
+        elif command in ("/poweron", "/on", "/poweroff", "/off"):
+            action = "start" if command in ("/poweron", "/on") else "stop"
+            if not argument:
+                self._instance_choices(telegram, chat_id, config, action)
+                return
+            user = resolve_instance(config, argument)
+            if user is None:
+                self._send(telegram, chat_id, "实例不存在，请使用 /instances 查看序号。")
+                return
+            self._new_confirmation(
+                telegram,
+                chat_id,
+                user_id,
+                action,
+                str(user.get("instance_id", "")),
+            )
+        else:
+            self._send_help(telegram, chat_id)
+
+    def _execute_pending(self, telegram, pending):
+        chat_id = pending["chat_id"]
+        user_id = pending["user_id"]
+        action = pending["action"]
+        if action == "check":
+            self._send(telegram, chat_id, "正在执行检测，请稍候。")
+            with self.guard.cycle_lock() as locked:
+                if not locked:
+                    self._send(telegram, chat_id, "已有检测任务正在运行，请稍后再试。")
+                    return
+                code = self.guard.run_cycle(no_notify=True)
+                summary = str(self.guard.load_state().get("last_summary", "") or "")
+            self._send(
+                telegram,
+                chat_id,
+                summary or "检测已完成，返回状态码 {}。".format(code),
+                self._menu_markup(),
+            )
+            self.guard.LOGGER.info("Telegram 管理员 %s 执行了一轮检测", user_id)
+            return
+
+        if action == "start" and int(pending.get("stage", 1)) == 1:
+            self._prepare_second_start_confirmation(telegram, pending)
+            return
+
+        config = self.guard.load_config()
+        instance_id = str(pending.get("instance_id", ""))
+        index = next(
+            (
+                index
+                for index, user in enumerate(config.get("users", []))
+                if str(user.get("instance_id", "")) == instance_id
+            ),
+            None,
+        )
+        if index is None:
+            self._send(telegram, chat_id, "实例不存在或配置已经变化。")
+            return
+        import web_panel
+
+        self.guard.LOGGER.info(
+            "Telegram 管理员 %s 请求%s实例 %s",
+            user_id,
+            "启动" if action == "start" else "停止",
+            instance_id,
+        )
+        result = web_panel.control_instance(
+            self.guard,
+            index,
+            action,
+            source="Telegram Bot",
+            notify=False,
+            allow_threshold_override=bool(pending.get("threshold_override", False)),
+            pause_on_threshold_override=True,
+        )
+        self._send(telegram, chat_id, result["message"], self._menu_markup())
+
+    def _prepare_second_start_confirmation(self, telegram, pending):
+        chat_id = pending["chat_id"]
+        user_id = pending["user_id"]
+        instance_id = str(pending.get("instance_id", ""))
+        with self.guard.cycle_lock() as locked:
+            if not locked:
+                self._send(telegram, chat_id, "已有检测任务正在运行，请稍后重新操作。")
+                return
+            config = self.guard.load_config()
+            user = next(
+                (
+                    item
+                    for item in config.get("users", [])
+                    if str(item.get("instance_id", "")) == instance_id
+                ),
+                None,
+            )
+            if user is None:
+                self._send(telegram, chat_id, "实例不存在或配置已经变化。")
+                return
+            status = self.guard.query_instance_status(user)
+            if status == "Running":
+                self._send(telegram, chat_id, "实例已经处于运行状态，无需开机。")
+                return
+            if status != "Stopped":
+                self._send(
+                    telegram,
+                    chat_id,
+                    "实例当前状态为 {}，暂不执行开机。".format(status),
+                )
+                return
+            traffic = self.guard.query_cdt_traffic_gb(user)
+            limit = float(user.get("traffic_limit_gb", 0) or 0)
+        self._new_confirmation(
+            telegram,
+            chat_id,
+            user_id,
+            "start",
+            instance_id,
+            stage=2,
+            threshold_override=traffic >= limit,
+            traffic_gb=traffic,
+            limit_gb=limit,
+        )
+
+    def _handle_callback(self, config, telegram, admins, callback):
+        callback_id = callback.get("id")
+        auth = self._authorized(telegram, admins, callback, callback_id=callback_id)
+        if auth is None:
+            return
+        user_id, chat_id = auth
+        data = str(callback.get("data", "") or "")
+        if data == "ag:status":
+            self._answer_callback(telegram, callback_id)
+            self._send(telegram, chat_id, build_status_text(self.guard, config=config))
+            return
+        if data == "ag:instances":
+            self._answer_callback(telegram, callback_id)
+            self._send(telegram, chat_id, build_instances_text(self.guard, config=config))
+            return
+        if data == "ag:req:check":
+            self._answer_callback(telegram, callback_id)
+            self._new_confirmation(telegram, chat_id, user_id, "check")
+            return
+        if data.startswith("ag:list:"):
+            action = data.rsplit(":", 1)[-1]
+            self._answer_callback(telegram, callback_id)
+            if action in ("start", "stop"):
+                self._instance_choices(telegram, chat_id, config, action)
+            return
+        if data.startswith("ag:req:"):
+            parts = data.split(":", 3)
+            self._answer_callback(telegram, callback_id)
+            if len(parts) == 4 and parts[2] in ("start", "stop"):
+                try:
+                    index = int(parts[3])
+                    if index < 0:
+                        raise IndexError
+                    user = config.get("users", [])[index]
+                except (IndexError, TypeError, ValueError):
+                    self._send(telegram, chat_id, "实例不存在或配置已经变化。")
+                    return
+                self._new_confirmation(
+                    telegram,
+                    chat_id,
+                    user_id,
+                    parts[2],
+                    str(user.get("instance_id", "")),
+                )
+            return
+        if data.startswith("ag:cancel:"):
+            token = data.split(":", 2)[-1]
+            pending = self.pending.get(token)
+            if pending and pending.get("user_id") == user_id:
+                self.pending.pop(token, None)
+                self._remove_buttons(telegram, callback)
+                self._answer_callback(telegram, callback_id, "已取消")
+            else:
+                self._answer_callback(telegram, callback_id, "操作已失效", alert=True)
+            return
+        if data.startswith("ag:confirm:"):
+            token = data.split(":", 2)[-1]
+            self._expire_pending()
+            pending = self.pending.get(token)
+            if (
+                pending is None
+                or pending.get("user_id") != user_id
+                or pending.get("chat_id") != chat_id
+            ):
+                self._answer_callback(telegram, callback_id, "确认已过期或无效", alert=True)
+                return
+            self.pending.pop(token, None)
+            self._remove_buttons(telegram, callback)
+            self._answer_callback(telegram, callback_id, "正在执行")
+            try:
+                self._execute_pending(telegram, pending)
+            except Exception as exc:
+                detail = self.guard.compact_error(
+                    exc, secrets=self.guard.telegram_secrets(telegram)
+                )
+                self.guard.LOGGER.exception("Telegram Bot 控制执行失败: %s", detail)
+                self._send(telegram, chat_id, "操作失败: {}".format(detail))
+            return
+        self._answer_callback(telegram, callback_id, "按钮无效", alert=True)
+
+    def _handle_update(self, config, telegram, admins, update):
+        if isinstance(update.get("message"), dict):
+            self._handle_message(config, telegram, admins, update["message"])
+        elif isinstance(update.get("callback_query"), dict):
+            self._handle_callback(config, telegram, admins, update["callback_query"])
+
+    def _prepare_token(self, telegram):
+        fingerprint = _token_fingerprint(telegram.get("bot_token"))
+        token_changed = fingerprint != self.fingerprint
+        if (
+            not token_changed
+            and self.offset is not None
+            and not self.drain_pending
+        ):
+            return
+        if token_changed:
+            self.drain_pending = True
+        self.fingerprint = fingerprint
+        self.offset = None if self.drain_pending else _load_offset(self.guard, fingerprint)
+        if self.offset is None:
+            updates = self._telegram_api(
+                telegram,
+                "getUpdates",
+                {
+                    "offset": -1,
+                    "limit": 1,
+                    "timeout": 0,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                },
+            ) or []
+            self.offset = (
+                max(int(item.get("update_id", -1)) for item in updates) + 1
+                if updates
+                else 0
+            )
+            _save_offset(self.guard, fingerprint, self.offset)
+            self.guard.LOGGER.info("Telegram Bot 控制已丢弃启用前的待处理消息")
+        self.drain_pending = False
+        if self.commands_fingerprint != fingerprint:
+            try:
+                self._telegram_api(
+                    telegram,
+                    "setMyCommands",
+                    {
+                        "commands": json.dumps(BOT_COMMANDS, ensure_ascii=False),
+                        "scope": json.dumps({"type": "all_private_chats"}),
+                    },
+                )
+            except Exception as exc:
+                self.guard.LOGGER.warning(
+                    "Telegram Bot 命令菜单注册失败，文本命令仍可使用: %s",
+                    self.guard.compact_error(exc),
+                )
+            self.commands_fingerprint = fingerprint
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                config, telegram, admins = self._poll_config()
+                if telegram is None:
+                    self.stop_event.wait(RETRY_WAIT_SECONDS)
+                    continue
+                self._prepare_token(telegram)
+                updates = self._telegram_api(
+                    telegram,
+                    "getUpdates",
+                    {
+                        "offset": self.offset,
+                        "limit": 100,
+                        "timeout": POLL_TIMEOUT_SECONDS,
+                        "allowed_updates": json.dumps(["message", "callback_query"]),
+                    },
+                    long_poll=True,
+                ) or []
+                if updates:
+                    self.offset = max(
+                        int(item.get("update_id", -1)) for item in updates
+                    ) + 1
+                    _save_offset(self.guard, self.fingerprint, self.offset)
+                    latest_config, latest_telegram, latest_admins = self._poll_config()
+                    if latest_telegram is None:
+                        continue
+                    if _token_fingerprint(latest_telegram.get("bot_token")) != self.fingerprint:
+                        self.drain_pending = True
+                        continue
+                    for update in updates:
+                        try:
+                            self._handle_update(
+                                latest_config,
+                                latest_telegram,
+                                latest_admins,
+                                update,
+                            )
+                        except Exception as exc:
+                            self.guard.LOGGER.exception(
+                                "Telegram Bot 单条更新处理失败: %s",
+                                self.guard.compact_error(
+                                    exc,
+                                    secrets=self.guard.telegram_secrets(latest_telegram),
+                                ),
+                            )
+                if self.last_error is not None:
+                    self.guard.LOGGER.info("Telegram Bot 控制连接已恢复")
+                    self.last_error = None
+            except Exception as exc:
+                detail = self.guard.compact_error(exc)
+                if detail != self.last_error:
+                    self.guard.LOGGER.warning("Telegram Bot 控制轮询失败: %s", detail)
+                    self.last_error = detail
+                self.stop_event.wait(RETRY_WAIT_SECONDS)
+
+
+def start_background(guard):
+    return TelegramControlService(guard).start()
+__AG_CONTROL_PY_EOF__
     cat > "$APP_DIR/web_actions.py" <<'__AG_WEB_ACTIONS_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -1065,11 +1797,19 @@ def telegram_payload(guard, telegram):
     nodes = guard.telegram_node_urls(telegram)
     active = str(telegram.get("node_url", "") or "").strip()
     mode = str(telegram.get("connection_mode", "direct") or "direct")
+    explicit_admins = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    effective_admins = guard.telegram_control_admin_ids(telegram)
     return {
         "bot_token_configured": bool(str(telegram.get("bot_token", "")).strip()),
         "chat_id": str(telegram.get("chat_id", "")),
         "timeout_seconds": int(telegram.get("timeout_seconds", 12)),
         "retries": int(telegram.get("retries", 3)),
+        "control_enabled": bool(telegram.get("control_enabled", True)),
+        "control_admin_ids": explicit_admins,
+        "control_effective_admin_ids": effective_admins,
+        "control_uses_chat_id": bool(effective_admins and not explicit_admins),
         "connection_mode": mode,
         "connection_label": CONNECTION_LABELS.get(mode, "未知"),
         "connection_description": guard.telegram_connection_description(telegram),
@@ -1413,6 +2153,18 @@ def update_telegram_identity(guard, data):
     telegram["retries"] = _integer(
         data, "retries", telegram.get("retries", 3), 1, 5
     )
+    telegram["control_enabled"] = _boolean(
+        data,
+        "control_enabled",
+        bool(telegram.get("control_enabled", True)),
+    )
+    if "control_admin_ids" in data:
+        try:
+            telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(
+                data.get("control_admin_ids")
+            )
+        except Exception as exc:
+            raise ManagementError(str(exc))
     _save_config(guard, config)
     return telegram_payload(guard, telegram)
 
@@ -2106,6 +2858,7 @@ def _write_manual_instance_log(
     message="",
     errors=None,
     level="error",
+    source="网页",
 ):
     guard.write_instance_log(
         user,
@@ -2126,11 +2879,19 @@ def _write_manual_instance_log(
             "message": message,
             "errors": list(errors or []),
         },
-        event="网页手动{}".format("开机" if action == "start" else "关机"),
+        event="{}手动{}".format(source, "开机" if action == "start" else "关机"),
     )
 
 
-def control_instance(guard, index, action):
+def control_instance(
+    guard,
+    index,
+    action,
+    source="网页控制台",
+    notify=True,
+    allow_threshold_override=False,
+    pause_on_threshold_override=False,
+):
     if action not in ("start", "stop"):
         raise WebPanelError("开关机动作无效")
     with guard.cycle_lock() as locked:
@@ -2148,6 +2909,8 @@ def control_instance(guard, index, action):
         traffic = None
         performed = False
         poll_error = None
+        threshold_overridden = False
+        monitor_paused = False
         try:
             schedule_target = guard.schedule_target(user)
             automation_active = bool(user.get("actions_enabled", True)) and not bool(
@@ -2167,13 +2930,20 @@ def control_instance(guard, index, action):
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
                 if traffic >= limit:
-                    raise WebPanelError(
-                        "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
-                            traffic, limit
-                        ),
-                        409,
-                    )
+                    if not allow_threshold_override:
+                        raise WebPanelError(
+                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                                traffic, limit
+                            ),
+                            409,
+                        )
+                    threshold_overridden = True
                 if before != "Running":
+                    if threshold_overridden and pause_on_threshold_override:
+                        user["paused"] = True
+                        guard.validate_config(config)
+                        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
+                        monitor_paused = True
                     guard.start_instance(user)
                     performed = True
                     after, poll_error = guard.wait_for_status(
@@ -2196,8 +2966,8 @@ def control_instance(guard, index, action):
             else:
                 after = before
         except WebPanelError as exc:
-            message = "网页控制台手动{}未执行: {}".format(
-                "开机" if action == "start" else "关机", exc
+            message = "{}手动{}未执行: {}".format(
+                source, "开机" if action == "start" else "关机", exc
             )
             _write_manual_instance_log(
                 guard,
@@ -2209,6 +2979,7 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[str(exc)],
+                source="网页" if source == "网页控制台" else source,
             )
             raise
         except Exception as exc:
@@ -2216,6 +2987,8 @@ def control_instance(guard, index, action):
             message = "实例{}失败: {}".format(
                 "开机" if action == "start" else "关机", error
             )
+            if monitor_paused:
+                message += "；该实例监控已暂停，请处理后按需恢复"
             _write_manual_instance_log(
                 guard,
                 user,
@@ -2226,10 +2999,12 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[error],
+                source="网页" if source == "网页控制台" else source,
             )
             raise WebPanelError(message, 502)
 
-        message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+        message = "{}手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+            source,
             "开机" if action == "start" else "关机",
             name,
             user.get("instance_id"),
@@ -2238,13 +3013,16 @@ def control_instance(guard, index, action):
         )
         if poll_error:
             message += "\n状态复查: {}".format(poll_error)
+        if monitor_paused:
+            message += "\n监控: 已自动暂停（流量阈值强制开机）"
         notify_error = None
-        try:
-            guard.send_telegram_message(config.get("telegram", {}), message)
-        except Exception as exc:
-            notify_error = guard.compact_error(
-                exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
-            )
+        if notify:
+            try:
+                guard.send_telegram_message(config.get("telegram", {}), message)
+            except Exception as exc:
+                notify_error = guard.compact_error(
+                    exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
+                )
         log_errors = []
         if poll_error:
             log_errors.append("ECS 状态复查失败: {}".format(poll_error))
@@ -2270,6 +3048,7 @@ def control_instance(guard, index, action):
             message=message,
             errors=log_errors,
             level=level,
+            source="网页" if source == "网页控制台" else source,
         )
         instances[str(user.get("instance_id", ""))] = dict(
             previous,
@@ -2307,6 +3086,8 @@ def control_instance(guard, index, action):
             "after": after or "Unknown",
             "message": message,
             "notification_error": notify_error,
+            "threshold_overridden": threshold_overridden,
+            "monitor_paused": monitor_paused,
         }
 
 
@@ -3578,6 +4359,8 @@ __AG_WEB_PY_EOF__
               <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
               <div class="field"><label for="tgTimeout">请求超时（秒）</label><input id="tgTimeout" type="number" min="3" max="60" required></div>
               <div class="field"><label for="tgRetries">重试次数</label><input id="tgRetries" type="number" min="1" max="5" required></div>
+              <div class="field wide"><div class="toggle-row"><div><strong>Bot 控制</strong><div class="brand-sub">仅授权管理员私聊可用</div></div><label class="switch"><input id="tgControlEnabled" type="checkbox"><span></span></label></div></div>
+              <div id="tgControlAdminsField" class="field wide"><label for="tgControlAdmins">管理员 Telegram 用户 ID</label><input id="tgControlAdmins" autocomplete="off" placeholder="留空使用正数私聊 Chat ID"><div id="tgControlHint" class="muted small"></div></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
           </form>
@@ -3929,13 +4712,19 @@ __AG_WEB_PY_EOF__
       $("logSource").innerHTML = '<option value="system">系统总日志</option>' + data.instances.map(item => `<option value="${item.index}">${esc(item.name)} (${esc(item.instance_id)}) · ${item.instance_log_enabled ? "已启用" : "已关闭"}</option>`).join("");
       $("logSource").value = Array.from($("logSource").options).some(option => option.value === selectedLogSource) ? selectedLogSource : "system";
       const telegram = data.telegram;
-      $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
+      $("telegramCurrent").textContent = `当前：${telegram.connection_description} · Bot 控制${telegram.control_enabled ? "已开启" : "已关闭"}`;
       $("connectionDescription").textContent = telegram.connection_description;
       $("tgToken").value = "";
       $("tgToken").placeholder = telegram.bot_token_configured ? "已保存，留空不修改" : "尚未保存，请输入 Bot Token";
       $("tgChatId").value = telegram.chat_id;
       $("tgTimeout").value = telegram.timeout_seconds;
       $("tgRetries").value = telegram.retries;
+      $("tgControlEnabled").checked = telegram.control_enabled;
+      $("tgControlAdmins").value = telegram.control_admin_ids.join(",");
+      $("tgControlHint").textContent = telegram.control_effective_admin_ids.length
+        ? `当前授权：${telegram.control_effective_admin_ids.join(", ")}${telegram.control_uses_chat_id ? "（使用 Chat ID）" : ""}`
+        : "当前没有有效管理员，Bot 不会接受控制命令";
+      updateTelegramControlFields();
       const mode = document.querySelector(`input[name="connectionMode"][value="${telegram.connection_mode}"]`) || document.querySelector('input[name="connectionMode"][value="direct"]');
       mode.checked = true;
       $("proxyUrl").value = "";
@@ -4009,6 +4798,10 @@ __AG_WEB_PY_EOF__
       $("proxyField").hidden = !["socks5", "http"].includes(mode);
       $("nodeField").hidden = mode !== "node";
       $("apiProxyField").hidden = mode !== "api_proxy";
+    }
+
+    function updateTelegramControlFields() {
+      $("tgControlAdminsField").hidden = !$("tgControlEnabled").checked;
     }
 
     function connectionPayload(save) {
@@ -4301,7 +5094,7 @@ __AG_WEB_PY_EOF__
     $("telegramIdentityForm").addEventListener("submit", async event => {
       event.preventDefault();
       try {
-        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value) } });
+        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value), control_enabled: $("tgControlEnabled").checked, control_admin_ids: $("tgControlAdmins").value.trim() } });
         $("tgToken").value = "";
         toast("Telegram 机器人配置已保存");
         await loadManagement();
@@ -4316,6 +5109,7 @@ __AG_WEB_PY_EOF__
     });
 
     document.querySelectorAll('input[name="connectionMode"]').forEach(input => input.addEventListener("change", updateConnectionFields));
+    $("tgControlEnabled").addEventListener("change", updateTelegramControlFields);
     async function submitConnection(save) {
       const target = $("connectionResult");
       setInlineResult(target, "正在连接 Telegram Bot API...");
@@ -4494,6 +5288,8 @@ DEFAULT_CONFIG = {
         "node_url": "",
         "node_urls": [],
         "api_base_url": "https://api.telegram.org",
+        "control_enabled": True,
+        "control_admin_ids": [],
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
@@ -4573,6 +5369,45 @@ def telegram_node_urls(telegram):
     if active_node and active_node not in nodes:
         nodes.append(active_node)
     return nodes
+
+
+def normalize_telegram_control_admin_ids(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        values = [item for item in re.split(r"[\s,;]+", value.strip()) if item]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise GuardError("Telegram Bot 管理员用户 ID 必须是数组或分隔文本")
+    if len(values) > 20:
+        raise GuardError("Telegram Bot 管理员用户 ID 最多配置 20 个")
+    result = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        try:
+            user_id = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id <= 0:
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id not in result:
+            result.append(user_id)
+    return result
+
+
+def telegram_control_admin_ids(telegram):
+    configured = normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", []) if isinstance(telegram, dict) else []
+    )
+    if configured:
+        return configured
+    try:
+        chat_id = int(str(telegram.get("chat_id", "") or "").strip())
+    except (TypeError, ValueError):
+        return []
+    return [chat_id] if chat_id > 0 else []
 
 
 def load_json(path, default):
@@ -4700,6 +5535,11 @@ def validate_telegram_config(telegram):
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    if "control_enabled" in telegram and not isinstance(
+        telegram.get("control_enabled"), bool
+    ):
+        raise GuardError("Telegram Bot 控制开关必须是布尔值")
+    normalize_telegram_control_admin_ids(telegram.get("control_admin_ids", []))
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
@@ -5309,11 +6149,18 @@ def _telegram_post(url, data, timeout, proxies):
         return session.post(url, data=data, timeout=timeout, proxies=proxies)
 
 
-def telegram_api(config, method, data=None):
+def telegram_api(config, method, data=None, request_timeout=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
-    timeout = max(3, int(config.get("timeout_seconds", 12)))
+    timeout = max(
+        3,
+        int(
+            request_timeout
+            if request_timeout is not None
+            else config.get("timeout_seconds", 12)
+        ),
+    )
     retries = max(1, min(5, int(config.get("retries", 3))))
     base_url, proxies = telegram_connection(config)
     url = "{}/bot{}/{}".format(base_url, token, method)
@@ -6016,6 +6863,13 @@ def run_daemon():
         web_server = web_panel.start_background(sys.modules[__name__], config)
     except Exception as exc:
         LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
+    telegram_control_service = None
+    try:
+        import telegram_control
+
+        telegram_control_service = telegram_control.start_background(sys.modules[__name__])
+    except Exception as exc:
+        LOGGER.error("Telegram Bot 控制启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
@@ -6052,6 +6906,8 @@ def run_daemon():
     if web_server is not None:
         web_server.shutdown()
         web_server.server_close()
+    if telegram_control_service is not None:
+        telegram_control_service.shutdown()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -6065,6 +6921,15 @@ def show_status():
     state = load_state()
     print("配置状态: 正常")
     print("实例数量: {}".format(len(config.get("users", []))))
+    telegram = config.get("telegram", {})
+    control_enabled = bool(telegram.get("control_enabled", True))
+    control_admins = telegram_control_admin_ids(telegram) if control_enabled else []
+    print(
+        "Bot 控制: {}{}".format(
+            "已启用" if control_enabled else "已关闭",
+            "（{} 个管理员）".format(len(control_admins)) if control_enabled else "",
+        )
+    )
     scheduled_users = [
         user
         for user in config.get("users", [])
@@ -6199,7 +7064,7 @@ UPDATE_BASE_URL = os.environ.get(
     "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
 ).rstrip("/")
 APP_VERSION = "1.5.1"
-LOCAL_RELEASE_ID = "b33376bac9264c553bba99954d7b714ccb9b12da4bfe5adaed2b2a24b60afcaf"
+LOCAL_RELEASE_ID = "f1156b1978ce85048e6e351068a182e2f1f614036f5c94cfc70cf41dcfb5ef8e"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -6691,15 +7556,60 @@ def _set_telegram_identity(candidate):
     )
 
 
+def telegram_control_status(telegram):
+    if not telegram.get("control_enabled", True):
+        return "已关闭"
+    admins = guard.telegram_control_admin_ids(telegram)
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    if not admins:
+        return "已启用，但未配置有效管理员"
+    source = "独立名单" if explicit else "使用私聊 Chat ID"
+    return "已启用，{} 个管理员（{}）".format(len(admins), source)
+
+
+def configure_telegram_control(telegram):
+    title("Telegram Bot 控制")
+    print("当前状态: {}".format(telegram_control_status(telegram)))
+    enabled = yes_no(
+        "启用 Telegram Bot 控制", bool(telegram.get("control_enabled", True))
+    )
+    telegram["control_enabled"] = enabled
+    if not enabled:
+        print("Bot 控制已关闭，Telegram 通知不受影响。")
+        return telegram
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    default = ",".join(str(value) for value in explicit) if explicit else "auto"
+    raw = prompt(
+        "管理员 Telegram 用户 ID（逗号分隔；auto 使用私聊 Chat ID）",
+        default,
+        required=True,
+    )
+    if raw.strip().lower() == "auto":
+        telegram["control_admin_ids"] = []
+    else:
+        telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(raw)
+    admins = guard.telegram_control_admin_ids(telegram)
+    if admins:
+        print("Bot 控制管理员: {}".format(", ".join(str(value) for value in admins)))
+    else:
+        print("警告: 当前没有有效管理员，Bot 控制不会接受任何命令。")
+    return telegram
+
+
 def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
-        title("Telegram 连接方式")
+        title("Telegram 连接与 Bot 控制")
         status_source = active if active is not None else candidate
         for line in telegram_connection_status_lines(status_source):
             print(line)
         if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
             for line in telegram_connection_status_lines(candidate, prefix="待保存"):
                 print(line)
+        print("Bot 控制: {}".format(telegram_control_status(candidate)))
         print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
@@ -6714,7 +7624,8 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 7) 取消并返回")
         print(" 8) 单独检测当前选择（不保存）")
         print(" 9) 测试并保存")
-        choice = prompt_int("请选择", 9, 1, 9)
+        print("10) Bot 控制设置")
+        choice = prompt_int("请选择", 10, 1, 10)
         if choice == 1:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
             candidate["connection_mode"] = "direct"
@@ -6785,6 +7696,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 _set_telegram_identity(candidate)
             if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
                 return candidate, False
+        elif choice == 10:
+            configure_telegram_control(candidate)
+            return candidate, True
 
 
 def configure_telegram(config, initial=False):
@@ -6793,6 +7707,10 @@ def configure_telegram(config, initial=False):
     candidate = json.loads(json.dumps(current, ensure_ascii=False))
     print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
     _set_telegram_identity(candidate)
+    candidate.setdefault("control_enabled", True)
+    candidate.setdefault("control_admin_ids", [])
+    if initial:
+        print("Telegram Bot 控制默认开启，未单独设置时使用正数私聊 Chat ID 授权。")
     candidate["timeout_seconds"] = prompt_int(
         "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
@@ -7486,7 +8404,7 @@ def menu():
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
         print(" 4) 测试 Telegram 通知")
-        print(" 5) Telegram 连接方式")
+        print(" 5) Telegram 连接与 Bot 控制")
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
@@ -7905,7 +8823,7 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -7915,6 +8833,7 @@ __AG_UNINSTALL_SH_EOF__
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
         "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/telegram_control.py" \
         "$APP_DIR/web_actions.py" \
         "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"

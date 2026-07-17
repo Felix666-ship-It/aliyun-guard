@@ -326,7 +326,7 @@ write_payload() {
     mkdir -p "$APP_DIR/logs"
 # __PAYLOAD_BLOCKS__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -336,6 +336,7 @@ write_payload() {
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
         "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/telegram_control.py" \
         "$APP_DIR/web_actions.py" \
         "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"

@@ -603,6 +603,8 @@
               <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
               <div class="field"><label for="tgTimeout">请求超时（秒）</label><input id="tgTimeout" type="number" min="3" max="60" required></div>
               <div class="field"><label for="tgRetries">重试次数</label><input id="tgRetries" type="number" min="1" max="5" required></div>
+              <div class="field wide"><div class="toggle-row"><div><strong>Bot 控制</strong><div class="brand-sub">仅授权管理员私聊可用</div></div><label class="switch"><input id="tgControlEnabled" type="checkbox"><span></span></label></div></div>
+              <div id="tgControlAdminsField" class="field wide"><label for="tgControlAdmins">管理员 Telegram 用户 ID</label><input id="tgControlAdmins" autocomplete="off" placeholder="留空使用正数私聊 Chat ID"><div id="tgControlHint" class="muted small"></div></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
           </form>
@@ -954,13 +956,19 @@
       $("logSource").innerHTML = '<option value="system">系统总日志</option>' + data.instances.map(item => `<option value="${item.index}">${esc(item.name)} (${esc(item.instance_id)}) · ${item.instance_log_enabled ? "已启用" : "已关闭"}</option>`).join("");
       $("logSource").value = Array.from($("logSource").options).some(option => option.value === selectedLogSource) ? selectedLogSource : "system";
       const telegram = data.telegram;
-      $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
+      $("telegramCurrent").textContent = `当前：${telegram.connection_description} · Bot 控制${telegram.control_enabled ? "已开启" : "已关闭"}`;
       $("connectionDescription").textContent = telegram.connection_description;
       $("tgToken").value = "";
       $("tgToken").placeholder = telegram.bot_token_configured ? "已保存，留空不修改" : "尚未保存，请输入 Bot Token";
       $("tgChatId").value = telegram.chat_id;
       $("tgTimeout").value = telegram.timeout_seconds;
       $("tgRetries").value = telegram.retries;
+      $("tgControlEnabled").checked = telegram.control_enabled;
+      $("tgControlAdmins").value = telegram.control_admin_ids.join(",");
+      $("tgControlHint").textContent = telegram.control_effective_admin_ids.length
+        ? `当前授权：${telegram.control_effective_admin_ids.join(", ")}${telegram.control_uses_chat_id ? "（使用 Chat ID）" : ""}`
+        : "当前没有有效管理员，Bot 不会接受控制命令";
+      updateTelegramControlFields();
       const mode = document.querySelector(`input[name="connectionMode"][value="${telegram.connection_mode}"]`) || document.querySelector('input[name="connectionMode"][value="direct"]');
       mode.checked = true;
       $("proxyUrl").value = "";
@@ -1034,6 +1042,10 @@
       $("proxyField").hidden = !["socks5", "http"].includes(mode);
       $("nodeField").hidden = mode !== "node";
       $("apiProxyField").hidden = mode !== "api_proxy";
+    }
+
+    function updateTelegramControlFields() {
+      $("tgControlAdminsField").hidden = !$("tgControlEnabled").checked;
     }
 
     function connectionPayload(save) {
@@ -1326,7 +1338,7 @@
     $("telegramIdentityForm").addEventListener("submit", async event => {
       event.preventDefault();
       try {
-        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value) } });
+        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value), control_enabled: $("tgControlEnabled").checked, control_admin_ids: $("tgControlAdmins").value.trim() } });
         $("tgToken").value = "";
         toast("Telegram 机器人配置已保存");
         await loadManagement();
@@ -1341,6 +1353,7 @@
     });
 
     document.querySelectorAll('input[name="connectionMode"]').forEach(input => input.addEventListener("change", updateConnectionFields));
+    $("tgControlEnabled").addEventListener("change", updateTelegramControlFields);
     async function submitConnection(save) {
       const target = $("connectionResult");
       setInlineResult(target, "正在连接 Telegram Bot API...");

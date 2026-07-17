@@ -527,6 +527,18 @@ class GuardNotificationTests(unittest.TestCase):
         self.assertEqual(result["id"], 1)
         self.assertEqual(post.call_count, 2)
 
+    def test_telegram_api_accepts_long_poll_request_timeout(self):
+        response = mock.MagicMock(status_code=200)
+        response.text = '{"ok": true, "result": []}'
+        with mock.patch.object(guard, "_telegram_post", return_value=response) as post:
+            guard.telegram_api(
+                {"bot_token": "token", "timeout_seconds": 5, "retries": 1},
+                "getUpdates",
+                {"timeout": 20},
+                request_timeout=30,
+            )
+        self.assertEqual(post.call_args.args[2], 30)
+
     def test_telegram_uses_socks5_proxy(self):
         response = mock.MagicMock(status_code=200)
         response.text = '{"ok": true, "result": {"id": 1}}'
@@ -784,6 +796,29 @@ class GuardCdtAccountCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_bot_control_defaults_to_enabled_and_uses_private_chat_id(self):
+        config = make_config()
+        config["telegram"].update({"chat_id": "5902850250"})
+        loaded = guard.deep_merge(guard.DEFAULT_CONFIG, config)
+        self.assertTrue(loaded["telegram"]["control_enabled"])
+        self.assertEqual(
+            guard.telegram_control_admin_ids(loaded["telegram"]),
+            [5902850250],
+        )
+
+    def test_explicit_bot_admins_override_notification_chat(self):
+        telegram = {
+            "chat_id": "5902850250",
+            "control_admin_ids": [1001, "1002", 1001],
+        }
+        self.assertEqual(guard.telegram_control_admin_ids(telegram), [1001, 1002])
+
+    def test_rejects_invalid_bot_admin_id(self):
+        config = make_config()
+        config["telegram"]["control_admin_ids"] = ["not-a-user-id"]
+        with self.assertRaisesRegex(guard.GuardError, "管理员用户 ID"):
+            guard.validate_config(config)
+
     def test_load_config_migrates_legacy_node_url_to_saved_nodes(self):
         node_url = (
             "vless://11111111-1111-1111-1111-111111111111@example.com:443"
@@ -1120,8 +1155,28 @@ class InstallerTemplateTests(unittest.TestCase):
         self.assertIn('"$APP_DIR/web_panel.py" ensure', template)
         self.assertIn("网页面板设置保持不变", template)
 
+    def test_installer_embeds_telegram_control_worker(self):
+        builder = (ROOT / "packaging" / "build_installer.py").read_text(
+            encoding="utf-8"
+        )
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"telegram_control.py", "telegram_control.py"', builder)
+        self.assertIn('"$APP_DIR/telegram_control.py"', template)
+
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_terminal_bot_control_defaults_on_and_accepts_multiple_admins(self):
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram["chat_id"] = "123"
+        with mock.patch.object(manager, "yes_no", return_value=True), mock.patch.object(
+            manager, "prompt", return_value="9001,9002"
+        ):
+            result = manager.configure_telegram_control(telegram)
+        self.assertTrue(result["control_enabled"])
+        self.assertEqual(result["control_admin_ids"], [9001, 9002])
+
     def test_docker_web_setup_uses_fixed_internal_listener(self):
         config = make_config()
         config["web_panel"] = {
@@ -1536,7 +1591,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             output.getvalue(),
         )
         self.assertIn("发现新版本: v1.3.0（请选择 16 更新）", output.getvalue())
-        self.assertIn(" 5) Telegram 连接方式", output.getvalue())
+        self.assertIn(" 5) Telegram 连接与 Bot 控制", output.getvalue())
         self.assertIn(" 9) 定时开关机设置", output.getvalue())
         self.assertIn("10) 网页控制面板", output.getvalue())
         self.assertIn("16) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())

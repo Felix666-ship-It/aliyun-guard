@@ -58,6 +58,7 @@ class DockerArtifactTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("FROM python:3.11-slim-bookworm", dockerfile)
         self.assertIn("COPY src/web_actions.py", dockerfile)
+        self.assertIn("src/telegram_control.py", dockerfile)
         self.assertIn("COPY version.json ./version.json", dockerfile)
         self.assertIn("ENTRYPOINT", dockerfile)
         self.assertNotIn("COPY config.json", dockerfile)

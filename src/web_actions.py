@@ -157,11 +157,19 @@ def telegram_payload(guard, telegram):
     nodes = guard.telegram_node_urls(telegram)
     active = str(telegram.get("node_url", "") or "").strip()
     mode = str(telegram.get("connection_mode", "direct") or "direct")
+    explicit_admins = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    effective_admins = guard.telegram_control_admin_ids(telegram)
     return {
         "bot_token_configured": bool(str(telegram.get("bot_token", "")).strip()),
         "chat_id": str(telegram.get("chat_id", "")),
         "timeout_seconds": int(telegram.get("timeout_seconds", 12)),
         "retries": int(telegram.get("retries", 3)),
+        "control_enabled": bool(telegram.get("control_enabled", True)),
+        "control_admin_ids": explicit_admins,
+        "control_effective_admin_ids": effective_admins,
+        "control_uses_chat_id": bool(effective_admins and not explicit_admins),
         "connection_mode": mode,
         "connection_label": CONNECTION_LABELS.get(mode, "未知"),
         "connection_description": guard.telegram_connection_description(telegram),
@@ -505,6 +513,18 @@ def update_telegram_identity(guard, data):
     telegram["retries"] = _integer(
         data, "retries", telegram.get("retries", 3), 1, 5
     )
+    telegram["control_enabled"] = _boolean(
+        data,
+        "control_enabled",
+        bool(telegram.get("control_enabled", True)),
+    )
+    if "control_admin_ids" in data:
+        try:
+            telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(
+                data.get("control_admin_ids")
+            )
+        except Exception as exc:
+            raise ManagementError(str(exc))
     _save_config(guard, config)
     return telegram_payload(guard, telegram)
 

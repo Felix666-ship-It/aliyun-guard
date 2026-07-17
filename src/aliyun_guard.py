@@ -80,6 +80,8 @@ DEFAULT_CONFIG = {
         "node_url": "",
         "node_urls": [],
         "api_base_url": "https://api.telegram.org",
+        "control_enabled": True,
+        "control_admin_ids": [],
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
@@ -159,6 +161,45 @@ def telegram_node_urls(telegram):
     if active_node and active_node not in nodes:
         nodes.append(active_node)
     return nodes
+
+
+def normalize_telegram_control_admin_ids(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        values = [item for item in re.split(r"[\s,;]+", value.strip()) if item]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise GuardError("Telegram Bot 管理员用户 ID 必须是数组或分隔文本")
+    if len(values) > 20:
+        raise GuardError("Telegram Bot 管理员用户 ID 最多配置 20 个")
+    result = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        try:
+            user_id = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id <= 0:
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id not in result:
+            result.append(user_id)
+    return result
+
+
+def telegram_control_admin_ids(telegram):
+    configured = normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", []) if isinstance(telegram, dict) else []
+    )
+    if configured:
+        return configured
+    try:
+        chat_id = int(str(telegram.get("chat_id", "") or "").strip())
+    except (TypeError, ValueError):
+        return []
+    return [chat_id] if chat_id > 0 else []
 
 
 def load_json(path, default):
@@ -286,6 +327,11 @@ def validate_telegram_config(telegram):
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    if "control_enabled" in telegram and not isinstance(
+        telegram.get("control_enabled"), bool
+    ):
+        raise GuardError("Telegram Bot 控制开关必须是布尔值")
+    normalize_telegram_control_admin_ids(telegram.get("control_admin_ids", []))
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
@@ -895,11 +941,18 @@ def _telegram_post(url, data, timeout, proxies):
         return session.post(url, data=data, timeout=timeout, proxies=proxies)
 
 
-def telegram_api(config, method, data=None):
+def telegram_api(config, method, data=None, request_timeout=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
-    timeout = max(3, int(config.get("timeout_seconds", 12)))
+    timeout = max(
+        3,
+        int(
+            request_timeout
+            if request_timeout is not None
+            else config.get("timeout_seconds", 12)
+        ),
+    )
     retries = max(1, min(5, int(config.get("retries", 3))))
     base_url, proxies = telegram_connection(config)
     url = "{}/bot{}/{}".format(base_url, token, method)
@@ -1602,6 +1655,13 @@ def run_daemon():
         web_server = web_panel.start_background(sys.modules[__name__], config)
     except Exception as exc:
         LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
+    telegram_control_service = None
+    try:
+        import telegram_control
+
+        telegram_control_service = telegram_control.start_background(sys.modules[__name__])
+    except Exception as exc:
+        LOGGER.error("Telegram Bot 控制启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
@@ -1638,6 +1698,8 @@ def run_daemon():
     if web_server is not None:
         web_server.shutdown()
         web_server.server_close()
+    if telegram_control_service is not None:
+        telegram_control_service.shutdown()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -1651,6 +1713,15 @@ def show_status():
     state = load_state()
     print("配置状态: 正常")
     print("实例数量: {}".format(len(config.get("users", []))))
+    telegram = config.get("telegram", {})
+    control_enabled = bool(telegram.get("control_enabled", True))
+    control_admins = telegram_control_admin_ids(telegram) if control_enabled else []
+    print(
+        "Bot 控制: {}{}".format(
+            "已启用" if control_enabled else "已关闭",
+            "（{} 个管理员）".format(len(control_admins)) if control_enabled else "",
+        )
+    )
     scheduled_users = [
         user
         for user in config.get("users", [])

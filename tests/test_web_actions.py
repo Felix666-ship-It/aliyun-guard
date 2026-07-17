@@ -91,6 +91,27 @@ class WebActionTests(unittest.TestCase):
         self.assertNotIn("access_key", payload["instances"][0])
         self.assertFalse(payload["instances"][0]["instance_log_enabled"])
         self.assertEqual(payload["telegram"]["nodes"][0]["description"], "VLESS 节点（Saved）")
+        self.assertTrue(payload["telegram"]["control_enabled"])
+        self.assertEqual(payload["telegram"]["control_effective_admin_ids"], [123456])
+        self.assertTrue(payload["telegram"]["control_uses_chat_id"])
+
+    def test_updates_bot_control_admins(self):
+        result = web_actions.update_telegram_identity(
+            guard,
+            {
+                "bot_token": "",
+                "chat_id": "123456",
+                "timeout_seconds": 12,
+                "retries": 3,
+                "control_enabled": True,
+                "control_admin_ids": "9001, 9002",
+            },
+        )
+        self.assertTrue(result["control_enabled"])
+        self.assertEqual(result["control_admin_ids"], [9001, 9002])
+        self.assertEqual(result["control_effective_admin_ids"], [9001, 9002])
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["control_admin_ids"], [9001, 9002])
 
     def test_instance_logging_switch_persists(self):
         result = web_actions.update_instance_logging(guard, 0, True)
