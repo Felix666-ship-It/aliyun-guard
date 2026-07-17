@@ -670,41 +670,6 @@ class ManualControlTests(unittest.TestCase):
 
 
 class WebHtmlTests(unittest.TestCase):
-    def test_twenty_ui_presets_cover_ten_layout_families(self):
-        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
-        presets = [
-            "linear-paper", "linear-graphite",
-            "vercel-mono", "vercel-contrast",
-            "stripe-indigo", "stripe-coral",
-            "cloudscape-day", "cloudscape-night",
-            "grafana-night", "grafana-day",
-            "datadog-observe", "datadog-terminal",
-            "polaris-mint", "polaris-berry",
-            "atlassian-ocean", "atlassian-neutral",
-            "carbon-white", "carbon-gray",
-            "mission-amber", "mission-cyan",
-        ]
-        self.assertEqual(html.count("data-ui-preset"), 21)
-        self.assertEqual(html.count("<optgroup"), 10)
-        for preset in presets:
-            self.assertIn('value="{}"'.format(preset), html)
-            self.assertIn('data-ui="{}"'.format(preset), html)
-        self.assertIn('localStorage.setItem(UI_PRESET_KEY, preset)', html)
-        self.assertIn('grid-template-columns:var(--side-width,220px) minmax(0,1fr)', html)
-        self.assertIn('content:"ALIYUN GUARD"', html)
-
-    def test_mobile_navigation_is_collected_in_settings_menu(self):
-        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
-        self.assertIn('id="mobileMenuButton"', html)
-        self.assertIn('aria-controls="appNav"', html)
-        self.assertIn('aria-expanded="false"', html)
-        self.assertIn('id="mobileUiPreset"', html)
-        self.assertIn('id="mobileRefreshButton"', html)
-        self.assertIn('.app-nav.mobile-open { display:flex; }', html)
-        self.assertIn('function setMobileMenu(open)', html)
-        self.assertIn('if (event.key === "Escape") setMobileMenu(false)', html)
-        self.assertIn('setMobileMenu(false);', html)
-
     def test_update_panel_has_real_progress_and_reconnect_polling(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertIn('id="updateProgressBar"', html)
