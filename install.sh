@@ -4610,6 +4610,13 @@ __AG_WEB_PY_EOF__
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light">
   <title>Aliyun Guard</title>
+  <script>
+    try {
+      document.documentElement.dataset.ui = localStorage.getItem("aliyun-guard-ui") || "cloudscape-day";
+    } catch (_) {
+      document.documentElement.dataset.ui = "cloudscape-day";
+    }
+  </script>
   <style>
     :root {
       --bg: #f4f6f3;
@@ -4761,6 +4768,30 @@ __AG_WEB_PY_EOF__
       z-index: 30;
     }
     .header-actions { display: flex; align-items: center; gap: 8px; }
+    .mobile-menu-button, .mobile-menu-tools { display:none; }
+    .ui-picker {
+      position: relative;
+      width: 210px;
+      min-width: 0;
+    }
+    .ui-picker > .icon {
+      position: absolute;
+      z-index: 1;
+      left: 10px;
+      top: 10px;
+      color: var(--muted);
+      pointer-events: none;
+    }
+    .ui-picker select {
+      min-height: 38px;
+      height: 38px;
+      padding: 6px 30px 6px 34px;
+      border-color: var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 650;
+    }
     .icon-button {
       width: 38px;
       height: 38px;
@@ -5081,6 +5112,191 @@ __AG_WEB_PY_EOF__
     .toast.error { background: #8f312d; }
     .spin { animation: spin .8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Twenty operational UI presets: ten layout families, two variants each. */
+    html[data-ui="linear-paper"] { --bg:#f6f6f8;--surface:#fff;--surface-alt:#eeeef2;--ink:#19191d;--muted:#696a73;--line:#dddde3;--brand:#5e6ad2;--brand-dark:#4b56b8;--cyan:#1688a7;--amber:#b76508;--red:#bd3d42;--shadow:none;--radius:4px;--side-width:218px; }
+    html[data-ui="linear-graphite"] { color-scheme:dark;--bg:#101115;--surface:#18191f;--surface-alt:#212229;--ink:#f3f3f5;--muted:#9b9da7;--line:#2d2f38;--brand:#8d93ff;--brand-dark:#747be8;--cyan:#53c3df;--amber:#e5a13c;--red:#ef6d72;--shadow:none;--radius:4px;--side-width:196px; }
+    html[data-ui="vercel-mono"] { --bg:#fafafa;--surface:#fff;--surface-alt:#f1f1f1;--ink:#111;--muted:#666;--line:#dedede;--brand:#111;--brand-dark:#333;--cyan:#0070f3;--amber:#a35200;--red:#d13737;--shadow:none;--radius:0px;--side-width:184px; }
+    html[data-ui="vercel-contrast"] { color-scheme:dark;--bg:#050505;--surface:#0d0d0d;--surface-alt:#191919;--ink:#fafafa;--muted:#929292;--line:#303030;--brand:#fafafa;--brand-dark:#d7d7d7;--cyan:#36a6ff;--amber:#ffc044;--red:#ff6363;--shadow:none;--radius:0px;--side-width:200px; }
+    html[data-ui="stripe-indigo"] { --bg:#f6f8fc;--surface:#fff;--surface-alt:#eef2fb;--ink:#17233c;--muted:#667085;--line:#dce2ee;--brand:#635bff;--brand-dark:#5149e8;--cyan:#00a6c7;--amber:#b55a06;--red:#c83e53;--shadow:0 10px 26px rgba(45,55,92,.08);--radius:7px;--side-width:230px; }
+    html[data-ui="stripe-coral"] { --bg:#f8fafc;--surface:#fff;--surface-alt:#edf3f7;--ink:#0a2540;--muted:#5e7183;--line:#d7e1e8;--brand:#d9485f;--brand-dark:#bd344b;--cyan:#008f9c;--amber:#b86a08;--red:#be3348;--shadow:0 8px 22px rgba(10,37,64,.08);--radius:6px;--side-width:214px; }
+    html[data-ui="cloudscape-day"] { --bg:#f4f5f5;--surface:#fff;--surface-alt:#eef1f1;--ink:#161d26;--muted:#5f6b75;--line:#d5dbdb;--brand:#007f70;--brand-dark:#00685c;--cyan:#147e9a;--amber:#b45f06;--red:#b53535;--shadow:0 5px 14px rgba(20,32,34,.08);--radius:5px;--side-width:232px; }
+    html[data-ui="cloudscape-night"] { color-scheme:dark;--bg:#111719;--surface:#182023;--surface-alt:#222c2f;--ink:#f1f5f4;--muted:#a4b0ad;--line:#344044;--brand:#4ec8ae;--brand-dark:#35af96;--cyan:#5fc4df;--amber:#f3aa45;--red:#f27373;--shadow:0 8px 22px rgba(0,0,0,.22);--radius:5px;--side-width:188px; }
+    html[data-ui="grafana-night"] { color-scheme:dark;--bg:#101214;--surface:#181b1f;--surface-alt:#22262b;--ink:#eef1f4;--muted:#9ca6ad;--line:#30363d;--brand:#f28b25;--brand-dark:#d97512;--cyan:#39a6d8;--amber:#f2b84b;--red:#e85d5d;--shadow:0 5px 16px rgba(0,0,0,.28);--radius:3px;--side-width:176px; }
+    html[data-ui="grafana-day"] { --bg:#eef1f3;--surface:#fff;--surface-alt:#f2f5f6;--ink:#1c242a;--muted:#65717a;--line:#d4dadd;--brand:#e06b12;--brand-dark:#bd5508;--cyan:#1688b0;--amber:#b87809;--red:#bf3f3f;--shadow:0 4px 13px rgba(24,36,43,.1);--radius:3px;--side-width:196px; }
+    html[data-ui="datadog-observe"] { --bg:#f7f7fa;--surface:#fff;--surface-alt:#f0eef5;--ink:#27232e;--muted:#716b79;--line:#dfdbe5;--brand:#7b3fb2;--brand-dark:#63308f;--cyan:#008fa3;--amber:#a86608;--red:#c33c59;--shadow:0 7px 18px rgba(58,38,70,.09);--radius:5px;--side-width:218px; }
+    html[data-ui="datadog-terminal"] { color-scheme:dark;--bg:#111114;--surface:#1a191e;--surface-alt:#25232a;--ink:#f5f2f7;--muted:#aaa3af;--line:#39343f;--brand:#d765b8;--brand-dark:#bc4d9d;--cyan:#59d2d9;--amber:#e7a646;--red:#f06a86;--shadow:0 7px 20px rgba(0,0,0,.3);--radius:3px;--side-width:184px; }
+    html[data-ui="polaris-mint"] { --bg:#f1f3f2;--surface:#fff;--surface-alt:#edf3f0;--ink:#1f2925;--muted:#64716b;--line:#d6ded9;--brand:#16785f;--brand-dark:#0f624c;--cyan:#137f99;--amber:#a76309;--red:#b83f4c;--shadow:0 6px 18px rgba(35,51,44,.08);--radius:7px;--side-width:240px; }
+    html[data-ui="polaris-berry"] { color-scheme:dark;--bg:#141718;--surface:#1d2221;--surface-alt:#282e2c;--ink:#f0f4f2;--muted:#9ea9a4;--line:#39413e;--brand:#e16f92;--brand-dark:#c65778;--cyan:#59bec8;--amber:#e1a74d;--red:#f07178;--shadow:0 8px 22px rgba(0,0,0,.25);--radius:7px;--side-width:208px; }
+    html[data-ui="atlassian-ocean"] { --bg:#f4f5f7;--surface:#fff;--surface-alt:#ebf0f7;--ink:#172b4d;--muted:#626f86;--line:#d6dce5;--brand:#0c66e4;--brand-dark:#0b57c6;--cyan:#0094a6;--amber:#a85e06;--red:#c93752;--shadow:0 4px 14px rgba(23,43,77,.09);--radius:4px;--side-width:236px; }
+    html[data-ui="atlassian-neutral"] { --bg:#f7f8f9;--surface:#fff;--surface-alt:#f0f1f2;--ink:#1d2125;--muted:#6b778c;--line:#dcdfe4;--brand:#44546f;--brand-dark:#2c3e5a;--cyan:#008da6;--amber:#a55d07;--red:#bd3d50;--shadow:none;--radius:3px;--side-width:190px; }
+    html[data-ui="carbon-white"] { --bg:#f4f4f4;--surface:#fff;--surface-alt:#e8e8e8;--ink:#161616;--muted:#6f6f6f;--line:#c6c6c6;--brand:#0f62fe;--brand-dark:#0043ce;--cyan:#007d79;--amber:#9f5b00;--red:#da1e28;--shadow:none;--radius:0px;--side-width:256px; }
+    html[data-ui="carbon-gray"] { color-scheme:dark;--bg:#161616;--surface:#262626;--surface-alt:#353535;--ink:#f4f4f4;--muted:#a8a8a8;--line:#525252;--brand:#78a9ff;--brand-dark:#5c97f5;--cyan:#42becc;--amber:#f1c21b;--red:#ff8389;--shadow:none;--radius:0px;--side-width:224px; }
+    html[data-ui="mission-amber"] { color-scheme:dark;--bg:#090b0c;--surface:#121719;--surface-alt:#1a2225;--ink:#eef3ef;--muted:#95a39d;--line:#344044;--brand:#f0aa35;--brand-dark:#cf8618;--cyan:#39c7d3;--amber:#f0aa35;--red:#ff665f;--shadow:0 0 0 1px rgba(240,170,53,.1);--radius:2px;--side-width:164px; }
+    html[data-ui="mission-cyan"] { color-scheme:dark;--bg:#080d0f;--surface:#11191c;--surface-alt:#192428;--ink:#edf7f7;--muted:#91a6a8;--line:#304348;--brand:#29c5d3;--brand-dark:#17a8b5;--cyan:#29c5d3;--amber:#f0a343;--red:#ff666a;--shadow:0 0 0 1px rgba(41,197,211,.12);--radius:2px;--side-width:184px; }
+
+    html[data-ui] body, html[data-ui] .app { background:var(--bg); color:var(--ink); }
+    html[data-ui] .auth-panel, html[data-ui] .app-header, html[data-ui] .app-nav { background:var(--surface); border-color:var(--line); }
+    html[data-ui] .auth-scene { background:var(--ink); }
+    html[data-ui] input, html[data-ui] select, html[data-ui] textarea,
+    html[data-ui] .button.secondary, html[data-ui] .button.danger,
+    html[data-ui] .icon-button, html[data-ui] .instance-menu,
+    html[data-ui] .mode-option span, html[data-ui] dialog { background:var(--surface); color:var(--ink); border-color:var(--line); }
+    html[data-ui] .service-chip, html[data-ui] .result-line { background:var(--surface-alt); color:var(--ink); border-color:var(--line); }
+    html[data-ui] .progress, html[data-ui] .update-progress progress,
+    html[data-ui] .update-progress progress::-webkit-progress-bar { background:var(--surface-alt); }
+    html[data-ui] .system-row, html[data-ui] .sparkline, html[data-ui] .node-row { border-color:var(--line); }
+    html[data-ui] dialog::backdrop { background:rgba(0,0,0,.58); }
+    html[data-ui] .metric-value, html[data-ui] .summary-value { font-variant-numeric:tabular-nums; }
+    html[data-ui] .tab-button:focus-visible, html[data-ui] .button:focus-visible,
+    html[data-ui] .icon-button:focus-visible, html[data-ui] select:focus-visible { outline:2px solid var(--cyan); outline-offset:2px; }
+
+    html:is([data-ui="linear-graphite"],[data-ui="vercel-contrast"],[data-ui="cloudscape-night"],[data-ui="grafana-night"],[data-ui="datadog-terminal"],[data-ui="polaris-berry"],[data-ui="carbon-gray"],[data-ui="mission-amber"],[data-ui="mission-cyan"]) .status-badge { background:#17372f;color:#72d8b6;border-color:#315a4d; }
+    html:is([data-ui="linear-graphite"],[data-ui="vercel-contrast"],[data-ui="cloudscape-night"],[data-ui="grafana-night"],[data-ui="datadog-terminal"],[data-ui="polaris-berry"],[data-ui="carbon-gray"],[data-ui="mission-amber"],[data-ui="mission-cyan"]) .status-badge.stopped,
+    html:is([data-ui="linear-graphite"],[data-ui="vercel-contrast"],[data-ui="cloudscape-night"],[data-ui="grafana-night"],[data-ui="datadog-terminal"],[data-ui="polaris-berry"],[data-ui="carbon-gray"],[data-ui="mission-amber"],[data-ui="mission-cyan"]) .status-badge.error { background:#3b2022;color:#ff9393;border-color:#704044; }
+    html:is([data-ui="linear-graphite"],[data-ui="vercel-contrast"],[data-ui="cloudscape-night"],[data-ui="grafana-night"],[data-ui="datadog-terminal"],[data-ui="polaris-berry"],[data-ui="carbon-gray"],[data-ui="mission-amber"],[data-ui="mission-cyan"]) .notice { background:#302719;color:#f2c775;border-color:#6b5630; }
+
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .app {
+      display:grid;grid-template-columns:var(--side-width) minmax(0,1fr);grid-template-rows:66px minmax(0,1fr);
+    }
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .app-header { grid-column:2;grid-row:1; }
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .app-nav {
+      grid-column:1;grid-row:1 / 3;position:sticky;top:0;height:100vh;align-self:start;flex-direction:column;align-items:stretch;gap:5px;padding:82px 12px 18px;border-right:1px solid var(--line);border-bottom:0;overflow-y:auto;
+    }
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .tab-button { width:100%;height:40px;justify-content:flex-start;padding:0 11px;border:0;border-radius:4px; }
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .tab-button.active { background:var(--surface-alt);color:var(--brand); }
+    html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"]) .main { grid-column:2;grid-row:2;width:min(1500px,100%); }
+    html[data-ui="linear-graphite"] .instances, html[data-ui="cloudscape-night"] .instances { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    html[data-ui="polaris-mint"] .instances, html[data-ui="atlassian-neutral"] .instances { grid-template-columns:1fr; }
+    html[data-ui="polaris-mint"] .instance-card:only-child, html[data-ui="atlassian-neutral"] .instance-card:only-child { grid-column:auto; }
+    html[data-ui^="linear-"] .main { padding-top:18px; }
+    html[data-ui="linear-graphite"] .card-body { padding:12px; }
+    html[data-ui^="cloudscape-"] .app-header { border-top:3px solid var(--brand); }
+    html[data-ui^="polaris-"] .summary-band { border-radius:7px; }
+    html[data-ui^="atlassian-"] .app-nav { padding-inline:10px; }
+
+    html[data-ui^="datadog-"] .app { display:grid;grid-template-columns:minmax(0,1fr) var(--side-width);grid-template-rows:66px minmax(0,1fr); }
+    html[data-ui^="datadog-"] .app-header { grid-column:1;grid-row:1; }
+    html[data-ui^="datadog-"] .app-nav { grid-column:2;grid-row:1 / 3;position:sticky;top:0;height:100vh;align-self:start;flex-direction:column;align-items:stretch;gap:6px;padding:82px 12px 18px;border-left:1px solid var(--line);border-bottom:0;overflow-y:auto; }
+    html[data-ui^="datadog-"] .tab-button { width:100%;height:41px;justify-content:flex-start;padding:0 11px;border:0;border-radius:4px; }
+    html[data-ui^="datadog-"] .tab-button.active { background:var(--surface-alt);color:var(--brand); }
+    html[data-ui^="datadog-"] .main { grid-column:1;grid-row:2;width:min(1520px,100%); }
+    html[data-ui="datadog-terminal"] .instances { grid-template-columns:repeat(3,minmax(0,1fr));gap:10px; }
+    html[data-ui="datadog-terminal"] .card-body { padding:11px 12px 9px; }
+
+    html[data-ui^="vercel-"] .app-header { border-top:1px solid var(--ink); }
+    html[data-ui^="vercel-"] .app-nav { justify-content:center;align-items:center; }
+    html[data-ui^="vercel-"] .summary-band, html[data-ui^="vercel-"] .instance-card, html[data-ui^="vercel-"] .panel { box-shadow:none; }
+    html[data-ui="vercel-mono"] .instances { grid-template-columns:1fr; }
+    html[data-ui="vercel-mono"] .instance-card:only-child { grid-column:auto; }
+    html[data-ui="vercel-contrast"] .summary-value { font-family:"Cascadia Mono",Consolas,monospace; }
+
+    html[data-ui^="stripe-"] .app-nav { align-items:center;justify-content:center;border-bottom:0;padding-top:6px; }
+    html[data-ui^="stripe-"] .tab-button { height:38px;padding:0 13px;border:0;border-radius:19px; }
+    html[data-ui^="stripe-"] .tab-button.active { color:#fff;background:var(--brand); }
+    html[data-ui^="stripe-"] .main { width:min(1240px,100%);padding-top:30px; }
+    html[data-ui^="stripe-"] .summary-band { border:0;box-shadow:var(--shadow); }
+    html[data-ui="stripe-coral"] .instances { grid-template-columns:repeat(3,minmax(0,1fr)); }
+
+    html[data-ui^="grafana-"] .main { width:min(1680px,100%);padding:16px 20px 34px; }
+    html[data-ui^="grafana-"] .app-header { height:58px; }
+    html[data-ui^="grafana-"] .app-nav { height:42px;align-items:center; }
+    html[data-ui^="grafana-"] .tab-button { height:42px; }
+    html[data-ui="grafana-night"] .instances { grid-template-columns:repeat(3,minmax(0,1fr));gap:10px; }
+    html[data-ui="grafana-night"] .summary-item { padding:12px 14px; }
+    html[data-ui="grafana-night"] .card-head { min-height:54px;padding:10px 12px; }
+    html[data-ui="grafana-night"] .card-body { padding:10px 12px 8px; }
+    html[data-ui="grafana-day"] .instances { grid-template-columns:1fr 1fr; }
+
+    html[data-ui^="carbon-"] .app-header { background:#161616;color:#f4f4f4;border:0; }
+    html[data-ui^="carbon-"] .app-header .brand-sub, html[data-ui^="carbon-"] .app-header .service-chip { color:#c6c6c6; }
+    html[data-ui^="carbon-"] .app-nav { padding-inline:28px;align-items:center; }
+    html[data-ui^="carbon-"] .tab-button { height:48px;border:0;padding:0 14px; }
+    html[data-ui^="carbon-"] .tab-button.active { background:var(--surface-alt);color:var(--brand); }
+    html[data-ui^="carbon-"] .summary-band, html[data-ui^="carbon-"] .instance-card, html[data-ui^="carbon-"] .panel { box-shadow:none; }
+    html[data-ui="carbon-gray"] .instances { grid-template-columns:1fr; }
+    html[data-ui="carbon-gray"] .instance-card:only-child { grid-column:auto; }
+    html[data-ui^="carbon-"] .card-head, html[data-ui^="carbon-"] .panel-head { border-left:4px solid var(--brand); }
+
+    html[data-ui^="mission-"] .app { padding-bottom:82px; }
+    html[data-ui^="mission-"] .app-header { background:var(--bg);border-bottom-color:var(--line); }
+    html[data-ui^="mission-"] .app-nav { position:fixed;z-index:45;left:50%;bottom:16px;transform:translateX(-50%);height:54px;width:min(620px,calc(100vw - 28px));align-items:center;justify-content:center;padding:6px;border:1px solid var(--line);border-radius:4px;background:var(--surface);box-shadow:0 12px 35px rgba(0,0,0,.42); }
+    html[data-ui^="mission-"] .tab-button { height:40px;flex:1;justify-content:center;border:0;border-radius:2px;padding:0 10px; }
+    html[data-ui^="mission-"] .tab-button.active { background:var(--brand);color:#081012; }
+    html[data-ui^="mission-"] .main { width:min(1700px,100%);padding:18px 22px 34px; }
+    html[data-ui^="mission-"] .summary-band { border-color:var(--brand); }
+    html[data-ui^="mission-"] .summary-label, html[data-ui^="mission-"] .instance-meta { font-family:"Cascadia Mono",Consolas,monospace; }
+    html[data-ui="mission-amber"] .instances { grid-template-columns:repeat(3,minmax(0,1fr));gap:10px; }
+    html[data-ui="mission-cyan"] .summary-band { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    html[data-ui="mission-cyan"] .summary-item:nth-child(2) { border-right:0; }
+    html[data-ui="mission-cyan"] .summary-item:nth-child(-n+2) { border-bottom:1px solid var(--line); }
+
+    /* Navigation is consistently left-sided across every preset. */
+    html[data-ui] .app {
+      display:grid;
+      grid-template-columns:var(--side-width,220px) minmax(0,1fr);
+      grid-template-rows:66px minmax(0,1fr);
+      padding-bottom:0;
+    }
+    html[data-ui] .app-header {
+      grid-column:2;
+      grid-row:1;
+    }
+    html[data-ui] .app-nav {
+      grid-column:1;
+      grid-row:1 / 3;
+      position:sticky;
+      inset:auto;
+      top:0;
+      transform:none;
+      width:auto;
+      height:100vh;
+      align-self:start;
+      flex-direction:column;
+      align-items:stretch;
+      justify-content:flex-start;
+      gap:5px;
+      padding:14px 12px 18px;
+      border:0;
+      border-right:1px solid var(--line);
+      border-radius:0;
+      box-shadow:none;
+      overflow-x:hidden;
+      overflow-y:auto;
+    }
+    html[data-ui] .app-nav::before {
+      content:"ALIYUN GUARD";
+      min-height:42px;
+      display:flex;
+      align-items:center;
+      padding:0 10px 12px;
+      margin-bottom:10px;
+      border-bottom:1px solid var(--line);
+      color:var(--ink);
+      font-size:12px;
+      font-weight:800;
+    }
+    html[data-ui] .tab-button {
+      width:100%;
+      height:42px;
+      flex:0 0 42px;
+      justify-content:flex-start;
+      padding:0 11px;
+      border:0;
+      border-radius:4px;
+      background:transparent;
+      color:var(--muted);
+    }
+    html[data-ui] .tab-button.active {
+      color:var(--brand);
+      background:var(--surface-alt);
+      border:0;
+    }
+    html[data-ui] .main {
+      grid-column:2;
+      grid-row:2;
+    }
+
     @media (max-width: 980px) {
       .auth-shell { grid-template-columns: minmax(280px, 390px) 1fr; }
       .auth-scene { padding: 5vw; }
@@ -5089,6 +5305,9 @@ __AG_WEB_PY_EOF__
       .summary-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
       .metric-grid { grid-template-columns: 1fr 1fr; }
       .mode-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      html[data-ui="linear-graphite"] .instances, html[data-ui="cloudscape-night"] .instances,
+      html[data-ui="datadog-terminal"] .instances, html[data-ui="stripe-coral"] .instances,
+      html[data-ui="grafana-night"] .instances, html[data-ui="mission-amber"] .instances { grid-template-columns:repeat(2,minmax(0,1fr)); }
     }
     @media (max-width: 760px) {
       .auth-shell { display: block; background: var(--bg); padding: 0; }
@@ -5115,6 +5334,85 @@ __AG_WEB_PY_EOF__
       .card-head-tools { gap: 6px; }
       .status-badge { min-width: 74px; padding: 0 8px; }
       .log-view { min-height: 440px; max-height: calc(100vh - 215px); }
+      .ui-picker { width:42px; }
+      .ui-picker select { width:42px;color:transparent;padding:0; }
+      .ui-picker option, .ui-picker optgroup { color:initial; }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .app { display:block; }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .app-header { height:60px; }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .app-nav { position:sticky;top:60px;width:auto;height:48px;flex-direction:row;align-items:end;padding:0 14px;gap:12px;border-left:0;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto;overflow-y:hidden; }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .tab-button { width:auto;height:48px;padding:0 3px;border-radius:0;background:transparent; }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .tab-button.active { background:transparent;border-bottom:2px solid var(--brand); }
+      html:is([data-ui^="linear-"],[data-ui^="cloudscape-"],[data-ui^="polaris-"],[data-ui^="atlassian-"],[data-ui^="datadog-"]) .main { width:100%; }
+      html[data-ui^="mission-"] .app { padding-bottom:74px; }
+      html[data-ui^="mission-"] .app-nav { bottom:8px; }
+      html[data-ui^="mission-"] .tab-button { font-size:0;padding:0; }
+      html[data-ui^="mission-"] .tab-button .icon { width:20px;height:20px;flex-basis:20px; }
+      .ui-picker, #refreshButton { display:none; }
+      .mobile-menu-button { display:grid; }
+      html[data-ui] .app { display:block;padding-bottom:0; }
+      html[data-ui] .app-header {
+        height:60px;
+        position:sticky;
+        top:0;
+        z-index:48;
+        padding:0 10px;
+      }
+      html[data-ui] .app-nav {
+        display:none;
+        position:fixed;
+        inset:68px 10px auto auto;
+        transform:none;
+        width:min(286px,calc(100vw - 20px));
+        height:auto;
+        max-height:calc(100vh - 78px);
+        flex-direction:column;
+        align-items:stretch;
+        gap:5px;
+        padding:10px;
+        background:var(--surface);
+        border:1px solid var(--line);
+        border-radius:6px;
+        box-shadow:0 18px 48px rgba(15,28,24,.24);
+        overflow-x:hidden;
+        overflow-y:auto;
+        z-index:52;
+      }
+      html[data-ui] .app-nav.mobile-open { display:flex; }
+      html[data-ui] .app-nav::before {
+        content:"页面导航";
+        width:auto;
+        min-height:38px;
+        justify-content:flex-start;
+        padding:0 8px 8px;
+        margin-bottom:3px;
+        font-size:12px;
+      }
+      html[data-ui] .tab-button {
+        width:100%;
+        height:44px;
+        flex:0 0 42px;
+        justify-content:flex-start;
+        padding:0 11px;
+        border:0;
+        border-radius:4px;
+        font-size:14px;
+      }
+      html[data-ui] .tab-button.active { background:var(--surface-alt);border:0; }
+      html[data-ui] .tab-button .icon { width:19px;height:19px;flex-basis:19px; }
+      .mobile-menu-tools {
+        margin-top:5px;
+        padding:10px 8px 2px;
+        display:grid;
+        gap:9px;
+        border-top:1px solid var(--line);
+      }
+      .mobile-menu-tools label { display:grid;gap:6px;color:var(--muted);font-size:12px;font-weight:650; }
+      .mobile-menu-tools select { min-height:40px; }
+      .mobile-menu-tools .button { width:100%;justify-content:flex-start; }
+      html[data-ui] .main {
+        width:100%;
+        padding:14px 10px 30px;
+      }
     }
     @media (max-width: 430px) {
       .summary-band { grid-template-columns: 1fr 1fr; }
@@ -5175,16 +5473,66 @@ __AG_WEB_PY_EOF__
       </div>
       <div class="header-actions">
         <div class="service-chip"><span id="serviceDot" class="dot"></span><span id="serviceText">读取中</span></div>
+        <label class="ui-picker" title="切换界面风格">
+          <span data-icon="palette"></span>
+          <select id="uiPreset" aria-label="界面风格">
+            <optgroup label="Linear 工作台">
+              <option data-ui-preset value="linear-paper">Linear / Paper</option>
+              <option data-ui-preset value="linear-graphite">Linear / Graphite</option>
+            </optgroup>
+            <optgroup label="Vercel 极简台">
+              <option data-ui-preset value="vercel-mono">Vercel / Mono</option>
+              <option data-ui-preset value="vercel-contrast">Vercel / Contrast</option>
+            </optgroup>
+            <optgroup label="Stripe 财务台">
+              <option data-ui-preset value="stripe-indigo">Stripe / Indigo</option>
+              <option data-ui-preset value="stripe-coral">Stripe / Coral</option>
+            </optgroup>
+            <optgroup label="Cloudscape 云运维">
+              <option data-ui-preset value="cloudscape-day">Cloudscape / Day</option>
+              <option data-ui-preset value="cloudscape-night">Cloudscape / Night</option>
+            </optgroup>
+            <optgroup label="Grafana 观测台">
+              <option data-ui-preset value="grafana-night">Grafana / Night</option>
+              <option data-ui-preset value="grafana-day">Grafana / Day</option>
+            </optgroup>
+            <optgroup label="Datadog 监控台">
+              <option data-ui-preset value="datadog-observe">Datadog / Observe</option>
+              <option data-ui-preset value="datadog-terminal">Datadog / Terminal</option>
+            </optgroup>
+            <optgroup label="Polaris 管理台">
+              <option data-ui-preset value="polaris-mint">Polaris / Mint</option>
+              <option data-ui-preset value="polaris-berry">Polaris / Berry</option>
+            </optgroup>
+            <optgroup label="Atlassian 协作台">
+              <option data-ui-preset value="atlassian-ocean">Atlassian / Ocean</option>
+              <option data-ui-preset value="atlassian-neutral">Atlassian / Neutral</option>
+            </optgroup>
+            <optgroup label="Carbon 数据台">
+              <option data-ui-preset value="carbon-white">Carbon / White</option>
+              <option data-ui-preset value="carbon-gray">Carbon / Gray</option>
+            </optgroup>
+            <optgroup label="Mission 指挥台">
+              <option data-ui-preset value="mission-amber">Mission / Amber</option>
+              <option data-ui-preset value="mission-cyan">Mission / Cyan</option>
+            </optgroup>
+          </select>
+        </label>
         <button id="refreshButton" class="icon-button" type="button" title="刷新" aria-label="刷新" data-icon="refresh-cw"></button>
+        <button id="mobileMenuButton" class="icon-button mobile-menu-button" type="button" title="打开页面设置" aria-label="打开页面设置" aria-controls="appNav" aria-expanded="false" data-icon="settings"></button>
         <button id="logoutButton" class="icon-button" type="button" title="退出登录" aria-label="退出登录" data-icon="log-out"></button>
       </div>
     </header>
-    <nav class="app-nav" aria-label="控制台视图">
+    <nav id="appNav" class="app-nav" aria-label="控制台视图">
       <button class="tab-button active" data-tab="dashboard"><span data-icon="layout-dashboard"></span>实例</button>
       <button class="tab-button" data-tab="telegram"><span data-icon="send"></span>Telegram</button>
       <button class="tab-button" data-tab="logs"><span data-icon="terminal"></span>日志</button>
       <button class="tab-button" data-tab="settings"><span data-icon="settings"></span>设置</button>
       <button class="tab-button" data-tab="system"><span data-icon="wrench"></span>系统</button>
+      <div class="mobile-menu-tools">
+        <label for="mobileUiPreset">界面风格<select id="mobileUiPreset" aria-label="手机界面风格"></select></label>
+        <button id="mobileRefreshButton" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新数据</button>
+      </div>
     </nav>
     <main class="main">
       <section id="dashboardTab" class="tab-panel">
@@ -5414,13 +5762,52 @@ __AG_WEB_PY_EOF__
       "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
       "save": '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
       "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
-      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>'
+      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+      "palette": '<circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2a10 10 0 0 0 0 20h1.5a2.5 2.5 0 0 0 0-5H12a2 2 0 0 1 0-4h4.5A5.5 5.5 0 0 0 22 7.5 5.5 5.5 0 0 0 16.5 2Z"/>'
     };
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
     const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false };
     const $ = id => document.getElementById(id);
+    const UI_PRESET_KEY = "aliyun-guard-ui";
+    $("mobileUiPreset").innerHTML = $("uiPreset").innerHTML;
+    const UI_PRESETS = new Set(Array.from(document.querySelectorAll("option[data-ui-preset]"), option => option.value));
+    function applyUiPreset(value, persist = true) {
+      const preset = UI_PRESETS.has(value) ? value : "cloudscape-day";
+      document.documentElement.dataset.ui = preset;
+      $("uiPreset").value = preset;
+      $("mobileUiPreset").value = preset;
+      if (persist) {
+        try { localStorage.setItem(UI_PRESET_KEY, preset); } catch (_) {}
+      }
+      return preset;
+    }
+    applyUiPreset(document.documentElement.dataset.ui, false);
+    function changeUiPreset(event) {
+      const label = event.currentTarget.options[event.currentTarget.selectedIndex].text;
+      applyUiPreset(event.currentTarget.value);
+      toast(`界面已切换为 ${label}`);
+    }
+    $("uiPreset").addEventListener("change", changeUiPreset);
+    $("mobileUiPreset").addEventListener("change", changeUiPreset);
+
+    const mobileMenuMedia = window.matchMedia("(max-width: 760px)");
+    function setMobileMenu(open) {
+      const expanded = Boolean(open && mobileMenuMedia.matches);
+      $("appNav").classList.toggle("mobile-open", expanded);
+      $("mobileMenuButton").setAttribute("aria-expanded", String(expanded));
+      $("mobileMenuButton").setAttribute("aria-label", expanded ? "关闭页面设置" : "打开页面设置");
+    }
+    $("mobileMenuButton").addEventListener("click", event => {
+      event.stopPropagation();
+      setMobileMenu($("mobileMenuButton").getAttribute("aria-expanded") !== "true");
+    });
+    document.addEventListener("click", event => {
+      if ($("mobileMenuButton").getAttribute("aria-expanded") === "true" && !$("appNav").contains(event.target)) setMobileMenu(false);
+    });
+    document.addEventListener("keydown", event => { if (event.key === "Escape") setMobileMenu(false); });
+    if (mobileMenuMedia.addEventListener) mobileMenuMedia.addEventListener("change", event => { if (!event.matches) setMobileMenu(false); });
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
     const fmtNum = (value, digits = 2) => value === null || value === undefined ? "--" : Number(value).toFixed(digits);
@@ -5455,6 +5842,7 @@ __AG_WEB_PY_EOF__
     }
 
     function showLogin() {
+      setMobileMenu(false);
       clearInterval(state.timer);
       state.timer = null;
       state.csrf = null;
@@ -5803,6 +6191,7 @@ __AG_WEB_PY_EOF__
       document.querySelectorAll(".tab-panel").forEach(x => x.hidden = x.id !== `${button.dataset.tab}Tab`);
       if (button.dataset.tab === "logs") loadLogs();
       if (["telegram", "settings", "system"].includes(button.dataset.tab)) loadManagement(false);
+      setMobileMenu(false);
     }));
 
     $("loginForm").addEventListener("submit", async event => {
@@ -5816,7 +6205,14 @@ __AG_WEB_PY_EOF__
     });
 
     $("togglePassword").addEventListener("click", () => { const input = $("password"); input.type = input.type === "password" ? "text" : "password"; $("togglePassword").innerHTML = icon(input.type === "password" ? "eye" : "eye-off"); });
-    $("refreshButton").addEventListener("click", async () => { $("refreshButton").querySelector("svg").classList.add("spin"); await Promise.all([loadDashboard(), loadManagement()]); $("refreshButton").querySelector("svg").classList.remove("spin"); });
+    async function refreshData(button) {
+      button.querySelector("svg").classList.add("spin");
+      button.disabled = true;
+      try { await Promise.all([loadDashboard(), loadManagement()]); }
+      finally { button.querySelector("svg").classList.remove("spin"); button.disabled = false; }
+    }
+    $("refreshButton").addEventListener("click", () => refreshData($("refreshButton")));
+    $("mobileRefreshButton").addEventListener("click", async () => { await refreshData($("mobileRefreshButton")); setMobileMenu(false); });
     $("logsRefresh").addEventListener("click", loadLogs);
     $("logSource").addEventListener("change", loadLogs);
     $("instanceLogToggle").addEventListener("click", async () => {
@@ -8007,7 +8403,7 @@ UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
 APP_VERSION = "1.5.7"
-LOCAL_RELEASE_ID = "be4b121ddb40f0acb0bab4309bb459084844c51ca83545866209750c1b9090b2"
+LOCAL_RELEASE_ID = "eff5f6d2be50408db33a3e4150219664d823545f358b3d765d3cc06aed80f3e2"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
