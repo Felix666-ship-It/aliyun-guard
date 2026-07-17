@@ -40,13 +40,15 @@ if [ "$(id -u)" -ne 0 ]; then
     die "请使用 root 权限运行（sudo -i）。"
 fi
 
-if [ ! -r /dev/tty ] && [ "$INSTALL_ACTION" = interactive ]; then
-    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
-fi
-if [ -r /dev/tty ]; then
+TTY_AVAILABLE=no
+if { : </dev/tty; } 2>/dev/null; then
     exec 3</dev/tty
+    TTY_AVAILABLE=yes
 else
     exec 3<&0
+fi
+if [ "$TTY_AVAILABLE" != yes ] && [ "$INSTALL_ACTION" = interactive ]; then
+    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
 fi
 
 prompt() {
@@ -3270,7 +3272,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -8003,8 +8005,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.5.5"
-LOCAL_RELEASE_ID = "e30e9e874b7b324ec2843fb511a4809370ab3bb5094fa83630a994480722b082"
+APP_VERSION = "1.5.6"
+LOCAL_RELEASE_ID = "2f0931c67ed84abd5ac890b1ab3f916dfb3a9d936cd3a5f66fde33d0e505f8c3"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

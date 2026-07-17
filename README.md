@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.5.5-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.5.6-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -628,6 +628,7 @@ aliyun-guard dry-run
 | `未找到实例` | Region 或 Instance ID 不匹配 | 在 ECS 控制台核对 Region ID 和实例 ID |
 | `v1.5.1` 网页提示已启动更新但版本未变化 | 旧网页更新进程随 systemd 主服务停止而被终止 | 先通过 SSH 执行一次 `aliyun-guard update` 升级到 `v1.5.2`；后续网页更新会使用独立 systemd 单元 |
 | `v1.5.2` / `v1.5.3` 网页更新校验失败或无完成反馈 | `main` 分支 Raw 文件可能存在缓存错配，旧页面也不显示后台进度 | 使用 `v1.5.4` Release 安装器升级一次；之后更新固定使用同一 Release，并显示真实进度 |
+| `v1.5.4` / `v1.5.5` 网页更新停在 25% | systemd 更新任务没有控制终端，旧安装器误判 `/dev/tty` 可用后提前退出 | `v1.5.6` 发布后在网页直接重试；若仍失败，再通过 SSH 执行 `aliyun-guard update` |
 
 日志会明确使用 `CDT 流量查询失败`、`ECS 实例查询失败`、`BSS 账单查询失败` 或 `Telegram ... 失败` 标注来源，避免一条模糊错误掩盖其他已成功的检查。
 

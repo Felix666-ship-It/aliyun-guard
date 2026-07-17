@@ -1136,6 +1136,14 @@ class UpdateTests(unittest.TestCase):
 
 
 class InstallerTemplateTests(unittest.TestCase):
+    def test_noninteractive_update_probes_tty_before_opening_it(self):
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if { : </dev/tty; } 2>/dev/null; then", template)
+        self.assertIn('if [ "$TTY_AVAILABLE" != yes ]', template)
+        self.assertNotIn("if [ -r /dev/tty ]", template)
+
     def test_update_preserves_telegram_node_configuration(self):
         template = (ROOT / "packaging" / "install.template.sh").read_text(
             encoding="utf-8"

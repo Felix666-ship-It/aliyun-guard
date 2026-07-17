@@ -40,13 +40,15 @@ if [ "$(id -u)" -ne 0 ]; then
     die "请使用 root 权限运行（sudo -i）。"
 fi
 
-if [ ! -r /dev/tty ] && [ "$INSTALL_ACTION" = interactive ]; then
-    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
-fi
-if [ -r /dev/tty ]; then
+TTY_AVAILABLE=no
+if { : </dev/tty; } 2>/dev/null; then
     exec 3</dev/tty
+    TTY_AVAILABLE=yes
 else
     exec 3<&0
+fi
+if [ "$TTY_AVAILABLE" != yes ] && [ "$INSTALL_ACTION" = interactive ]; then
+    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
 fi
 
 prompt() {
