@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.5.8-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.5.7-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
