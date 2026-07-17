@@ -5,8 +5,10 @@
 import copy
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import time
 
 import telegram_proxy
 
@@ -717,6 +719,50 @@ def detached_process(command, log_name):
     return process.pid
 
 
+def systemd_update_process(command, log_name):
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise ManagementError(
+            "当前 systemd 环境缺少 systemd-run，无法从网页安全更新；"
+            "请通过 SSH 执行 aliyun-guard update",
+            500,
+        )
+    log_path = APP_DIR / "logs" / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(mode=0o600, exist_ok=True)
+    os.chmod(log_path, 0o600)
+    unit = "aliyun-guard-update-{}-{}".format(os.getpid(), int(time.time() * 1000))
+    shell_command = 'log_path=$1; shift; exec "$@" >>"$log_path" 2>&1'
+    launcher = [
+        systemd_run,
+        "--quiet",
+        "--no-block",
+        "--unit={}".format(unit),
+        "/bin/sh",
+        "-c",
+        shell_command,
+        "aliyun-guard-update",
+        str(log_path),
+        *command,
+    ]
+    try:
+        result = subprocess.run(
+            launcher,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        raise ManagementError("启动独立更新服务失败: {}".format(exc), 500)
+    if result.returncode != 0:
+        detail = str(result.stdout or "systemd-run 返回错误").strip()
+        raise ManagementError("启动独立更新服务失败: {}".format(detail), 500)
+    return unit
+
+
 def service_command(action):
     if action != "restart":
         raise ManagementError("服务操作无效")
@@ -746,10 +792,17 @@ def install_update():
     manager_path = APP_DIR / "manager.py"
     if not manager_path.exists():
         raise ManagementError("更新程序不存在", 500)
+    command = [sys.executable, str(manager_path), "update", "--yes"]
+    backend_path = APP_DIR / "service_backend"
     try:
-        return detached_process(
-            [sys.executable, str(manager_path), "update", "--yes"],
-            "web-update.log",
-        )
+        backend = backend_path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        backend = ""
+    try:
+        if backend == "systemd":
+            return systemd_update_process(command, "web-update.log")
+        return detached_process(command, "web-update.log")
+    except ManagementError:
+        raise
     except Exception as exc:
         raise ManagementError("启动更新失败: {}".format(exc), 500)

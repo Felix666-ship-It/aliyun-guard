@@ -1,6 +1,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,61 @@ class WebActionTests(unittest.TestCase):
                 web_actions.install_update()
         self.assertEqual(raised.exception.status, 409)
         self.assertIn("docker compose", str(raised.exception))
+
+    def test_systemd_update_uses_independent_transient_unit(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        manager_path = app_dir / "manager.py"
+        manager_path.write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        completed = subprocess.CompletedProcess([], 0, "")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(
+            web_actions.shutil, "which", return_value="/usr/bin/systemd-run"
+        ), mock.patch.object(
+            web_actions.subprocess, "run", return_value=completed
+        ) as run, mock.patch.object(
+            web_actions, "detached_process"
+        ) as detached:
+            unit = web_actions.install_update()
+        self.assertTrue(unit.startswith("aliyun-guard-update-"))
+        detached.assert_not_called()
+        launcher = run.call_args.args[0]
+        self.assertEqual(launcher[0], "/usr/bin/systemd-run")
+        self.assertIn("--no-block", launcher)
+        self.assertIn("--unit={}".format(unit), launcher)
+        self.assertIn(str(manager_path), launcher)
+        self.assertIn(str(app_dir / "logs" / "web-update.log"), launcher)
+
+    def test_systemd_update_without_systemd_run_reports_cli_fallback(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        (app_dir / "manager.py").write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(web_actions.shutil, "which", return_value=None):
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.install_update()
+        self.assertIn("aliyun-guard update", str(raised.exception))
+
+    def test_non_systemd_update_keeps_detached_process_fallback(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        manager_path = app_dir / "manager.py"
+        manager_path.write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("openrc\n", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(
+            web_actions, "detached_process", return_value=77
+        ) as detached:
+            self.assertEqual(web_actions.install_update(), 77)
+        detached.assert_called_once_with(
+            [sys.executable, str(manager_path), "update", "--yes"],
+            "web-update.log",
+        )
 
     def test_update_check_identifies_container_deployment(self):
         with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "1"}), mock.patch(
