@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -945,6 +945,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parts == ["api", "update"]:
                 self._json(web_actions.check_update())
                 return
+            if parts == ["api", "s3-backup", "list"]:
+                self._json(
+                    {"ok": True, "backups": web_actions.list_s3_backups(self.server.guard)}
+                )
+                return
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
@@ -1060,6 +1065,40 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._authenticated(require_csrf=True)
                 result = web_actions.create_encrypted_backup(self._read_json())
                 self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "settings"]:
+                result = web_actions.save_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "s3_backup": result})
+                return
+            if parts == ["api", "s3-backup", "test"]:
+                result = web_actions.test_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "run"]:
+                self._read_json()
+                result = web_actions.run_s3_backup_now(self.server.guard)
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "preview"]:
+                data = self._read_json()
+                result = web_actions.preview_s3_backup(
+                    self.server.guard, data.get("key")
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "restore"]:
+                data = self._read_json()
+                result = web_actions.restore_s3_backup(
+                    self.server.guard,
+                    data.get("key"),
+                    include_logs=web_actions._boolean(data, "include_logs", True),
+                )
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
                 return
             if parts == ["api", "backup", "preview"]:
                 self._authenticated(require_csrf=True)

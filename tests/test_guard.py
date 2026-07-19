@@ -1190,10 +1190,13 @@ class InstallerTemplateTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('"backup_manager.py", "backup_manager.py"', builder)
+        self.assertIn('"s3_backup.py", "s3_backup.py"', builder)
         self.assertIn('"watchdog.py", "watchdog.py"', builder)
         self.assertIn("$SERVICE_NAME-watchdog.timer", template)
         self.assertIn("# aliyun-guard-watchdog", template)
         self.assertIn("cryptography>=42,<46", template)
+        self.assertIn("boto3>=1.34,<2", template)
+        self.assertIn('"$APP_DIR/s3_backup.py"', template)
         self.assertIn('if [ "$START_BACKEND" = yes ]; then', template)
         control = (ROOT / "src" / "control.sh").read_text(encoding="utf-8")
         self.assertIn('systemctl disable --now "$SERVICE_NAME-watchdog.timer"', control)

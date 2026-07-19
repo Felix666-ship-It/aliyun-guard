@@ -35,10 +35,12 @@ DATA_FILES = (
     "config.json",
     "state.json",
     "telegram-control-state.json",
+    "s3-backup-state.json",
     "service_backend",
 )
 PROGRAM_FILES = (
     "aliyun_guard.py",
+    "s3_backup.py",
     "manager.py",
     "telegram_proxy.py",
     "telegram_control.py",

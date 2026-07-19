@@ -27,6 +27,7 @@ except ImportError as exc:
     REQUESTS_IMPORT_ERROR = exc
 
 import telegram_proxy
+import s3_backup
 
 try:
     import fcntl
@@ -94,6 +95,7 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 600,
         "failure_threshold": 2,
     },
+    "s3_backup": dict(s3_backup.DEFAULT_CONFIG),
     "users": [],
 }
 
@@ -299,6 +301,12 @@ def validate_config(config):
         raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
     if watchdog_failures < 1 or watchdog_failures > 10:
         raise GuardError("看门狗连续失败次数必须在 1 到 10 之间")
+    try:
+        config["s3_backup"] = s3_backup.validate_config(
+            config.get("s3_backup", {}), require_ready=None
+        )
+    except s3_backup.S3BackupError as exc:
+        raise GuardError(str(exc))
     try:
         import web_panel
     except ImportError as exc:
@@ -1762,19 +1770,21 @@ def is_due(config, state, now=None):
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
+    config = load_config()
+    now = dt.datetime.now().astimezone()
+    result = 0
     with cycle_lock() as locked:
         if not locked:
             LOGGER.info("已有检测正在运行，本次计划任务跳过")
-            return 0
-        config = load_config()
-        write_heartbeat("scheduled", "计划任务已唤醒")
-        state = load_state()
-        now = dt.datetime.now().astimezone()
-        if not is_due(config, state, now.timestamp()) and not has_due_schedule(
-            config, state, now
-        ):
-            return 0
-        return run_cycle(started_at=now)
+        else:
+            write_heartbeat("scheduled", "计划任务已唤醒")
+            state = load_state()
+            if is_due(config, state, now.timestamp()) or has_due_schedule(
+                config, state, now
+            ):
+                result = run_cycle(started_at=now)
+    run_s3_backup_if_due(config, now)
+    return result
 
 
 def scheduler_wait_seconds(config, state, now=None):
@@ -1786,6 +1796,100 @@ def scheduler_wait_seconds(config, state, now=None):
         regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
+
+
+def s3_backup_secrets(config):
+    backup = config.get("s3_backup", {}) if isinstance(config, dict) else {}
+    return tuple(
+        str(backup.get(field, "") or "")
+        for field in (
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "backup_password",
+        )
+        if str(backup.get(field, "") or "")
+    )
+
+
+def run_s3_backup_if_due(config, now=None):
+    backup = config.get("s3_backup", {})
+    if not isinstance(backup, dict) or not backup.get("enabled", False):
+        return None
+    now = now or dt.datetime.now().astimezone()
+    secrets = s3_backup_secrets(config)
+    heartbeat_stop = threading.Event()
+
+    def refresh_backup_heartbeat():
+        while not heartbeat_stop.wait(30):
+            try:
+                write_heartbeat("s3_backup", "S3 加密备份正在上传")
+            except Exception:
+                pass
+
+    write_heartbeat("s3_backup", "检查 S3 自动备份计划")
+    heartbeat_thread = threading.Thread(
+        target=refresh_backup_heartbeat,
+        name="aliyun-guard-s3-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        try:
+            result = s3_backup.run_if_due(backup, CONFIG_FILE.parent, now=now)
+        except Exception as exc:
+            result = {"ok": False, "error": compact_error(exc, secrets=secrets)}
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
+        write_heartbeat("daemon_running", "S3 自动备份检查完成")
+    if result is None or result.get("skipped"):
+        return result
+    mode = str(backup.get("notification_mode", "errors"))
+    if result.get("ok"):
+        LOGGER.info(
+            "S3 自动备份成功: %s，清理 %s 份旧备份",
+            result.get("key"),
+            len(result.get("deleted", [])),
+        )
+        should_send = mode == "always"
+        text = (
+            "Aliyun Guard S3 自动备份成功\n"
+            "时间: {}\n"
+            "Bucket: {}\n"
+            "对象: {}\n"
+            "大小: {:.2f} MiB\n"
+            "清理旧备份: {} 份"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            result.get("bucket", ""),
+            result.get("key", ""),
+            float(result.get("size", 0)) / 1048576,
+            len(result.get("deleted", [])),
+        )
+    else:
+        LOGGER.error("S3 自动备份失败: %s", result.get("error", "未知错误"))
+        should_send = mode in ("always", "errors")
+        text = (
+            "Aliyun Guard S3 自动备份失败\n"
+            "时间: {}\n"
+            "错误: {}"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            compact_error(result.get("error", "未知错误"), secrets=secrets),
+        )
+    if should_send:
+        try:
+            send_telegram_message(config.get("telegram", {}), text)
+        except Exception as exc:
+            LOGGER.error(
+                "S3 备份结果 Telegram 通知失败: %s",
+                compact_error(
+                    exc,
+                    secrets=telegram_secrets(config.get("telegram", {})) + secrets,
+                ),
+            )
+    return result
 
 
 def handle_stop(signum, frame):
@@ -1830,6 +1934,7 @@ def run_daemon():
     first_cycle = True
     while not _STOP_EVENT.is_set():
         write_heartbeat("daemon_running", "调度循环正常")
+        now = dt.datetime.now().astimezone()
         with cycle_lock() as locked:
             if locked:
                 try:
@@ -1852,6 +1957,10 @@ def run_daemon():
                     )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
+        try:
+            run_s3_backup_if_due(config, now)
+        except Exception as exc:
+            LOGGER.error("S3 自动备份调度失败: %s", compact_error(exc))
         first_cycle = False
         try:
             config = load_config()

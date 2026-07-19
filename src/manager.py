@@ -18,6 +18,7 @@ import urllib.request
 
 import aliyun_guard as guard
 import backup_manager
+import s3_backup
 import telegram_proxy
 import web_panel
 
@@ -29,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -1400,6 +1401,181 @@ def backup_restore_menu():
             print("操作失败: {}".format(exc))
 
 
+def collect_s3_backup_settings(config):
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    title("S3 自动备份设置")
+    candidate = dict(current)
+    candidate["enabled"] = yes_no("启用 S3 自动备份", current["enabled"])
+    candidate["bucket"] = prompt(
+        "Bucket 名称", current["bucket"], required=candidate["enabled"]
+    )
+    candidate["region"] = prompt("AWS/S3 Region", current["region"], required=True)
+    candidate["endpoint_url"] = prompt(
+        "自定义 Endpoint（AWS S3 留空）", current["endpoint_url"]
+    ).rstrip("/")
+    candidate["prefix"] = prompt("对象目录前缀", current["prefix"])
+    styles = [("auto", "自动"), ("path", "路径寻址"), ("virtual", "虚拟主机寻址")]
+    print("\nS3 寻址方式：")
+    default_style = next(
+        (index for index, item in enumerate(styles, 1) if item[0] == current["addressing_style"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(styles, 1):
+        print(" {}) {}".format(index, label))
+    candidate["addressing_style"] = styles[
+        prompt_int("寻址方式", default_style, 1, len(styles)) - 1
+    ][0]
+    use_role = yes_no("使用 EC2 IAM Role/环境凭据", not bool(current["access_key_id"]))
+    if use_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        candidate["access_key_id"] = prompt_secret(
+            "AWS Access Key ID",
+            keep_existing=not candidate["enabled"] or bool(current["access_key_id"]),
+        ) or current["access_key_id"]
+        candidate["secret_access_key"] = prompt_secret(
+            "AWS Secret Access Key",
+            keep_existing=not candidate["enabled"] or bool(current["secret_access_key"]),
+        ) or current["secret_access_key"]
+        candidate["session_token"] = prompt_secret(
+            "AWS Session Token（长期密钥留空）", keep_existing=True
+        ) or current["session_token"]
+    candidate["backup_password"] = prompt_secret(
+        "自动备份加密密码（至少 8 位）",
+        keep_existing=not candidate["enabled"] or bool(current["backup_password"]),
+    ) or current["backup_password"]
+    schedules = [("hourly", "每小时"), ("daily", "每天"), ("weekly", "每周")]
+    print("\n自动备份周期：")
+    default_schedule = next(
+        (index for index, item in enumerate(schedules, 1) if item[0] == current["schedule"]),
+        2,
+    )
+    for index, (_value, label) in enumerate(schedules, 1):
+        print(" {}) {}".format(index, label))
+    candidate["schedule"] = schedules[
+        prompt_int("周期", default_schedule, 1, len(schedules)) - 1
+    ][0]
+    candidate["time"] = prompt(
+        "执行时间 HH:MM（每小时仅使用分钟）", current["time"], required=True
+    )
+    if candidate["schedule"] == "weekly":
+        candidate["weekday"] = prompt_int(
+            "星期（0=周一，6=周日）", current["weekday"], 0, 6
+        )
+    candidate["retention"] = prompt_int(
+        "云端和本地保留份数", current["retention"], 1, 365
+    )
+    candidate["include_state"] = yes_no("包含运行状态", current["include_state"])
+    candidate["include_logs"] = yes_no("包含日志", current["include_logs"])
+    notifications = [("errors", "仅失败通知"), ("always", "成功和失败都通知"), ("none", "不通知")]
+    print("\nTelegram 通知：")
+    default_notice = next(
+        (index for index, item in enumerate(notifications, 1) if item[0] == current["notification_mode"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(notifications, 1):
+        print(" {}) {}".format(index, label))
+    candidate["notification_mode"] = notifications[
+        prompt_int("通知方式", default_notice, 1, len(notifications)) - 1
+    ][0]
+    encryptions = [("AES256", "SSE-S3"), ("aws:kms", "SSE-KMS"), ("", "关闭服务端加密")]
+    print("\nS3 服务端加密：")
+    default_encryption = next(
+        (index for index, item in enumerate(encryptions, 1) if item[0] == current["server_side_encryption"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(encryptions, 1):
+        print(" {}) {}".format(index, label))
+    candidate["server_side_encryption"] = encryptions[
+        prompt_int("加密方式", default_encryption, 1, len(encryptions)) - 1
+    ][0]
+    if candidate["server_side_encryption"] == "aws:kms":
+        candidate["kms_key_id"] = prompt_secret(
+            "KMS Key ID/ARN", keep_existing=bool(current["kms_key_id"])
+        ) or current["kms_key_id"]
+    else:
+        candidate["kms_key_id"] = ""
+    return s3_backup.validate_config(candidate, require_ready=candidate["enabled"])
+
+
+def print_s3_backups(items):
+    if not items:
+        print("云端没有 Aliyun Guard 加密备份。")
+        return
+    for index, item in enumerate(items, 1):
+        print(
+            " {:>3}) {:<42} {:>8.2f} MiB  {}".format(
+                index,
+                item["name"][:42],
+                float(item["size"]) / 1048576,
+                item.get("modified_at", ""),
+            )
+        )
+
+
+def s3_backup_menu(config):
+    while True:
+        current = s3_backup.normalized_config(config.get("s3_backup", {}))
+        status = s3_backup.read_status(CONFIG_FILE.parent)
+        title("AWS S3 / S3 兼容存储自动备份")
+        print("状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        print("Bucket: {}".format(current["bucket"] or "未配置"))
+        print("最近成功: {}".format(status.get("last_success_at") or "尚未运行"))
+        if status.get("last_error"):
+            print("最近错误: {}".format(status["last_error"]))
+        print("\n 1) 配置自动备份")
+        print(" 2) 测试当前 S3 连接")
+        print(" 3) 立即创建并上传加密备份")
+        print(" 4) 查看云端备份")
+        print(" 5) 从云端预览并恢复")
+        print(" 6) 返回")
+        choice = prompt_int("请输入序号", 6, 1, 6)
+        if choice == 6:
+            return
+        try:
+            if choice == 1:
+                candidate = collect_s3_backup_settings(config)
+                if candidate["enabled"]:
+                    print("正在测试 S3 连接...")
+                    result = s3_backup.test_connection(candidate)
+                    print("连接成功，延迟约 {} ms。".format(result["latency_ms"]))
+                config["s3_backup"] = candidate
+                save_config(config)
+                print("S3 自动备份设置已保存。")
+            elif choice == 2:
+                result = s3_backup.test_connection(current)
+                print("连接成功：{} / {}，延迟约 {} ms。".format(result["bucket"], result["endpoint"], result["latency_ms"]))
+            elif choice == 3:
+                result = s3_backup.create_and_upload(current, CONFIG_FILE.parent)
+                print("上传成功: s3://{}/{}".format(result["bucket"], result["key"]))
+                print("已清理云端旧备份 {} 份。".format(len(result["deleted"])))
+            elif choice in (4, 5):
+                items = s3_backup.list_backups(current, limit=100)
+                print_s3_backups(items)
+                if choice == 5 and items:
+                    index = prompt_int("选择要恢复的备份", 1, 1, len(items)) - 1
+                    path = s3_backup.download_backup(current, items[index]["key"], CONFIG_FILE.parent)
+                    try:
+                        preview = backup_manager.preview_restore(path, current["backup_password"], CONFIG_FILE.parent)
+                        for item in preview.get("files", []):
+                            print(" - {:<9} {}".format(item["action"], item["path"]))
+                        if yes_no("确认按以上差异恢复并重启服务", False):
+                            result = backup_manager.restore_backup(
+                                path,
+                                current["backup_password"],
+                                CONFIG_FILE.parent,
+                                include_logs=yes_no("恢复备份中的日志", True),
+                            )
+                            print("恢复完成，恢复前安全备份: {}".format(result["safety_backup"]))
+                            run_control("restart")
+                    finally:
+                        path.unlink(missing_ok=True)
+        except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+            print("S3 备份操作失败: {}".format(exc))
+
+
 def discover_instances_menu(config):
     title("自动发现阿里云 ECS")
     ak = prompt_secret("AccessKey ID")
@@ -1579,7 +1755,8 @@ def menu():
         print("17) 备份、恢复与版本回滚")
         print("18) 自动发现并批量导入 ECS")
         print("19) 退出")
-        choice = prompt_int("请输入序号", 19, 1, 19)
+        print("20) AWS S3 自动备份")
+        choice = prompt_int("请输入序号", 19, 1, 20)
         try:
             if choice == 1:
                 show_status(config)
@@ -1621,6 +1798,8 @@ def menu():
                 discover_instances_menu(config)
             elif choice == 19:
                 return 0
+            elif choice == 20:
+                s3_backup_menu(config)
         except KeyboardInterrupt:
             print("\n操作已取消。")
         if choice != 19:

@@ -309,7 +309,8 @@ create_venv() {
         'aliyun-python-sdk-core>=2.16,<3' \
         'aliyun-python-sdk-ecs>=4.24,<5' \
         'requests[socks]>=2.31,<3' \
-        'cryptography>=42,<46'
+        'cryptography>=42,<46' \
+        'boto3>=1.34,<2'
 }
 
 stop_old_backend() {
@@ -329,7 +330,7 @@ write_payload() {
     mkdir -p "$APP_DIR/logs"
 # __PAYLOAD_BLOCKS__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/s3_backup.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -339,6 +340,7 @@ write_payload() {
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
         "$APP_DIR/backup_manager.py" \
+        "$APP_DIR/s3_backup.py" \
         "$APP_DIR/watchdog.py" \
         "$APP_DIR/telegram_proxy.py" \
         "$APP_DIR/telegram_control.py" \

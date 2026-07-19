@@ -309,7 +309,8 @@ create_venv() {
         'aliyun-python-sdk-core>=2.16,<3' \
         'aliyun-python-sdk-ecs>=4.24,<5' \
         'requests[socks]>=2.31,<3' \
-        'cryptography>=42,<46'
+        'cryptography>=42,<46' \
+        'boto3>=1.34,<2'
 }
 
 stop_old_backend() {
@@ -365,10 +366,12 @@ DATA_FILES = (
     "config.json",
     "state.json",
     "telegram-control-state.json",
+    "s3-backup-state.json",
     "service_backend",
 )
 PROGRAM_FILES = (
     "aliyun_guard.py",
+    "s3_backup.py",
     "manager.py",
     "telegram_proxy.py",
     "telegram_control.py",
@@ -776,6 +779,513 @@ def restore_program_snapshot(snapshot_path=None, app_dir=APP_DIR):
         "safety_snapshot": str(current_snapshot),
     }
 __AG_BACKUP_PY_EOF__
+    cat > "$APP_DIR/s3_backup.py" <<'__AG_S3_BACKUP_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Encrypted backup storage for AWS S3 and S3-compatible services."""
+
+import contextlib
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import urllib.parse
+
+import backup_manager
+
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import BotoCoreError, ClientError
+    from boto3.s3.transfer import TransferConfig
+    BOTO_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - installer supplies boto3
+    boto3 = None
+    Config = None
+    TransferConfig = None
+    BotoCoreError = ClientError = Exception
+    BOTO_IMPORT_ERROR = exc
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - deployed targets are Linux
+    fcntl = None
+
+
+DEFAULT_CONFIG = {
+    "enabled": False,
+    "bucket": "",
+    "region": "us-east-1",
+    "endpoint_url": "",
+    "addressing_style": "auto",
+    "prefix": "aliyun-guard",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "session_token": "",
+    "backup_password": "",
+    "schedule": "daily",
+    "time": "03:00",
+    "weekday": 0,
+    "retention": 30,
+    "include_state": True,
+    "include_logs": False,
+    "notification_mode": "errors",
+    "server_side_encryption": "AES256",
+    "kms_key_id": "",
+}
+
+STATE_NAME = "s3-backup-state.json"
+LOCK_NAME = "s3-backup.lock"
+MAX_REMOTE_ITEMS = 5000
+RETRY_SECONDS = 15 * 60
+
+
+class S3BackupError(RuntimeError):
+    pass
+
+
+def normalized_config(value):
+    result = dict(DEFAULT_CONFIG)
+    if isinstance(value, dict):
+        result.update(value)
+    result["bucket"] = str(result.get("bucket", "") or "").strip()
+    result["region"] = str(result.get("region", "") or "us-east-1").strip()
+    result["endpoint_url"] = str(result.get("endpoint_url", "") or "").strip().rstrip("/")
+    result["prefix"] = str(result.get("prefix", "") or "aliyun-guard").strip().strip("/")
+    for field in ("access_key_id", "secret_access_key", "session_token", "backup_password", "kms_key_id"):
+        result[field] = str(result.get(field, "") or "").strip()
+    return result
+
+
+def validate_config(value, require_ready=None):
+    config = normalized_config(value)
+    for field in ("enabled", "include_state", "include_logs"):
+        if not isinstance(config.get(field), bool):
+            raise S3BackupError("s3_backup.{} 必须是布尔值".format(field))
+    if config["schedule"] not in ("hourly", "daily", "weekly"):
+        raise S3BackupError("S3 备份周期必须是 hourly、daily 或 weekly")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(config.get("time", ""))):
+        raise S3BackupError("S3 备份时间必须是 HH:MM")
+    try:
+        config["weekday"] = int(config.get("weekday", 0))
+        config["retention"] = int(config.get("retention", 30))
+    except (TypeError, ValueError) as exc:
+        raise S3BackupError("S3 星期和保留份数必须是整数") from exc
+    if config["weekday"] < 0 or config["weekday"] > 6:
+        raise S3BackupError("S3 每周备份日期必须在 0 到 6 之间")
+    if config["retention"] < 1 or config["retention"] > 365:
+        raise S3BackupError("S3 备份保留份数必须在 1 到 365 之间")
+    if config["notification_mode"] not in ("always", "errors", "none"):
+        raise S3BackupError("S3 通知模式必须是 always、errors 或 none")
+    if config["server_side_encryption"] not in ("", "AES256", "aws:kms"):
+        raise S3BackupError("S3 服务端加密必须是 AES256、aws:kms 或关闭")
+    if config["addressing_style"] not in ("auto", "path", "virtual"):
+        raise S3BackupError("S3 寻址方式必须是 auto、path 或 virtual")
+    if config["server_side_encryption"] == "aws:kms" and not config["kms_key_id"]:
+        raise S3BackupError("使用 SSE-KMS 时必须填写 KMS Key ID")
+    if bool(config["access_key_id"]) != bool(config["secret_access_key"]):
+        raise S3BackupError("S3 Access Key ID 和 Secret Access Key 必须同时填写或同时留空")
+    if config["session_token"] and not config["access_key_id"]:
+        raise S3BackupError("S3 Session Token 需要同时配置 Access Key")
+    if config["endpoint_url"]:
+        parsed = urllib.parse.urlsplit(config["endpoint_url"])
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+            raise S3BackupError("S3 Endpoint 必须是无账号密码的 HTTP/HTTPS 地址")
+        if parsed.scheme == "http" and parsed.hostname not in (
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        ):
+            raise S3BackupError("远程 S3 Endpoint 必须使用 HTTPS；HTTP 仅允许本机 MinIO")
+    if config["prefix"]:
+        if len(config["prefix"]) > 256 or any(part in (".", "..") for part in config["prefix"].split("/")):
+            raise S3BackupError("S3 对象前缀无效")
+    ready = config["enabled"] if require_ready is None else bool(require_ready)
+    if ready:
+        if not config["bucket"]:
+            raise S3BackupError("S3 Bucket 不能为空")
+        if not config["region"]:
+            raise S3BackupError("S3 Region 不能为空")
+        if len(config["backup_password"]) < 8:
+            raise S3BackupError("S3 自动备份密码至少需要 8 个字符")
+    return config
+
+
+def _require_boto3():
+    if BOTO_IMPORT_ERROR is not None:
+        raise S3BackupError("缺少 S3 依赖 boto3: {}".format(BOTO_IMPORT_ERROR))
+
+
+def create_client(value):
+    _require_boto3()
+    config = validate_config(value, require_ready=True)
+    kwargs = {
+        "service_name": "s3",
+        "region_name": config["region"],
+        "config": Config(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 3, "mode": "standard"},
+            signature_version="s3v4",
+            s3={"addressing_style": config["addressing_style"]},
+        ),
+    }
+    if config["endpoint_url"]:
+        kwargs["endpoint_url"] = config["endpoint_url"]
+    if config["access_key_id"]:
+        kwargs["aws_access_key_id"] = config["access_key_id"]
+        kwargs["aws_secret_access_key"] = config["secret_access_key"]
+        if config["session_token"]:
+            kwargs["aws_session_token"] = config["session_token"]
+    return boto3.client(**kwargs)
+
+
+def _compact_error(exc, secrets=()):
+    if BOTO_IMPORT_ERROR is None and isinstance(exc, ClientError):
+        error = exc.response.get("Error", {})
+        text = "{}: {}".format(error.get("Code", "S3Error"), error.get("Message", str(exc)))
+    else:
+        text = str(exc)
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***")
+    return text.replace("\r", " ").replace("\n", " ")[:600]
+
+
+def _config_secrets(config):
+    return tuple(
+        config.get(field, "")
+        for field in ("access_key_id", "secret_access_key", "session_token", "backup_password")
+        if config.get(field, "")
+    )
+
+
+def _call(label, operation, secrets=()):
+    try:
+        return operation()
+    except (BotoCoreError, ClientError, OSError) as exc:
+        raise S3BackupError(
+            "{}失败: {}".format(label, _compact_error(exc, secrets=secrets))
+        ) from exc
+
+
+def object_prefix(value):
+    config = normalized_config(value)
+    return config["prefix"] + "/" if config["prefix"] else ""
+
+
+def test_connection(value):
+    config = validate_config(value, require_ready=True)
+    client = create_client(config)
+    started = dt.datetime.now().astimezone()
+    _call(
+        "S3 连接测试",
+        lambda: client.list_objects_v2(
+            Bucket=config["bucket"], Prefix=object_prefix(config), MaxKeys=1
+        ),
+        secrets=_config_secrets(config),
+    )
+    elapsed = (dt.datetime.now().astimezone() - started).total_seconds()
+    return {
+        "ok": True,
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint": config["endpoint_url"] or "AWS S3",
+        "latency_ms": max(0, int(elapsed * 1000)),
+    }
+
+
+def _extra_args(config):
+    result = {
+        "ContentType": "application/json",
+        "Metadata": {"format": backup_manager.BACKUP_FORMAT},
+    }
+    encryption = config["server_side_encryption"]
+    if encryption:
+        result["ServerSideEncryption"] = encryption
+    if encryption == "aws:kms":
+        result["SSEKMSKeyId"] = config["kms_key_id"]
+    return result
+
+
+def list_backups(value, limit=100, client=None):
+    config = validate_config(value, require_ready=True)
+    client = client or create_client(config)
+    prefix = object_prefix(config)
+    items = []
+    token = None
+    while len(items) < MAX_REMOTE_ITEMS:
+        kwargs = {"Bucket": config["bucket"], "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        response = _call(
+            "读取 S3 备份列表",
+            lambda kwargs=kwargs: client.list_objects_v2(**kwargs),
+            secrets=_config_secrets(config),
+        )
+        for item in response.get("Contents", []):
+            key = str(item.get("Key", ""))
+            name = key[len(prefix):] if key.startswith(prefix) else ""
+            if name and "/" not in name and key.endswith(".agbackup"):
+                modified = item.get("LastModified")
+                items.append(
+                    {
+                        "key": key,
+                        "name": name,
+                        "size": int(item.get("Size", 0)),
+                        "modified_at": modified.isoformat() if hasattr(modified, "isoformat") else str(modified or ""),
+                        "etag": str(item.get("ETag", "")).strip('"'),
+                    }
+                )
+        if not response.get("IsTruncated"):
+            break
+        token = response.get("NextContinuationToken")
+        if not token:
+            break
+    items.sort(key=lambda item: (item["modified_at"], item["key"]), reverse=True)
+    return items[: max(1, min(int(limit), MAX_REMOTE_ITEMS))]
+
+
+def prune_backups(value, client=None):
+    config = validate_config(value, require_ready=True)
+    client = client or create_client(config)
+    items = list_backups(config, limit=MAX_REMOTE_ITEMS, client=client)
+    expired = items[config["retention"] :]
+    for item in expired:
+        _call(
+            "清理旧 S3 备份",
+            lambda key=item["key"]: client.delete_object(Bucket=config["bucket"], Key=key),
+            secrets=_config_secrets(config),
+        )
+    return [item["key"] for item in expired]
+
+
+def prune_local_backups(app_dir, retention):
+    local_items = sorted(
+        (Path(app_dir) / "backups").glob("aliyun-guard-s3-*.agbackup"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    deleted = []
+    for expired in local_items[int(retention) :]:
+        expired.unlink(missing_ok=True)
+        deleted.append(str(expired))
+    return deleted
+
+
+def create_and_upload(value, app_dir, now=None):
+    config = validate_config(value, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    stamp = now.strftime("%Y%m%d-%H%M%S-%f")
+    filename = "aliyun-guard-s3-{}.agbackup".format(stamp)
+    local_path = Path(app_dir) / "backups" / filename
+    backup_manager.create_backup(
+        config["backup_password"],
+        app_dir=Path(app_dir),
+        output_path=local_path,
+        include_state=config["include_state"],
+        include_logs=config["include_logs"],
+    )
+    client = create_client(config)
+    key = object_prefix(config) + filename
+    try:
+        _call(
+            "上传 S3 加密备份",
+            lambda: client.upload_file(
+                str(local_path),
+                config["bucket"],
+                key,
+                ExtraArgs=_extra_args(config),
+                Config=TransferConfig(
+                    multipart_threshold=backup_manager.MAX_BACKUP_FILE_BYTES + 1
+                ),
+            ),
+            secrets=_config_secrets(config),
+        )
+        deleted = prune_backups(config, client=client)
+    finally:
+        local_deleted = prune_local_backups(app_dir, config["retention"])
+    return {
+        "ok": True,
+        "key": key,
+        "filename": filename,
+        "size": local_path.stat().st_size,
+        "local_path": str(local_path),
+        "deleted": deleted,
+        "local_deleted": local_deleted,
+        "bucket": config["bucket"],
+    }
+
+
+def _validate_remote_key(value, key):
+    prefix = object_prefix(value)
+    key = str(key or "").strip()
+    name = key[len(prefix):] if key.startswith(prefix) else ""
+    if (
+        not name
+        or len(key) > 1024
+        or len(name) > 255
+        or "/" in name
+        or "\\" in name
+        or not name.endswith(".agbackup")
+    ):
+        raise S3BackupError("S3 备份对象不在当前配置前缀下")
+    return key, name
+
+
+def download_backup(value, key, app_dir):
+    config = validate_config(value, require_ready=True)
+    key, name = _validate_remote_key(config, key)
+    directory = Path(app_dir) / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=str(directory), prefix=".s3-download-", suffix=".agbackup", delete=False
+    ) as handle:
+        destination = Path(handle.name)
+    temporary = destination.with_name(destination.name + ".tmp")
+    client = create_client(config)
+    try:
+        metadata = _call(
+            "读取 S3 备份信息",
+            lambda: client.head_object(Bucket=config["bucket"], Key=key),
+            secrets=_config_secrets(config),
+        )
+        if int(metadata.get("ContentLength", 0)) > backup_manager.MAX_BACKUP_FILE_BYTES:
+            raise S3BackupError("S3 备份文件超过大小限制")
+        _call(
+            "下载 S3 加密备份",
+            lambda: client.download_file(config["bucket"], key, str(temporary)),
+            secrets=_config_secrets(config),
+        )
+        if temporary.stat().st_size > backup_manager.MAX_BACKUP_FILE_BYTES:
+            raise S3BackupError("S3 备份文件超过大小限制")
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(destination))
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def schedule_slot(value, now=None):
+    config = validate_config(value, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    hour, minute = (int(part) for part in config["time"].split(":"))
+    if config["schedule"] == "hourly":
+        target = now.replace(minute=minute, second=0, microsecond=0)
+        return now.strftime("hourly:%Y%m%d%H") if now >= target else None
+    if config["schedule"] == "daily":
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return now.strftime("daily:%Y%m%d") if now >= target else None
+    week_start = (now - dt.timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    target = week_start + dt.timedelta(
+        days=config["weekday"], hours=hour, minutes=minute
+    )
+    return "weekly:{}".format(week_start.strftime("%Y%m%d")) if now >= target else None
+
+
+def _read_state(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def read_status(app_dir):
+    return _read_state(Path(app_dir) / STATE_NAME)
+
+
+def _write_state(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(str(temporary), 0o600)
+    os.replace(str(temporary), str(path))
+
+
+@contextlib.contextmanager
+def backup_lock(app_dir):
+    path = Path(app_dir) / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    locked = True
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            locked = False
+    try:
+        yield locked
+    finally:
+        if locked and fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def run_if_due(value, app_dir, now=None):
+    config = validate_config(value, require_ready=False)
+    if not config["enabled"]:
+        return None
+    config = validate_config(config, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    slot = schedule_slot(config, now)
+    if slot is None:
+        return None
+    state_path = Path(app_dir) / STATE_NAME
+    with backup_lock(app_dir) as locked:
+        if not locked:
+            return {"ok": True, "skipped": "locked", "slot": slot}
+        state = _read_state(state_path)
+        if state.get("last_success_slot") == slot:
+            return None
+        if state.get("last_attempt_slot") == slot:
+            try:
+                last_attempt = dt.datetime.fromisoformat(state["last_attempt_at"])
+                if (now - last_attempt).total_seconds() < RETRY_SECONDS:
+                    return None
+            except (KeyError, TypeError, ValueError):
+                pass
+        state.update(
+            {
+                "last_attempt_slot": slot,
+                "last_attempt_at": now.isoformat(timespec="seconds"),
+            }
+        )
+        _write_state(state_path, state)
+        try:
+            result = create_and_upload(config, app_dir, now=now)
+            state.update(
+                {
+                    "last_success_slot": slot,
+                    "last_success_at": now.isoformat(timespec="seconds"),
+                    "last_key": result["key"],
+                    "last_error": None,
+                }
+            )
+            result["slot"] = slot
+        except Exception as exc:
+            error = _compact_error(
+                exc,
+                secrets=(
+                    config["access_key_id"],
+                    config["secret_access_key"],
+                    config["session_token"],
+                    config["backup_password"],
+                ),
+            )
+            state["last_error"] = error
+            result = {"ok": False, "slot": slot, "error": error}
+        _write_state(state_path, state)
+        return result
+__AG_S3_BACKUP_PY_EOF__
     cat > "$APP_DIR/watchdog.py" <<'__AG_WATCHDOG_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -2965,6 +3475,7 @@ import time
 
 import telegram_proxy
 import backup_manager
+import s3_backup
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -3184,6 +3695,7 @@ def management_payload(guard, backend="unknown"):
             "password_configured": bool(str(web.get("password_hash", "")).strip()),
         },
         "backend": backend,
+        "s3_backup": s3_backup_payload(config.get("s3_backup", {})),
         "rollback_snapshots": [
             {
                 "name": path.name,
@@ -3193,6 +3705,213 @@ def management_payload(guard, backend="unknown"):
             for path in backup_manager.list_program_snapshots(app_dir=APP_DIR)
         ],
     }
+
+
+def s3_backup_payload(value):
+    config = s3_backup.normalized_config(value)
+    status = s3_backup.read_status(DATA_DIR)
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint_url": config["endpoint_url"],
+        "prefix": config["prefix"],
+        "addressing_style": config["addressing_style"],
+        "access_key_configured": bool(config["access_key_id"]),
+        "uses_iam_role": not bool(config["access_key_id"]),
+        "session_token_configured": bool(config["session_token"]),
+        "backup_password_configured": bool(config["backup_password"]),
+        "schedule": config["schedule"],
+        "time": config["time"],
+        "weekday": int(config["weekday"]),
+        "retention": int(config["retention"]),
+        "include_state": bool(config["include_state"]),
+        "include_logs": bool(config["include_logs"]),
+        "notification_mode": config["notification_mode"],
+        "server_side_encryption": config["server_side_encryption"],
+        "kms_key_configured": bool(config["kms_key_id"]),
+        "status": {
+            "last_attempt_at": status.get("last_attempt_at"),
+            "last_success_at": status.get("last_success_at"),
+            "last_key": status.get("last_key"),
+            "last_error": status.get("last_error"),
+        },
+    }
+
+
+def _s3_candidate(guard, data, save=False):
+    if not isinstance(data, dict):
+        raise ManagementError("S3 配置必须是对象")
+    config = guard.load_config()
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    candidate = dict(current)
+    for field in (
+        "bucket",
+        "region",
+        "endpoint_url",
+        "prefix",
+        "schedule",
+        "time",
+        "notification_mode",
+        "server_side_encryption",
+        "addressing_style",
+    ):
+        if field in data:
+            candidate[field] = str(data.get(field, "") or "").strip()
+    for field in ("enabled", "include_state", "include_logs"):
+        if field in data:
+            candidate[field] = _boolean(data, field, candidate[field])
+    candidate["weekday"] = _integer(
+        data, "weekday", candidate["weekday"], 0, 6
+    )
+    candidate["retention"] = _integer(
+        data, "retention", candidate["retention"], 1, 365
+    )
+    use_iam_role = _boolean(
+        data, "use_iam_role", not bool(current["access_key_id"])
+    )
+    if use_iam_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        for field in ("access_key_id", "secret_access_key", "session_token"):
+            entered = str(data.get(field, "") or "").strip()
+            if entered:
+                candidate[field] = entered
+        if _boolean(data, "clear_session_token", False):
+            candidate["session_token"] = ""
+        if (
+            (candidate["enabled"] or not save)
+            and (not candidate["access_key_id"] or not candidate["secret_access_key"])
+        ):
+            raise ManagementError("未使用 IAM Role 时必须填写 S3 Access Key 和 Secret")
+    entered_password = str(data.get("backup_password", "") or "").strip()
+    if entered_password:
+        candidate["backup_password"] = entered_password
+    entered_kms = str(data.get("kms_key_id", "") or "").strip()
+    if entered_kms:
+        candidate["kms_key_id"] = entered_kms
+    elif candidate.get("server_side_encryption") != "aws:kms":
+        candidate["kms_key_id"] = ""
+    try:
+        candidate = s3_backup.validate_config(
+            candidate, require_ready=bool(candidate.get("enabled")) or not save
+        )
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(str(exc))
+    if save:
+        config["s3_backup"] = candidate
+        _save_config(guard, config)
+    return candidate
+
+
+def save_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=True)
+    return s3_backup_payload(candidate)
+
+
+def test_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=False)
+    try:
+        return s3_backup.test_connection(candidate)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    candidate["access_key_id"],
+                    candidate["secret_access_key"],
+                    candidate["session_token"],
+                    candidate["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def run_s3_backup_now(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.create_and_upload(
+            backup, DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    backup["access_key_id"],
+                    backup["secret_access_key"],
+                    backup["session_token"],
+                    backup["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def list_s3_backups(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.list_backups(backup, limit=100)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"]),
+            ),
+            502,
+        )
+
+
+def preview_s3_backup(guard, key):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.preview_restore(
+            path, backup["backup_password"], DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def restore_s3_backup(guard, key, include_logs=True):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.restore_backup(
+            path,
+            backup["backup_password"],
+            DATA_DIR,
+            include_logs=bool(include_logs),
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 def _decode_backup(data):
@@ -4184,7 +4903,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5099,6 +5818,11 @@ class PanelHandler(BaseHTTPRequestHandler):
             if parts == ["api", "update"]:
                 self._json(web_actions.check_update())
                 return
+            if parts == ["api", "s3-backup", "list"]:
+                self._json(
+                    {"ok": True, "backups": web_actions.list_s3_backups(self.server.guard)}
+                )
+                return
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 limit = query.get("limit", ["200"])[0]
@@ -5214,6 +5938,40 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._authenticated(require_csrf=True)
                 result = web_actions.create_encrypted_backup(self._read_json())
                 self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "settings"]:
+                result = web_actions.save_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "s3_backup": result})
+                return
+            if parts == ["api", "s3-backup", "test"]:
+                result = web_actions.test_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "run"]:
+                self._read_json()
+                result = web_actions.run_s3_backup_now(self.server.guard)
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "preview"]:
+                data = self._read_json()
+                result = web_actions.preview_s3_backup(
+                    self.server.guard, data.get("key")
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "restore"]:
+                data = self._read_json()
+                result = web_actions.restore_s3_backup(
+                    self.server.guard,
+                    data.get("key"),
+                    include_logs=web_actions._boolean(data, "include_logs", True),
+                )
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
                 return
             if parts == ["api", "backup", "preview"]:
                 self._authenticated(require_csrf=True)
@@ -6305,6 +7063,37 @@ __AG_WEB_PY_EOF__
             </div>
             <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
           </form>
+          <form id="s3BackupForm" class="panel full">
+            <div class="panel-head"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></div>
+            <div class="panel-body form-grid">
+              <label class="check-row wide"><input id="s3Enabled" type="checkbox">启用自动备份</label>
+              <div class="field"><label for="s3Bucket">Bucket</label><input id="s3Bucket" autocomplete="off"></div>
+              <div class="field"><label for="s3Region">Region</label><input id="s3Region" placeholder="us-east-1"></div>
+              <div class="field wide"><label for="s3Endpoint">自定义 Endpoint</label><input id="s3Endpoint" type="url" placeholder="AWS S3 留空；R2/MinIO 填写 HTTPS 地址"></div>
+              <div class="field"><label for="s3Prefix">对象目录前缀</label><input id="s3Prefix" placeholder="aliyun-guard"></div>
+              <div class="field"><label for="s3AddressingStyle">寻址方式</label><select id="s3AddressingStyle"><option value="auto">自动</option><option value="path">路径寻址</option><option value="virtual">虚拟主机寻址</option></select></div>
+              <label class="check-row wide"><input id="s3IamRole" type="checkbox">使用 EC2 IAM Role 或环境凭据</label>
+              <div id="s3CredentialFields" class="wide form-grid">
+                <div class="field"><label for="s3AccessKey">Access Key ID</label><input id="s3AccessKey" type="password" autocomplete="off"></div>
+                <div class="field"><label for="s3SecretKey">Secret Access Key</label><input id="s3SecretKey" type="password" autocomplete="off"></div>
+                <div class="field wide"><label for="s3SessionToken">Session Token</label><input id="s3SessionToken" type="password" autocomplete="off" placeholder="长期密钥留空"></div>
+                <label class="check-row wide"><input id="s3ClearSessionToken" type="checkbox">清除已保存的 Session Token</label>
+              </div>
+              <div class="field wide"><label for="s3BackupPassword">加密备份密码</label><input id="s3BackupPassword" type="password" minlength="8" autocomplete="new-password"></div>
+              <div class="field"><label for="s3Schedule">周期</label><select id="s3Schedule"><option value="hourly">每小时</option><option value="daily">每天</option><option value="weekly">每周</option></select></div>
+              <div class="field"><label for="s3Time">执行时间</label><input id="s3Time" type="time"></div>
+              <div id="s3WeekdayField" class="field"><label for="s3Weekday">星期</label><select id="s3Weekday"><option value="0">周一</option><option value="1">周二</option><option value="2">周三</option><option value="3">周四</option><option value="4">周五</option><option value="5">周六</option><option value="6">周日</option></select></div>
+              <div class="field"><label for="s3Retention">保留份数</label><input id="s3Retention" type="number" min="1" max="365"></div>
+              <label class="check-row"><input id="s3IncludeState" type="checkbox">包含运行状态</label>
+              <label class="check-row"><input id="s3IncludeLogs" type="checkbox">包含日志</label>
+              <div class="field"><label for="s3Notification">Telegram 通知</label><select id="s3Notification"><option value="errors">仅失败</option><option value="always">成功和失败</option><option value="none">不通知</option></select></div>
+              <div class="field"><label for="s3Encryption">服务端加密</label><select id="s3Encryption"><option value="AES256">SSE-S3</option><option value="aws:kms">SSE-KMS</option><option value="">关闭</option></select></div>
+              <div id="s3KmsField" class="field wide"><label for="s3KmsKey">KMS Key ID / ARN</label><input id="s3KmsKey" type="password" autocomplete="off"></div>
+              <div id="s3Result" class="inline-result wide" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="s3TestButton" class="button secondary" type="button"><span data-icon="gauge"></span>测试连接</button><button id="s3RunButton" class="button secondary" type="button"><span data-icon="upload"></span>立即备份</button><button id="s3ListButton" class="button secondary" type="button"><span data-icon="search"></span>云端备份</button><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
+            <div id="s3BackupList" class="node-list"></div>
+          </form>
           <div class="panel full">
             <div class="panel-head"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></div>
             <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
@@ -6409,6 +7198,7 @@ __AG_WEB_PY_EOF__
       "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
       "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
       "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+      "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
       "pencil": '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
       "trash-2": '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
       "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
@@ -6419,7 +7209,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, s3RestoreKey: null, s3RestorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -6628,6 +7418,36 @@ __AG_WEB_PY_EOF__
       $("updateCurrentVersion").textContent = `v${data.version}`;
       $("rollbackSnapshot").innerHTML = data.rollback_snapshots.length ? data.rollback_snapshots.map(item => `<option value="${esc(item.name)}">${esc(item.name)} · ${Math.ceil(item.size / 1024)} KiB</option>`).join("") : '<option value="">没有可用快照</option>';
       $("rollbackButton").disabled = !data.rollback_snapshots.length;
+      const s3 = data.s3_backup;
+      $("s3Enabled").checked = s3.enabled;
+      $("s3Bucket").value = s3.bucket;
+      $("s3Region").value = s3.region;
+      $("s3Endpoint").value = s3.endpoint_url;
+      $("s3Prefix").value = s3.prefix;
+      $("s3AddressingStyle").value = s3.addressing_style;
+      $("s3IamRole").checked = s3.uses_iam_role;
+      $("s3AccessKey").value = "";
+      $("s3SecretKey").value = "";
+      $("s3SessionToken").value = "";
+      $("s3ClearSessionToken").checked = false;
+      $("s3BackupPassword").value = "";
+      $("s3KmsKey").value = "";
+      $("s3AccessKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Access Key ID";
+      $("s3SecretKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Secret Access Key";
+      $("s3SessionToken").placeholder = s3.session_token_configured ? "已保存，留空不修改" : "长期密钥留空";
+      $("s3BackupPassword").placeholder = s3.backup_password_configured ? "已保存，留空不修改" : "至少 8 个字符";
+      $("s3Schedule").value = s3.schedule;
+      $("s3Time").value = s3.time;
+      $("s3Weekday").value = String(s3.weekday);
+      $("s3Retention").value = s3.retention;
+      $("s3IncludeState").checked = s3.include_state;
+      $("s3IncludeLogs").checked = s3.include_logs;
+      $("s3Notification").value = s3.notification_mode;
+      $("s3Encryption").value = s3.server_side_encryption;
+      $("s3KmsKey").placeholder = s3.kms_key_configured ? "已保存，留空不修改" : "请输入 KMS Key ID 或 ARN";
+      $("s3BackupStatus").textContent = s3.enabled ? `已启用 · 最近成功 ${fmtDate(s3.status.last_success_at)}` : "已关闭";
+      setInlineResult($("s3Result"), s3.status.last_error ? `最近失败：${s3.status.last_error}` : "", Boolean(s3.status.last_error));
+      updateS3Fields();
     }
 
     function downloadBase64(filename, encoded) {
@@ -6726,6 +7546,49 @@ __AG_WEB_PY_EOF__
       const publicHttp = $("webHost").value === "0.0.0.0";
       $("webWarning").textContent = publicHttp ? "所有网卡监听允许直接 HTTP 访问，用户名和密码会以明文经过网络；建议配置防火墙或 HTTPS 反向代理。" : "仅本机监听适合 SSH 隧道或 HTTPS 反向代理。";
       $("webWarning").classList.toggle("warning-text", publicHttp);
+    }
+
+    function updateS3Fields() {
+      $("s3CredentialFields").hidden = $("s3IamRole").checked;
+      $("s3WeekdayField").hidden = $("s3Schedule").value !== "weekly";
+      $("s3KmsField").hidden = $("s3Encryption").value !== "aws:kms";
+    }
+
+    function s3SettingsPayload() {
+      return {
+        enabled: $("s3Enabled").checked,
+        bucket: $("s3Bucket").value.trim(),
+        region: $("s3Region").value.trim(),
+        endpoint_url: $("s3Endpoint").value.trim(),
+        prefix: $("s3Prefix").value.trim(),
+        addressing_style: $("s3AddressingStyle").value,
+        use_iam_role: $("s3IamRole").checked,
+        access_key_id: $("s3AccessKey").value.trim(),
+        secret_access_key: $("s3SecretKey").value.trim(),
+        session_token: $("s3SessionToken").value.trim(),
+        clear_session_token: $("s3ClearSessionToken").checked,
+        backup_password: $("s3BackupPassword").value,
+        schedule: $("s3Schedule").value,
+        time: $("s3Time").value,
+        weekday: Number($("s3Weekday").value),
+        retention: Number($("s3Retention").value),
+        include_state: $("s3IncludeState").checked,
+        include_logs: $("s3IncludeLogs").checked,
+        notification_mode: $("s3Notification").value,
+        server_side_encryption: $("s3Encryption").value,
+        kms_key_id: $("s3KmsKey").value.trim(),
+      };
+    }
+
+    async function loadS3Backups() {
+      $("s3ListButton").disabled = true;
+      setInlineResult($("s3Result"), "正在读取云端备份...");
+      try {
+        const data = await api("/api/s3-backup/list");
+        $("s3BackupList").innerHTML = data.backups.length ? data.backups.map(item => `<div class="node-row" data-s3-key="${esc(item.key)}"><div><div class="node-name">${esc(item.name)}</div><div class="muted small">${(item.size / 1048576).toFixed(2)} MiB · ${esc(fmtDate(item.modified_at))}</div></div><div class="node-actions"><button class="button secondary" type="button" data-s3-action="preview">${icon("search")}预览</button><button class="button warning" type="button" data-s3-action="restore">${icon("refresh-cw")}恢复</button></div></div>`).join("") : '<div class="node-row muted">云端没有 Aliyun Guard 加密备份</div>';
+        setInlineResult($("s3Result"), `已读取 ${data.backups.length} 份云端备份`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3ListButton").disabled = false; }
     }
 
     function billingFieldsVisibility() {
@@ -7037,6 +7900,72 @@ __AG_WEB_PY_EOF__
         $("restoreBackupButton").disabled = true;
       } catch (error) { toast(error.message, true); }
     });
+    $("s3IamRole").addEventListener("change", updateS3Fields);
+    $("s3Schedule").addEventListener("change", updateS3Fields);
+    $("s3Encryption").addEventListener("change", updateS3Fields);
+    $("s3BackupForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/settings", { method: "POST", body: s3SettingsPayload() });
+        toast("S3 自动备份设置已保存");
+        await loadManagement(false);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { button.disabled = false; }
+    });
+    $("s3TestButton").addEventListener("click", async () => {
+      $("s3TestButton").disabled = true;
+      setInlineResult($("s3Result"), "正在测试 S3 连接...");
+      try {
+        const data = await api("/api/s3-backup/test", { method: "POST", body: s3SettingsPayload() });
+        setInlineResult($("s3Result"), `连接成功：${data.result.bucket} · ${data.result.endpoint} · ${data.result.latency_ms} ms`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3TestButton").disabled = false; }
+    });
+    $("s3RunButton").addEventListener("click", async () => {
+      if (!confirm("立即使用已保存的 S3 设置创建并上传一份加密备份？")) return;
+      $("s3RunButton").disabled = true;
+      setInlineResult($("s3Result"), "正在创建加密备份并上传...");
+      try {
+        const data = await api("/api/s3-backup/run", { method: "POST", body: {} });
+        setInlineResult($("s3Result"), `上传成功：s3://${data.result.bucket}/${data.result.key}；清理 ${data.result.deleted.length} 份旧备份`);
+        await loadS3Backups();
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3RunButton").disabled = false; }
+    });
+    $("s3ListButton").addEventListener("click", loadS3Backups);
+    $("s3BackupList").addEventListener("click", async event => {
+      const button = event.target.closest("[data-s3-action]");
+      const row = button?.closest("[data-s3-key]");
+      if (!button || !row) return;
+      const key = row.dataset.s3Key;
+      if (button.dataset.s3Action === "preview") {
+        button.disabled = true;
+        setInlineResult($("s3Result"), "正在下载并验证云端备份...");
+        try {
+          const data = await api("/api/s3-backup/preview", { method: "POST", body: { key } });
+          const changed = data.result.files.filter(item => item.action !== "unchanged");
+          state.s3RestoreKey = key;
+          state.s3RestorePreviewReady = true;
+          setInlineResult($("s3Result"), `已预览 ${row.querySelector(".node-name").textContent}：${data.result.summary.instances || 0} 个实例，${changed.length} 个文件将新增或替换：${changed.map(item => item.path).join("、") || "无变化"}`);
+        } catch (error) { state.s3RestoreKey = null; state.s3RestorePreviewReady = false; setInlineResult($("s3Result"), error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
+      if (!state.s3RestorePreviewReady || state.s3RestoreKey !== key) {
+        setInlineResult($("s3Result"), "请先预览这份云端备份，再执行恢复。", true);
+        return;
+      }
+      if (!confirm("确认按刚才的差异预览恢复这份云端备份？当前配置会先自动创建安全备份。")) return;
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/restore", { method: "POST", body: { key, include_logs: true } });
+        state.s3RestorePreviewReady = false;
+        state.s3RestoreKey = null;
+        toast("云端备份已恢复，后台服务即将重启");
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); button.disabled = false; }
+    });
     $("rollbackButton").addEventListener("click", async () => {
       const snapshot = $("rollbackSnapshot").value;
       if (!snapshot || !confirm(`确认回滚到 ${snapshot}？配置、状态和日志不会改变。`)) return;
@@ -7303,6 +8232,7 @@ except ImportError as exc:
     REQUESTS_IMPORT_ERROR = exc
 
 import telegram_proxy
+import s3_backup
 
 try:
     import fcntl
@@ -7370,6 +8300,7 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 600,
         "failure_threshold": 2,
     },
+    "s3_backup": dict(s3_backup.DEFAULT_CONFIG),
     "users": [],
 }
 
@@ -7575,6 +8506,12 @@ def validate_config(config):
         raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
     if watchdog_failures < 1 or watchdog_failures > 10:
         raise GuardError("看门狗连续失败次数必须在 1 到 10 之间")
+    try:
+        config["s3_backup"] = s3_backup.validate_config(
+            config.get("s3_backup", {}), require_ready=None
+        )
+    except s3_backup.S3BackupError as exc:
+        raise GuardError(str(exc))
     try:
         import web_panel
     except ImportError as exc:
@@ -9038,19 +9975,21 @@ def is_due(config, state, now=None):
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
+    config = load_config()
+    now = dt.datetime.now().astimezone()
+    result = 0
     with cycle_lock() as locked:
         if not locked:
             LOGGER.info("已有检测正在运行，本次计划任务跳过")
-            return 0
-        config = load_config()
-        write_heartbeat("scheduled", "计划任务已唤醒")
-        state = load_state()
-        now = dt.datetime.now().astimezone()
-        if not is_due(config, state, now.timestamp()) and not has_due_schedule(
-            config, state, now
-        ):
-            return 0
-        return run_cycle(started_at=now)
+        else:
+            write_heartbeat("scheduled", "计划任务已唤醒")
+            state = load_state()
+            if is_due(config, state, now.timestamp()) or has_due_schedule(
+                config, state, now
+            ):
+                result = run_cycle(started_at=now)
+    run_s3_backup_if_due(config, now)
+    return result
 
 
 def scheduler_wait_seconds(config, state, now=None):
@@ -9062,6 +10001,100 @@ def scheduler_wait_seconds(config, state, now=None):
         regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
+
+
+def s3_backup_secrets(config):
+    backup = config.get("s3_backup", {}) if isinstance(config, dict) else {}
+    return tuple(
+        str(backup.get(field, "") or "")
+        for field in (
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "backup_password",
+        )
+        if str(backup.get(field, "") or "")
+    )
+
+
+def run_s3_backup_if_due(config, now=None):
+    backup = config.get("s3_backup", {})
+    if not isinstance(backup, dict) or not backup.get("enabled", False):
+        return None
+    now = now or dt.datetime.now().astimezone()
+    secrets = s3_backup_secrets(config)
+    heartbeat_stop = threading.Event()
+
+    def refresh_backup_heartbeat():
+        while not heartbeat_stop.wait(30):
+            try:
+                write_heartbeat("s3_backup", "S3 加密备份正在上传")
+            except Exception:
+                pass
+
+    write_heartbeat("s3_backup", "检查 S3 自动备份计划")
+    heartbeat_thread = threading.Thread(
+        target=refresh_backup_heartbeat,
+        name="aliyun-guard-s3-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        try:
+            result = s3_backup.run_if_due(backup, CONFIG_FILE.parent, now=now)
+        except Exception as exc:
+            result = {"ok": False, "error": compact_error(exc, secrets=secrets)}
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
+        write_heartbeat("daemon_running", "S3 自动备份检查完成")
+    if result is None or result.get("skipped"):
+        return result
+    mode = str(backup.get("notification_mode", "errors"))
+    if result.get("ok"):
+        LOGGER.info(
+            "S3 自动备份成功: %s，清理 %s 份旧备份",
+            result.get("key"),
+            len(result.get("deleted", [])),
+        )
+        should_send = mode == "always"
+        text = (
+            "Aliyun Guard S3 自动备份成功\n"
+            "时间: {}\n"
+            "Bucket: {}\n"
+            "对象: {}\n"
+            "大小: {:.2f} MiB\n"
+            "清理旧备份: {} 份"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            result.get("bucket", ""),
+            result.get("key", ""),
+            float(result.get("size", 0)) / 1048576,
+            len(result.get("deleted", [])),
+        )
+    else:
+        LOGGER.error("S3 自动备份失败: %s", result.get("error", "未知错误"))
+        should_send = mode in ("always", "errors")
+        text = (
+            "Aliyun Guard S3 自动备份失败\n"
+            "时间: {}\n"
+            "错误: {}"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            compact_error(result.get("error", "未知错误"), secrets=secrets),
+        )
+    if should_send:
+        try:
+            send_telegram_message(config.get("telegram", {}), text)
+        except Exception as exc:
+            LOGGER.error(
+                "S3 备份结果 Telegram 通知失败: %s",
+                compact_error(
+                    exc,
+                    secrets=telegram_secrets(config.get("telegram", {})) + secrets,
+                ),
+            )
+    return result
 
 
 def handle_stop(signum, frame):
@@ -9106,6 +10139,7 @@ def run_daemon():
     first_cycle = True
     while not _STOP_EVENT.is_set():
         write_heartbeat("daemon_running", "调度循环正常")
+        now = dt.datetime.now().astimezone()
         with cycle_lock() as locked:
             if locked:
                 try:
@@ -9128,6 +10162,10 @@ def run_daemon():
                     )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
+        try:
+            run_s3_backup_if_due(config, now)
+        except Exception as exc:
+            LOGGER.error("S3 自动备份调度失败: %s", compact_error(exc))
         first_cycle = False
         try:
             config = load_config()
@@ -9286,6 +10324,7 @@ import urllib.request
 
 import aliyun_guard as guard
 import backup_manager
+import s3_backup
 import telegram_proxy
 import web_panel
 
@@ -9297,8 +10336,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.5.8"
-LOCAL_RELEASE_ID = "4b5a637212b626945ca7e2c8cfa6bc561964fca13bc3bd65eadd65cb97b83796"
+APP_VERSION = "1.5.9"
+LOCAL_RELEASE_ID = "1ecb7ead2150b382e69df44e6590e2b4a891cfb42aca6810ff5299ed03ca1898"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -10668,6 +11707,181 @@ def backup_restore_menu():
             print("操作失败: {}".format(exc))
 
 
+def collect_s3_backup_settings(config):
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    title("S3 自动备份设置")
+    candidate = dict(current)
+    candidate["enabled"] = yes_no("启用 S3 自动备份", current["enabled"])
+    candidate["bucket"] = prompt(
+        "Bucket 名称", current["bucket"], required=candidate["enabled"]
+    )
+    candidate["region"] = prompt("AWS/S3 Region", current["region"], required=True)
+    candidate["endpoint_url"] = prompt(
+        "自定义 Endpoint（AWS S3 留空）", current["endpoint_url"]
+    ).rstrip("/")
+    candidate["prefix"] = prompt("对象目录前缀", current["prefix"])
+    styles = [("auto", "自动"), ("path", "路径寻址"), ("virtual", "虚拟主机寻址")]
+    print("\nS3 寻址方式：")
+    default_style = next(
+        (index for index, item in enumerate(styles, 1) if item[0] == current["addressing_style"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(styles, 1):
+        print(" {}) {}".format(index, label))
+    candidate["addressing_style"] = styles[
+        prompt_int("寻址方式", default_style, 1, len(styles)) - 1
+    ][0]
+    use_role = yes_no("使用 EC2 IAM Role/环境凭据", not bool(current["access_key_id"]))
+    if use_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        candidate["access_key_id"] = prompt_secret(
+            "AWS Access Key ID",
+            keep_existing=not candidate["enabled"] or bool(current["access_key_id"]),
+        ) or current["access_key_id"]
+        candidate["secret_access_key"] = prompt_secret(
+            "AWS Secret Access Key",
+            keep_existing=not candidate["enabled"] or bool(current["secret_access_key"]),
+        ) or current["secret_access_key"]
+        candidate["session_token"] = prompt_secret(
+            "AWS Session Token（长期密钥留空）", keep_existing=True
+        ) or current["session_token"]
+    candidate["backup_password"] = prompt_secret(
+        "自动备份加密密码（至少 8 位）",
+        keep_existing=not candidate["enabled"] or bool(current["backup_password"]),
+    ) or current["backup_password"]
+    schedules = [("hourly", "每小时"), ("daily", "每天"), ("weekly", "每周")]
+    print("\n自动备份周期：")
+    default_schedule = next(
+        (index for index, item in enumerate(schedules, 1) if item[0] == current["schedule"]),
+        2,
+    )
+    for index, (_value, label) in enumerate(schedules, 1):
+        print(" {}) {}".format(index, label))
+    candidate["schedule"] = schedules[
+        prompt_int("周期", default_schedule, 1, len(schedules)) - 1
+    ][0]
+    candidate["time"] = prompt(
+        "执行时间 HH:MM（每小时仅使用分钟）", current["time"], required=True
+    )
+    if candidate["schedule"] == "weekly":
+        candidate["weekday"] = prompt_int(
+            "星期（0=周一，6=周日）", current["weekday"], 0, 6
+        )
+    candidate["retention"] = prompt_int(
+        "云端和本地保留份数", current["retention"], 1, 365
+    )
+    candidate["include_state"] = yes_no("包含运行状态", current["include_state"])
+    candidate["include_logs"] = yes_no("包含日志", current["include_logs"])
+    notifications = [("errors", "仅失败通知"), ("always", "成功和失败都通知"), ("none", "不通知")]
+    print("\nTelegram 通知：")
+    default_notice = next(
+        (index for index, item in enumerate(notifications, 1) if item[0] == current["notification_mode"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(notifications, 1):
+        print(" {}) {}".format(index, label))
+    candidate["notification_mode"] = notifications[
+        prompt_int("通知方式", default_notice, 1, len(notifications)) - 1
+    ][0]
+    encryptions = [("AES256", "SSE-S3"), ("aws:kms", "SSE-KMS"), ("", "关闭服务端加密")]
+    print("\nS3 服务端加密：")
+    default_encryption = next(
+        (index for index, item in enumerate(encryptions, 1) if item[0] == current["server_side_encryption"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(encryptions, 1):
+        print(" {}) {}".format(index, label))
+    candidate["server_side_encryption"] = encryptions[
+        prompt_int("加密方式", default_encryption, 1, len(encryptions)) - 1
+    ][0]
+    if candidate["server_side_encryption"] == "aws:kms":
+        candidate["kms_key_id"] = prompt_secret(
+            "KMS Key ID/ARN", keep_existing=bool(current["kms_key_id"])
+        ) or current["kms_key_id"]
+    else:
+        candidate["kms_key_id"] = ""
+    return s3_backup.validate_config(candidate, require_ready=candidate["enabled"])
+
+
+def print_s3_backups(items):
+    if not items:
+        print("云端没有 Aliyun Guard 加密备份。")
+        return
+    for index, item in enumerate(items, 1):
+        print(
+            " {:>3}) {:<42} {:>8.2f} MiB  {}".format(
+                index,
+                item["name"][:42],
+                float(item["size"]) / 1048576,
+                item.get("modified_at", ""),
+            )
+        )
+
+
+def s3_backup_menu(config):
+    while True:
+        current = s3_backup.normalized_config(config.get("s3_backup", {}))
+        status = s3_backup.read_status(CONFIG_FILE.parent)
+        title("AWS S3 / S3 兼容存储自动备份")
+        print("状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        print("Bucket: {}".format(current["bucket"] or "未配置"))
+        print("最近成功: {}".format(status.get("last_success_at") or "尚未运行"))
+        if status.get("last_error"):
+            print("最近错误: {}".format(status["last_error"]))
+        print("\n 1) 配置自动备份")
+        print(" 2) 测试当前 S3 连接")
+        print(" 3) 立即创建并上传加密备份")
+        print(" 4) 查看云端备份")
+        print(" 5) 从云端预览并恢复")
+        print(" 6) 返回")
+        choice = prompt_int("请输入序号", 6, 1, 6)
+        if choice == 6:
+            return
+        try:
+            if choice == 1:
+                candidate = collect_s3_backup_settings(config)
+                if candidate["enabled"]:
+                    print("正在测试 S3 连接...")
+                    result = s3_backup.test_connection(candidate)
+                    print("连接成功，延迟约 {} ms。".format(result["latency_ms"]))
+                config["s3_backup"] = candidate
+                save_config(config)
+                print("S3 自动备份设置已保存。")
+            elif choice == 2:
+                result = s3_backup.test_connection(current)
+                print("连接成功：{} / {}，延迟约 {} ms。".format(result["bucket"], result["endpoint"], result["latency_ms"]))
+            elif choice == 3:
+                result = s3_backup.create_and_upload(current, CONFIG_FILE.parent)
+                print("上传成功: s3://{}/{}".format(result["bucket"], result["key"]))
+                print("已清理云端旧备份 {} 份。".format(len(result["deleted"])))
+            elif choice in (4, 5):
+                items = s3_backup.list_backups(current, limit=100)
+                print_s3_backups(items)
+                if choice == 5 and items:
+                    index = prompt_int("选择要恢复的备份", 1, 1, len(items)) - 1
+                    path = s3_backup.download_backup(current, items[index]["key"], CONFIG_FILE.parent)
+                    try:
+                        preview = backup_manager.preview_restore(path, current["backup_password"], CONFIG_FILE.parent)
+                        for item in preview.get("files", []):
+                            print(" - {:<9} {}".format(item["action"], item["path"]))
+                        if yes_no("确认按以上差异恢复并重启服务", False):
+                            result = backup_manager.restore_backup(
+                                path,
+                                current["backup_password"],
+                                CONFIG_FILE.parent,
+                                include_logs=yes_no("恢复备份中的日志", True),
+                            )
+                            print("恢复完成，恢复前安全备份: {}".format(result["safety_backup"]))
+                            run_control("restart")
+                    finally:
+                        path.unlink(missing_ok=True)
+        except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+            print("S3 备份操作失败: {}".format(exc))
+
+
 def discover_instances_menu(config):
     title("自动发现阿里云 ECS")
     ak = prompt_secret("AccessKey ID")
@@ -10847,7 +12061,8 @@ def menu():
         print("17) 备份、恢复与版本回滚")
         print("18) 自动发现并批量导入 ECS")
         print("19) 退出")
-        choice = prompt_int("请输入序号", 19, 1, 19)
+        print("20) AWS S3 自动备份")
+        choice = prompt_int("请输入序号", 19, 1, 20)
         try:
             if choice == 1:
                 show_status(config)
@@ -10889,6 +12104,8 @@ def menu():
                 discover_instances_menu(config)
             elif choice == 19:
                 return 0
+            elif choice == 20:
+                s3_backup_menu(config)
         except KeyboardInterrupt:
             print("\n操作已取消。")
         if choice != 19:
@@ -11309,7 +12526,7 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/s3_backup.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -11319,6 +12536,7 @@ __AG_UNINSTALL_SH_EOF__
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
         "$APP_DIR/backup_manager.py" \
+        "$APP_DIR/s3_backup.py" \
         "$APP_DIR/watchdog.py" \
         "$APP_DIR/telegram_proxy.py" \
         "$APP_DIR/telegram_control.py" \

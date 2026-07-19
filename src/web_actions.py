@@ -14,6 +14,7 @@ import time
 
 import telegram_proxy
 import backup_manager
+import s3_backup
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -233,6 +234,7 @@ def management_payload(guard, backend="unknown"):
             "password_configured": bool(str(web.get("password_hash", "")).strip()),
         },
         "backend": backend,
+        "s3_backup": s3_backup_payload(config.get("s3_backup", {})),
         "rollback_snapshots": [
             {
                 "name": path.name,
@@ -242,6 +244,213 @@ def management_payload(guard, backend="unknown"):
             for path in backup_manager.list_program_snapshots(app_dir=APP_DIR)
         ],
     }
+
+
+def s3_backup_payload(value):
+    config = s3_backup.normalized_config(value)
+    status = s3_backup.read_status(DATA_DIR)
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint_url": config["endpoint_url"],
+        "prefix": config["prefix"],
+        "addressing_style": config["addressing_style"],
+        "access_key_configured": bool(config["access_key_id"]),
+        "uses_iam_role": not bool(config["access_key_id"]),
+        "session_token_configured": bool(config["session_token"]),
+        "backup_password_configured": bool(config["backup_password"]),
+        "schedule": config["schedule"],
+        "time": config["time"],
+        "weekday": int(config["weekday"]),
+        "retention": int(config["retention"]),
+        "include_state": bool(config["include_state"]),
+        "include_logs": bool(config["include_logs"]),
+        "notification_mode": config["notification_mode"],
+        "server_side_encryption": config["server_side_encryption"],
+        "kms_key_configured": bool(config["kms_key_id"]),
+        "status": {
+            "last_attempt_at": status.get("last_attempt_at"),
+            "last_success_at": status.get("last_success_at"),
+            "last_key": status.get("last_key"),
+            "last_error": status.get("last_error"),
+        },
+    }
+
+
+def _s3_candidate(guard, data, save=False):
+    if not isinstance(data, dict):
+        raise ManagementError("S3 配置必须是对象")
+    config = guard.load_config()
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    candidate = dict(current)
+    for field in (
+        "bucket",
+        "region",
+        "endpoint_url",
+        "prefix",
+        "schedule",
+        "time",
+        "notification_mode",
+        "server_side_encryption",
+        "addressing_style",
+    ):
+        if field in data:
+            candidate[field] = str(data.get(field, "") or "").strip()
+    for field in ("enabled", "include_state", "include_logs"):
+        if field in data:
+            candidate[field] = _boolean(data, field, candidate[field])
+    candidate["weekday"] = _integer(
+        data, "weekday", candidate["weekday"], 0, 6
+    )
+    candidate["retention"] = _integer(
+        data, "retention", candidate["retention"], 1, 365
+    )
+    use_iam_role = _boolean(
+        data, "use_iam_role", not bool(current["access_key_id"])
+    )
+    if use_iam_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        for field in ("access_key_id", "secret_access_key", "session_token"):
+            entered = str(data.get(field, "") or "").strip()
+            if entered:
+                candidate[field] = entered
+        if _boolean(data, "clear_session_token", False):
+            candidate["session_token"] = ""
+        if (
+            (candidate["enabled"] or not save)
+            and (not candidate["access_key_id"] or not candidate["secret_access_key"])
+        ):
+            raise ManagementError("未使用 IAM Role 时必须填写 S3 Access Key 和 Secret")
+    entered_password = str(data.get("backup_password", "") or "").strip()
+    if entered_password:
+        candidate["backup_password"] = entered_password
+    entered_kms = str(data.get("kms_key_id", "") or "").strip()
+    if entered_kms:
+        candidate["kms_key_id"] = entered_kms
+    elif candidate.get("server_side_encryption") != "aws:kms":
+        candidate["kms_key_id"] = ""
+    try:
+        candidate = s3_backup.validate_config(
+            candidate, require_ready=bool(candidate.get("enabled")) or not save
+        )
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(str(exc))
+    if save:
+        config["s3_backup"] = candidate
+        _save_config(guard, config)
+    return candidate
+
+
+def save_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=True)
+    return s3_backup_payload(candidate)
+
+
+def test_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=False)
+    try:
+        return s3_backup.test_connection(candidate)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    candidate["access_key_id"],
+                    candidate["secret_access_key"],
+                    candidate["session_token"],
+                    candidate["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def run_s3_backup_now(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.create_and_upload(
+            backup, DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    backup["access_key_id"],
+                    backup["secret_access_key"],
+                    backup["session_token"],
+                    backup["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def list_s3_backups(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.list_backups(backup, limit=100)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"]),
+            ),
+            502,
+        )
+
+
+def preview_s3_backup(guard, key):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.preview_restore(
+            path, backup["backup_password"], DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def restore_s3_backup(guard, key, include_logs=True):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.restore_backup(
+            path,
+            backup["backup_password"],
+            DATA_DIR,
+            include_logs=bool(include_logs),
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 def _decode_backup(data):

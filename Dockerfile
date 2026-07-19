@@ -1,6 +1,6 @@
 FROM python:3.11-slim-bookworm
 
-ARG APP_VERSION=1.5.8
+ARG APP_VERSION=1.5.9
 LABEL org.opencontainers.image.title="Aliyun Guard" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.source="https://github.com/Felix666-ship-It/aliyun-guard"
@@ -29,7 +29,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
 
 WORKDIR /opt/aliyun-guard
 COPY src/aliyun_guard.py src/manager.py src/telegram_proxy.py src/telegram_control.py ./
-COPY src/backup_manager.py src/watchdog.py ./
+COPY src/backup_manager.py src/s3_backup.py src/watchdog.py ./
 COPY src/web_actions.py src/web_panel.py src/web_panel.html ./
 COPY version.json ./version.json
 COPY docker/entrypoint.sh /usr/local/bin/aliyun-guard-container
@@ -38,7 +38,7 @@ RUN chmod 700 /usr/local/bin/aliyun-guard-container \
     && mkdir -p /data/logs /opt/aliyun-guard/bin \
     && chmod 700 /data /data/logs /opt/aliyun-guard /opt/aliyun-guard/bin \
     && python -m py_compile \
-        aliyun_guard.py manager.py telegram_proxy.py telegram_control.py backup_manager.py watchdog.py web_actions.py web_panel.py
+        aliyun_guard.py manager.py telegram_proxy.py telegram_control.py backup_manager.py s3_backup.py watchdog.py web_actions.py web_panel.py
 
 VOLUME ["/data", "/opt/aliyun-guard/bin"]
 EXPOSE 8765

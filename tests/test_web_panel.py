@@ -491,6 +491,40 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(data["result"], discovered)
         scan.assert_called_once()
 
+    def test_s3_backup_endpoints_require_authentication_and_csrf(self):
+        status, _data, _headers = self.request("GET", "/api/s3-backup/list")
+        self.assertEqual(status, 401)
+        cookie, csrf = self.login()
+        status, _data, _headers = self.request(
+            "POST", "/api/s3-backup/run", {}, cookie=cookie
+        )
+        self.assertEqual(status, 403)
+        result = {
+            "ok": True,
+            "bucket": "guard-backups",
+            "key": "aliyun-guard/test.agbackup",
+            "deleted": [],
+        }
+        with mock.patch.object(
+            web_panel.web_actions, "run_s3_backup_now", return_value=result
+        ) as run:
+            status, data, _headers = self.request(
+                "POST", "/api/s3-backup/run", {}, cookie=cookie, csrf=csrf
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["key"], result["key"])
+        run.assert_called_once()
+        with mock.patch.object(
+            web_panel.web_actions,
+            "list_s3_backups",
+            return_value=[{"key": result["key"], "name": "test.agbackup"}],
+        ):
+            status, data, _headers = self.request(
+                "GET", "/api/s3-backup/list", cookie=cookie
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["backups"][0]["key"], result["key"])
+
     def test_http_login_works_with_legacy_secure_option_enabled(self):
         self.config["web_panel"]["cookie_secure"] = True
         guard.atomic_write_json(guard.CONFIG_FILE, self.config)
@@ -753,6 +787,15 @@ class WebHtmlTests(unittest.TestCase):
             'id="rollbackButton"',
             'id="watchdogEnabled"',
             "failure_threshold",
+            'id="s3BackupForm"',
+            'id="s3IamRole"',
+            'id="s3BackupList"',
+            "/api/s3-backup/settings",
+            "/api/s3-backup/test",
+            "/api/s3-backup/run",
+            "/api/s3-backup/list",
+            "/api/s3-backup/preview",
+            "/api/s3-backup/restore",
         ):
             self.assertIn(marker, html)
         self.assertIn("MAX_BODY_BYTES = 128 * 1024 * 1024", panel)

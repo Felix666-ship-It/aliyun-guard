@@ -749,6 +749,37 @@
             </div>
             <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
           </form>
+          <form id="s3BackupForm" class="panel full">
+            <div class="panel-head"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></div>
+            <div class="panel-body form-grid">
+              <label class="check-row wide"><input id="s3Enabled" type="checkbox">启用自动备份</label>
+              <div class="field"><label for="s3Bucket">Bucket</label><input id="s3Bucket" autocomplete="off"></div>
+              <div class="field"><label for="s3Region">Region</label><input id="s3Region" placeholder="us-east-1"></div>
+              <div class="field wide"><label for="s3Endpoint">自定义 Endpoint</label><input id="s3Endpoint" type="url" placeholder="AWS S3 留空；R2/MinIO 填写 HTTPS 地址"></div>
+              <div class="field"><label for="s3Prefix">对象目录前缀</label><input id="s3Prefix" placeholder="aliyun-guard"></div>
+              <div class="field"><label for="s3AddressingStyle">寻址方式</label><select id="s3AddressingStyle"><option value="auto">自动</option><option value="path">路径寻址</option><option value="virtual">虚拟主机寻址</option></select></div>
+              <label class="check-row wide"><input id="s3IamRole" type="checkbox">使用 EC2 IAM Role 或环境凭据</label>
+              <div id="s3CredentialFields" class="wide form-grid">
+                <div class="field"><label for="s3AccessKey">Access Key ID</label><input id="s3AccessKey" type="password" autocomplete="off"></div>
+                <div class="field"><label for="s3SecretKey">Secret Access Key</label><input id="s3SecretKey" type="password" autocomplete="off"></div>
+                <div class="field wide"><label for="s3SessionToken">Session Token</label><input id="s3SessionToken" type="password" autocomplete="off" placeholder="长期密钥留空"></div>
+                <label class="check-row wide"><input id="s3ClearSessionToken" type="checkbox">清除已保存的 Session Token</label>
+              </div>
+              <div class="field wide"><label for="s3BackupPassword">加密备份密码</label><input id="s3BackupPassword" type="password" minlength="8" autocomplete="new-password"></div>
+              <div class="field"><label for="s3Schedule">周期</label><select id="s3Schedule"><option value="hourly">每小时</option><option value="daily">每天</option><option value="weekly">每周</option></select></div>
+              <div class="field"><label for="s3Time">执行时间</label><input id="s3Time" type="time"></div>
+              <div id="s3WeekdayField" class="field"><label for="s3Weekday">星期</label><select id="s3Weekday"><option value="0">周一</option><option value="1">周二</option><option value="2">周三</option><option value="3">周四</option><option value="4">周五</option><option value="5">周六</option><option value="6">周日</option></select></div>
+              <div class="field"><label for="s3Retention">保留份数</label><input id="s3Retention" type="number" min="1" max="365"></div>
+              <label class="check-row"><input id="s3IncludeState" type="checkbox">包含运行状态</label>
+              <label class="check-row"><input id="s3IncludeLogs" type="checkbox">包含日志</label>
+              <div class="field"><label for="s3Notification">Telegram 通知</label><select id="s3Notification"><option value="errors">仅失败</option><option value="always">成功和失败</option><option value="none">不通知</option></select></div>
+              <div class="field"><label for="s3Encryption">服务端加密</label><select id="s3Encryption"><option value="AES256">SSE-S3</option><option value="aws:kms">SSE-KMS</option><option value="">关闭</option></select></div>
+              <div id="s3KmsField" class="field wide"><label for="s3KmsKey">KMS Key ID / ARN</label><input id="s3KmsKey" type="password" autocomplete="off"></div>
+              <div id="s3Result" class="inline-result wide" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="s3TestButton" class="button secondary" type="button"><span data-icon="gauge"></span>测试连接</button><button id="s3RunButton" class="button secondary" type="button"><span data-icon="upload"></span>立即备份</button><button id="s3ListButton" class="button secondary" type="button"><span data-icon="search"></span>云端备份</button><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
+            <div id="s3BackupList" class="node-list"></div>
+          </form>
           <div class="panel full">
             <div class="panel-head"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></div>
             <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
@@ -853,6 +884,7 @@
       "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
       "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
       "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+      "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
       "pencil": '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
       "trash-2": '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
       "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
@@ -863,7 +895,7 @@
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, s3RestoreKey: null, s3RestorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -1072,6 +1104,36 @@
       $("updateCurrentVersion").textContent = `v${data.version}`;
       $("rollbackSnapshot").innerHTML = data.rollback_snapshots.length ? data.rollback_snapshots.map(item => `<option value="${esc(item.name)}">${esc(item.name)} · ${Math.ceil(item.size / 1024)} KiB</option>`).join("") : '<option value="">没有可用快照</option>';
       $("rollbackButton").disabled = !data.rollback_snapshots.length;
+      const s3 = data.s3_backup;
+      $("s3Enabled").checked = s3.enabled;
+      $("s3Bucket").value = s3.bucket;
+      $("s3Region").value = s3.region;
+      $("s3Endpoint").value = s3.endpoint_url;
+      $("s3Prefix").value = s3.prefix;
+      $("s3AddressingStyle").value = s3.addressing_style;
+      $("s3IamRole").checked = s3.uses_iam_role;
+      $("s3AccessKey").value = "";
+      $("s3SecretKey").value = "";
+      $("s3SessionToken").value = "";
+      $("s3ClearSessionToken").checked = false;
+      $("s3BackupPassword").value = "";
+      $("s3KmsKey").value = "";
+      $("s3AccessKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Access Key ID";
+      $("s3SecretKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Secret Access Key";
+      $("s3SessionToken").placeholder = s3.session_token_configured ? "已保存，留空不修改" : "长期密钥留空";
+      $("s3BackupPassword").placeholder = s3.backup_password_configured ? "已保存，留空不修改" : "至少 8 个字符";
+      $("s3Schedule").value = s3.schedule;
+      $("s3Time").value = s3.time;
+      $("s3Weekday").value = String(s3.weekday);
+      $("s3Retention").value = s3.retention;
+      $("s3IncludeState").checked = s3.include_state;
+      $("s3IncludeLogs").checked = s3.include_logs;
+      $("s3Notification").value = s3.notification_mode;
+      $("s3Encryption").value = s3.server_side_encryption;
+      $("s3KmsKey").placeholder = s3.kms_key_configured ? "已保存，留空不修改" : "请输入 KMS Key ID 或 ARN";
+      $("s3BackupStatus").textContent = s3.enabled ? `已启用 · 最近成功 ${fmtDate(s3.status.last_success_at)}` : "已关闭";
+      setInlineResult($("s3Result"), s3.status.last_error ? `最近失败：${s3.status.last_error}` : "", Boolean(s3.status.last_error));
+      updateS3Fields();
     }
 
     function downloadBase64(filename, encoded) {
@@ -1170,6 +1232,49 @@
       const publicHttp = $("webHost").value === "0.0.0.0";
       $("webWarning").textContent = publicHttp ? "所有网卡监听允许直接 HTTP 访问，用户名和密码会以明文经过网络；建议配置防火墙或 HTTPS 反向代理。" : "仅本机监听适合 SSH 隧道或 HTTPS 反向代理。";
       $("webWarning").classList.toggle("warning-text", publicHttp);
+    }
+
+    function updateS3Fields() {
+      $("s3CredentialFields").hidden = $("s3IamRole").checked;
+      $("s3WeekdayField").hidden = $("s3Schedule").value !== "weekly";
+      $("s3KmsField").hidden = $("s3Encryption").value !== "aws:kms";
+    }
+
+    function s3SettingsPayload() {
+      return {
+        enabled: $("s3Enabled").checked,
+        bucket: $("s3Bucket").value.trim(),
+        region: $("s3Region").value.trim(),
+        endpoint_url: $("s3Endpoint").value.trim(),
+        prefix: $("s3Prefix").value.trim(),
+        addressing_style: $("s3AddressingStyle").value,
+        use_iam_role: $("s3IamRole").checked,
+        access_key_id: $("s3AccessKey").value.trim(),
+        secret_access_key: $("s3SecretKey").value.trim(),
+        session_token: $("s3SessionToken").value.trim(),
+        clear_session_token: $("s3ClearSessionToken").checked,
+        backup_password: $("s3BackupPassword").value,
+        schedule: $("s3Schedule").value,
+        time: $("s3Time").value,
+        weekday: Number($("s3Weekday").value),
+        retention: Number($("s3Retention").value),
+        include_state: $("s3IncludeState").checked,
+        include_logs: $("s3IncludeLogs").checked,
+        notification_mode: $("s3Notification").value,
+        server_side_encryption: $("s3Encryption").value,
+        kms_key_id: $("s3KmsKey").value.trim(),
+      };
+    }
+
+    async function loadS3Backups() {
+      $("s3ListButton").disabled = true;
+      setInlineResult($("s3Result"), "正在读取云端备份...");
+      try {
+        const data = await api("/api/s3-backup/list");
+        $("s3BackupList").innerHTML = data.backups.length ? data.backups.map(item => `<div class="node-row" data-s3-key="${esc(item.key)}"><div><div class="node-name">${esc(item.name)}</div><div class="muted small">${(item.size / 1048576).toFixed(2)} MiB · ${esc(fmtDate(item.modified_at))}</div></div><div class="node-actions"><button class="button secondary" type="button" data-s3-action="preview">${icon("search")}预览</button><button class="button warning" type="button" data-s3-action="restore">${icon("refresh-cw")}恢复</button></div></div>`).join("") : '<div class="node-row muted">云端没有 Aliyun Guard 加密备份</div>';
+        setInlineResult($("s3Result"), `已读取 ${data.backups.length} 份云端备份`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3ListButton").disabled = false; }
     }
 
     function billingFieldsVisibility() {
@@ -1480,6 +1585,72 @@
         state.restorePreviewReady = false;
         $("restoreBackupButton").disabled = true;
       } catch (error) { toast(error.message, true); }
+    });
+    $("s3IamRole").addEventListener("change", updateS3Fields);
+    $("s3Schedule").addEventListener("change", updateS3Fields);
+    $("s3Encryption").addEventListener("change", updateS3Fields);
+    $("s3BackupForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/settings", { method: "POST", body: s3SettingsPayload() });
+        toast("S3 自动备份设置已保存");
+        await loadManagement(false);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { button.disabled = false; }
+    });
+    $("s3TestButton").addEventListener("click", async () => {
+      $("s3TestButton").disabled = true;
+      setInlineResult($("s3Result"), "正在测试 S3 连接...");
+      try {
+        const data = await api("/api/s3-backup/test", { method: "POST", body: s3SettingsPayload() });
+        setInlineResult($("s3Result"), `连接成功：${data.result.bucket} · ${data.result.endpoint} · ${data.result.latency_ms} ms`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3TestButton").disabled = false; }
+    });
+    $("s3RunButton").addEventListener("click", async () => {
+      if (!confirm("立即使用已保存的 S3 设置创建并上传一份加密备份？")) return;
+      $("s3RunButton").disabled = true;
+      setInlineResult($("s3Result"), "正在创建加密备份并上传...");
+      try {
+        const data = await api("/api/s3-backup/run", { method: "POST", body: {} });
+        setInlineResult($("s3Result"), `上传成功：s3://${data.result.bucket}/${data.result.key}；清理 ${data.result.deleted.length} 份旧备份`);
+        await loadS3Backups();
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3RunButton").disabled = false; }
+    });
+    $("s3ListButton").addEventListener("click", loadS3Backups);
+    $("s3BackupList").addEventListener("click", async event => {
+      const button = event.target.closest("[data-s3-action]");
+      const row = button?.closest("[data-s3-key]");
+      if (!button || !row) return;
+      const key = row.dataset.s3Key;
+      if (button.dataset.s3Action === "preview") {
+        button.disabled = true;
+        setInlineResult($("s3Result"), "正在下载并验证云端备份...");
+        try {
+          const data = await api("/api/s3-backup/preview", { method: "POST", body: { key } });
+          const changed = data.result.files.filter(item => item.action !== "unchanged");
+          state.s3RestoreKey = key;
+          state.s3RestorePreviewReady = true;
+          setInlineResult($("s3Result"), `已预览 ${row.querySelector(".node-name").textContent}：${data.result.summary.instances || 0} 个实例，${changed.length} 个文件将新增或替换：${changed.map(item => item.path).join("、") || "无变化"}`);
+        } catch (error) { state.s3RestoreKey = null; state.s3RestorePreviewReady = false; setInlineResult($("s3Result"), error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
+      if (!state.s3RestorePreviewReady || state.s3RestoreKey !== key) {
+        setInlineResult($("s3Result"), "请先预览这份云端备份，再执行恢复。", true);
+        return;
+      }
+      if (!confirm("确认按刚才的差异预览恢复这份云端备份？当前配置会先自动创建安全备份。")) return;
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/restore", { method: "POST", body: { key, include_logs: true } });
+        state.s3RestorePreviewReady = false;
+        state.s3RestoreKey = null;
+        toast("云端备份已恢复，后台服务即将重启");
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); button.disabled = false; }
     });
     $("rollbackButton").addEventListener("click", async () => {
       const snapshot = $("rollbackSnapshot").value;

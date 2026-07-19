@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "packaging" / "install.template.sh"
 PAYLOADS = [
     (ROOT / "src" / "backup_manager.py", "backup_manager.py", "__AG_BACKUP_PY_EOF__"),
+    (ROOT / "src" / "s3_backup.py", "s3_backup.py", "__AG_S3_BACKUP_PY_EOF__"),
     (ROOT / "src" / "watchdog.py", "watchdog.py", "__AG_WATCHDOG_PY_EOF__"),
     (ROOT / "src" / "telegram_proxy.py", "telegram_proxy.py", "__AG_PROXY_PY_EOF__"),
     (ROOT / "src" / "telegram_control.py", "telegram_control.py", "__AG_CONTROL_PY_EOF__"),
