@@ -1,3 +1,4 @@
 aliyun-python-sdk-core>=2.16,<3
 aliyun-python-sdk-ecs>=4.24,<5
 requests[socks]>=2.31,<3
+cryptography>=42,<46

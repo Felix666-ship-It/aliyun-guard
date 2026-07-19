@@ -53,6 +53,9 @@ APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().pare
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 STATE_FILE = Path(os.environ.get("ALIYUN_GUARD_STATE", APP_DIR / "state.json"))
 LOCK_FILE = Path(os.environ.get("ALIYUN_GUARD_LOCK", APP_DIR / "cycle.lock"))
+HEARTBEAT_FILE = Path(
+    os.environ.get("ALIYUN_GUARD_HEARTBEAT", APP_DIR / "heartbeat.json")
+)
 LOG_DIR = Path(os.environ.get("ALIYUN_GUARD_LOG_DIR", APP_DIR / "logs"))
 LOG_FILE = LOG_DIR / "guard.log"
 
@@ -86,6 +89,11 @@ DEFAULT_CONFIG = {
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
     "start_poll_seconds": 5,
+    "watchdog": {
+        "enabled": True,
+        "timeout_seconds": 600,
+        "failure_threshold": 2,
+    },
     "users": [],
 }
 
@@ -246,6 +254,20 @@ def save_state(state):
     atomic_write_json(STATE_FILE, state)
 
 
+def write_heartbeat(status="running", detail=None, now=None):
+    now = now or dt.datetime.now().astimezone()
+    value = {
+        "at": now.isoformat(timespec="seconds"),
+        "epoch": now.timestamp(),
+        "status": str(status or "running"),
+        "pid": os.getpid(),
+    }
+    if detail:
+        value["detail"] = str(detail)[:500]
+    atomic_write_json(HEARTBEAT_FILE, value)
+    return value
+
+
 def validate_config(config):
     try:
         interval = int(config.get("interval_seconds", 0))
@@ -263,6 +285,20 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    watchdog = config.get("watchdog", {})
+    if not isinstance(watchdog, dict):
+        raise GuardError("watchdog 必须是对象")
+    if "enabled" in watchdog and not isinstance(watchdog.get("enabled"), bool):
+        raise GuardError("watchdog.enabled 必须是布尔值")
+    try:
+        watchdog_timeout = int(watchdog.get("timeout_seconds", 600))
+        watchdog_failures = int(watchdog.get("failure_threshold", 2))
+    except (TypeError, ValueError):
+        raise GuardError("看门狗超时和连续失败次数必须是整数")
+    if watchdog_timeout < 120 or watchdog_timeout > 86400:
+        raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
+    if watchdog_failures < 1 or watchdog_failures > 10:
+        raise GuardError("看门狗连续失败次数必须在 1 到 10 之间")
     try:
         import web_panel
     except ImportError as exc:
@@ -776,6 +812,127 @@ def query_instance_status(user):
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
+
+
+def _instance_tags(instance):
+    raw = instance.get("Tags", {}).get("Tag", []) if isinstance(instance, dict) else []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    return {
+        str(item.get("TagKey", "")): str(item.get("TagValue", ""))
+        for item in raw
+        if isinstance(item, dict) and str(item.get("TagKey", ""))
+    }
+
+
+def discover_ecs_regions(ak, sk):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    request = CommonRequest()
+    request.set_protocol_type("https")
+    request.set_accept_format("json")
+    request.set_method("POST")
+    request.set_domain("ecs.aliyuncs.com")
+    request.set_version("2014-05-26")
+    request.set_action_name("DescribeRegions")
+    request.set_connect_timeout(5000)
+    request.set_read_timeout(15000)
+    credentials = {"ak": access_key, "sk": secret_key}
+    response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
+    data = json.loads(response.decode("utf-8"))
+    regions = data.get("Regions", {}).get("Region", [])
+    if isinstance(regions, dict):
+        regions = [regions]
+    if not isinstance(regions, list):
+        raise GuardError("ECS 返回 Region 列表格式无法识别")
+    result = []
+    for item in regions:
+        region = str(item.get("RegionId", "") if isinstance(item, dict) else "").strip()
+        if region and region not in result:
+            result.append(region)
+    return result
+
+
+def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    region_values = []
+    for value in regions if isinstance(regions, (list, tuple)) else [regions]:
+        region = str(value or "").strip()
+        if region and region not in region_values:
+            region_values.append(region)
+    if not region_values:
+        raise GuardError("至少需要一个 Region ID")
+    if len(region_values) > 50:
+        raise GuardError("一次最多扫描 50 个 Region")
+    tag_key = str(tag_key or "").strip()
+    tag_value = str(tag_value or "").strip()
+    results = []
+    errors = []
+    credentials = {"ak": access_key, "sk": secret_key}
+    for region in region_values:
+        try:
+            page = 1
+            while page <= 100:
+                request = DescribeInstancesRequest()
+                request.set_protocol_type("https")
+                request.set_accept_format("json")
+                request.set_PageNumber(page)
+                request.set_PageSize(100)
+                request.set_connect_timeout(5000)
+                request.set_read_timeout(20000)
+                response = make_client(credentials, region).do_action_with_exception(request)
+                data = json.loads(response.decode("utf-8"))
+                instances = data.get("Instances", {}).get("Instance", [])
+                if isinstance(instances, dict):
+                    instances = [instances]
+                if not isinstance(instances, list):
+                    raise GuardError("ECS 返回实例列表格式无法识别")
+                for instance in instances:
+                    if not isinstance(instance, dict):
+                        continue
+                    tags = _instance_tags(instance)
+                    if tag_key and tag_key not in tags:
+                        continue
+                    if tag_key and tag_value and tags.get(tag_key) != tag_value:
+                        continue
+                    instance_id = str(instance.get("InstanceId", "")).strip()
+                    if not instance_id:
+                        continue
+                    results.append(
+                        {
+                            "region": region,
+                            "instance_id": instance_id,
+                            "name": str(instance.get("InstanceName", "") or instance_id),
+                            "status": str(instance.get("Status", "Unknown")),
+                            "zone_id": str(instance.get("ZoneId", "")),
+                            "instance_type": str(instance.get("InstanceType", "")),
+                            "public_ip": str(
+                                (instance.get("PublicIpAddress", {}).get("IpAddress", []) or [""])[0]
+                            ),
+                            "tags": tags,
+                        }
+                    )
+                total = int(data.get("TotalCount", len(instances)) or 0)
+                if page * 100 >= total or not instances:
+                    break
+                page += 1
+        except Exception as exc:
+            errors.append(
+                {
+                    "region": region,
+                    "error": compact_error(exc, secrets=(access_key, secret_key)),
+                }
+            )
+    return {"instances": results, "errors": errors, "regions": region_values}
 
 
 def start_instance(user):
@@ -1579,6 +1736,11 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         dry_run=dry_run,
     )
     save_state(previous_state)
+    if not dry_run:
+        write_heartbeat(
+            "cycle_error" if error_count else "cycle_ok",
+            "{} 个错误".format(error_count) if error_count else "检测完成",
+        )
     return 1 if error_count else 0
 
 
@@ -1605,6 +1767,7 @@ def run_scheduled():
             LOGGER.info("已有检测正在运行，本次计划任务跳过")
             return 0
         config = load_config()
+        write_heartbeat("scheduled", "计划任务已唤醒")
         state = load_state()
         now = dt.datetime.now().astimezone()
         if not is_due(config, state, now.timestamp()) and not has_due_schedule(
@@ -1663,8 +1826,10 @@ def run_daemon():
     except Exception as exc:
         LOGGER.error("Telegram Bot 控制启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
+    write_heartbeat("daemon_started", "后台服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
+        write_heartbeat("daemon_running", "调度循环正常")
         with cycle_lock() as locked:
             if locked:
                 try:

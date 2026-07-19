@@ -308,7 +308,8 @@ create_venv() {
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
         'aliyun-python-sdk-core>=2.16,<3' \
         'aliyun-python-sdk-ecs>=4.24,<5' \
-        'requests[socks]>=2.31,<3'
+        'requests[socks]>=2.31,<3' \
+        'cryptography>=42,<46'
 }
 
 stop_old_backend() {
@@ -328,7 +329,7 @@ write_payload() {
     mkdir -p "$APP_DIR/logs"
 # __PAYLOAD_BLOCKS__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -337,6 +338,8 @@ write_payload() {
     "$VENV_DIR/bin/python" -m py_compile \
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
+        "$APP_DIR/backup_manager.py" \
+        "$APP_DIR/watchdog.py" \
         "$APP_DIR/telegram_proxy.py" \
         "$APP_DIR/telegram_control.py" \
         "$APP_DIR/web_actions.py" \
@@ -377,6 +380,20 @@ remove_cron_entry() {
     rm -f "$cron_old" "$cron_new"
 }
 
+setup_watchdog_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    cron_old=$(mktemp)
+    cron_new=$(mktemp)
+    crontab -l > "$cron_old" 2>/dev/null || :
+    grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
+    if [ "$START_BACKEND" = yes ]; then
+        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    fi
+    crontab "$cron_new"
+    rm -f "$cron_old" "$cron_new"
+}
+
 setup_systemd() {
     cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
@@ -400,7 +417,37 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    cat > "/etc/systemd/system/$SERVICE_NAME-watchdog.service" <<EOF
+[Unit]
+Description=Aliyun Guard heartbeat watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=$APP_DIR
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$VENV_DIR/bin/python $APP_DIR/watchdog.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+EOF
+    cat > "/etc/systemd/system/$SERVICE_NAME-watchdog.timer" <<EOF
+[Unit]
+Description=Check Aliyun Guard heartbeat every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
     chmod 644 "/etc/systemd/system/$SERVICE_NAME.service"
+    chmod 644 "/etc/systemd/system/$SERVICE_NAME-watchdog.service" "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
     if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rm -f "/etc/init.d/$SERVICE_NAME"
@@ -409,10 +456,16 @@ EOF
     printf '%s\n' systemd > "$APP_DIR/service_backend"
     systemctl daemon-reload
     if [ "$START_BACKEND" = yes ]; then
+        rm -f "$APP_DIR/disabled"
         systemctl enable --now "$SERVICE_NAME.service"
+        systemctl enable --now "$SERVICE_NAME-watchdog.timer"
     else
+        : > "$APP_DIR/disabled"
+        chmod 600 "$APP_DIR/disabled"
         systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
         systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
+        systemctl stop "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
     fi
 }
 
@@ -435,12 +488,17 @@ depend() {
 EOF
     chmod 755 "/etc/init.d/$SERVICE_NAME"
     rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    rm -f "/etc/systemd/system/$SERVICE_NAME-watchdog.service" "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
     remove_cron_entry
     printf '%s\n' openrc > "$APP_DIR/service_backend"
     if [ "$START_BACKEND" = yes ]; then
+        rm -f "$APP_DIR/disabled"
+        setup_watchdog_cron
         rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start
     else
+        : > "$APP_DIR/disabled"
+        chmod 600 "$APP_DIR/disabled"
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
     fi
@@ -469,6 +527,10 @@ setup_cron() {
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    if [ "$START_BACKEND" = yes ]; then
+        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    fi
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
     if [ "$START_BACKEND" = yes ]; then

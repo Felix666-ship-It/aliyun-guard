@@ -123,6 +123,77 @@ class WebActionTests(unittest.TestCase):
         self.assertFalse(result["enabled"])
         self.assertFalse(guard.load_config()["users"][0]["instance_log_enabled"])
 
+    def test_discovery_response_is_redacted_and_imports_selected_instances(self):
+        discovered = {
+            "instances": [
+                {
+                    "region": "cn-hongkong",
+                    "instance_id": "i-discovered",
+                    "name": "Discovered",
+                    "status": "Running",
+                    "zone_id": "cn-hongkong-b",
+                    "instance_type": "ecs.t6-c1m1.large",
+                    "public_ip": "203.0.113.2",
+                    "tags": {"env": "prod"},
+                }
+            ],
+            "errors": [],
+            "regions": ["cn-hongkong"],
+        }
+        with mock.patch.object(
+            guard, "discover_ecs_instances", return_value=discovered
+        ):
+            result = web_actions.discover_instances(
+                guard,
+                {
+                    "ak": "scan-ak",
+                    "sk": "scan-sk",
+                    "regions": ["cn-hongkong"],
+                    "tag_key": "env",
+                    "tag_value": "prod",
+                },
+            )
+        serialized = json.dumps(result)
+        self.assertNotIn("scan-ak", serialized)
+        self.assertNotIn("scan-sk", serialized)
+        imported = web_actions.import_discovered_instances(
+            guard,
+            {
+                "ak": "scan-ak",
+                "sk": "scan-sk",
+                "instances": result["instances"],
+                "traffic_limit_gb": 150,
+                "actions_enabled": True,
+                "billing_site": "china",
+            },
+        )
+        self.assertEqual(imported["count"], 1)
+        saved = guard.load_config()["users"][-1]
+        self.assertEqual(saved["instance_id"], "i-discovered")
+        self.assertEqual(saved["sk"], "scan-sk")
+
+    def test_discovery_without_regions_uses_account_region_list(self):
+        with mock.patch.object(
+            guard, "discover_ecs_regions", return_value=["cn-hongkong"]
+        ) as regions, mock.patch.object(
+            guard,
+            "discover_ecs_instances",
+            return_value={"instances": [], "errors": [], "regions": ["cn-hongkong"]},
+        ) as scan:
+            web_actions.discover_instances(
+                guard, {"ak": "scan-ak", "sk": "scan-sk", "regions": []}
+            )
+        regions.assert_called_once_with("scan-ak", "scan-sk")
+        self.assertEqual(scan.call_args.args[2], ["cn-hongkong"])
+
+    def test_backup_creation_never_returns_plaintext_secret(self):
+        with mock.patch.object(web_actions, "DATA_DIR", Path(self.temp.name)):
+            result = web_actions.create_encrypted_backup(
+                {"password": "correct-password", "include_state": True, "include_logs": False}
+            )
+        self.assertNotIn("private-secret-key", result["backup_base64"])
+        self.assertTrue(result["filename"].endswith(".agbackup"))
+
     def test_failed_instance_validation_does_not_save_without_force(self):
         data = {
             "name": "New",

@@ -37,7 +37,7 @@ PID_FILE = APP_DIR / "web-panel.pid"
 SUPERVISOR_LOCK_FILE = APP_DIR / "web-panel-supervisor.lock"
 DISABLED_FILE = APP_DIR / "disabled"
 BACKEND_FILE = APP_DIR / "service_backend"
-MAX_BODY_BYTES = 64 * 1024
+MAX_BODY_BYTES = 128 * 1024 * 1024
 SESSION_SECONDS = 12 * 60 * 60
 PASSWORD_ITERATIONS = 260000
 
@@ -857,7 +857,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise WebPanelError("请求长度无效")
-        if length <= 0 or length > MAX_BODY_BYTES:
+        route = urllib.parse.urlsplit(self.path).path
+        backup_upload = route in ("/api/backup/preview", "/api/backup/restore")
+        maximum = MAX_BODY_BYTES if backup_upload else 1024 * 1024
+        if length <= 0 or length > maximum:
             raise WebPanelError("请求内容为空或过大", 413)
         try:
             value = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -1049,6 +1052,43 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "instances"]:
                 result = web_actions.save_instance(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "backup", "create"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.create_encrypted_backup(self._read_json())
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "backup", "preview"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.preview_encrypted_backup(self._read_json())
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "backup", "restore"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.restore_encrypted_backup(self._read_json())
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
+                return
+            if parts == ["api", "rollback"]:
+                self._authenticated(require_csrf=True)
+                data = self._read_json()
+                result = web_actions.rollback_program(data.get("snapshot"))
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
+                return
+            if parts == ["api", "discovery", "scan"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.discover_instances(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "discovery", "import"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.import_discovered_instances(
                     self.server.guard, self._read_json()
                 )
                 self._json({"ok": True, "result": result})

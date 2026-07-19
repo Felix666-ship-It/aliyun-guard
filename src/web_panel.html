@@ -589,6 +589,7 @@
             <button id="dryRunButton" class="button secondary" type="button"><span data-icon="flask-conical"></span>演练检测</button>
             <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
             <button id="addInstanceButton" class="button secondary" type="button"><span data-icon="plus"></span>添加实例</button>
+            <button id="discoverInstanceButton" class="button secondary" type="button"><span data-icon="search"></span>自动发现</button>
           </div>
         </div>
         <div class="summary-band">
@@ -680,6 +681,9 @@
               <div class="field"><label for="startWait">开机确认等待（秒）</label><input id="startWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="stopWait">关机确认等待（秒）</label><input id="stopWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="pollSeconds">状态轮询间隔（秒）</label><input id="pollSeconds" type="number" min="1" max="60" required></div>
+              <label class="check-row wide"><input id="watchdogEnabled" type="checkbox">启用监控失联看门狗</label>
+              <div class="field"><label for="watchdogTimeout">心跳超时（秒）</label><input id="watchdogTimeout" type="number" min="120" max="86400" required></div>
+              <div class="field"><label for="watchdogFailures">连续失败次数</label><input id="watchdogFailures" type="number" min="1" max="10" required></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存全局设置</button></div>
           </form>
@@ -725,6 +729,30 @@
               </div>
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
+          </div>
+          <form id="backupCreateForm" class="panel">
+            <div class="panel-head"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field wide"><label for="backupPassword">备份密码</label><input id="backupPassword" type="password" minlength="8" autocomplete="new-password" required></div>
+              <label class="check-row"><input id="backupState" type="checkbox" checked>包含状态</label>
+              <label class="check-row"><input id="backupLogs" type="checkbox" checked>包含日志</label>
+            </div>
+            <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="download"></span>创建并下载</button></div>
+          </form>
+          <form id="backupRestoreForm" class="panel">
+            <div class="panel-head"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field wide"><label for="restoreFile">备份文件</label><input id="restoreFile" type="file" accept=".agbackup,application/json" required></div>
+              <div class="field wide"><label for="restorePassword">备份密码</label><input id="restorePassword" type="password" minlength="8" autocomplete="current-password" required></div>
+              <label class="check-row wide"><input id="restoreLogs" type="checkbox" checked>恢复备份中的日志</label>
+              <div id="restorePreview" class="inline-result wide" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
+          </form>
+          <div class="panel full">
+            <div class="panel-head"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></div>
+            <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
+            <div class="panel-actions"><button id="rollbackButton" class="button warning" type="button" disabled><span data-icon="refresh-cw"></span>回滚并重启</button></div>
           </div>
         </div>
       </section>
@@ -776,6 +804,27 @@
     </form>
   </dialog>
 
+  <dialog id="discoveryDialog" class="wide-dialog">
+    <form id="discoveryForm">
+      <div class="dialog-head"><h2>自动发现阿里云 ECS</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
+      <div class="dialog-body">
+        <div class="form-grid">
+          <div class="field"><label for="discoverAk">AccessKey ID</label><input id="discoverAk" type="password" autocomplete="off" required></div>
+          <div class="field"><label for="discoverSk">AccessKey Secret</label><input id="discoverSk" type="password" autocomplete="off" required></div>
+          <div class="field wide"><label for="discoverRegions">Region ID（逗号分隔）</label><input id="discoverRegions" placeholder="留空扫描内置 Region"></div>
+          <div class="field"><label for="discoverTagKey">标签键</label><input id="discoverTagKey" placeholder="可留空"></div>
+          <div class="field"><label for="discoverTagValue">标签值</label><input id="discoverTagValue" placeholder="可留空"></div>
+          <div class="field"><label for="discoverLimit">统一关机阈值（GB）</label><input id="discoverLimit" type="number" min="0.01" step="0.01" value="180" required></div>
+          <div class="field"><label for="discoverBillingSite">账单站点</label><select id="discoverBillingSite"><option value="china">阿里云中国站</option><option value="international">阿里云国际站</option></select></div>
+          <label class="check-row wide"><input id="discoverActions" type="checkbox" checked>允许导入的实例自动开关机</label>
+        </div>
+        <div id="discoveryResult" class="inline-result" hidden></div>
+        <div id="discoveryList" class="node-list"></div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button id="scanInstancesButton" class="button secondary" type="button"><span data-icon="search"></span>扫描实例</button><button id="importInstancesButton" class="button primary" type="submit" disabled><span data-icon="plus"></span>导入所选</button></div>
+    </form>
+  </dialog>
+
   <div id="toast" class="toast" hidden role="status"><span id="toastIcon" data-icon="circle-check"></span><span id="toastText"></span></div>
 
   <script>
@@ -814,7 +863,7 @@
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -1003,6 +1052,9 @@
       $("startWait").value = settings.start_wait_seconds;
       $("stopWait").value = settings.stop_wait_seconds;
       $("pollSeconds").value = settings.start_poll_seconds;
+      $("watchdogEnabled").checked = settings.watchdog.enabled;
+      $("watchdogTimeout").value = settings.watchdog.timeout_seconds;
+      $("watchdogFailures").value = settings.watchdog.failure_threshold;
 
       const web = data.web;
       $("webEnabled").checked = web.enabled;
@@ -1018,6 +1070,44 @@
       $("systemBrowserUrl").textContent = web.browser_url;
       $("systemCurrentVersion").textContent = `v${data.version}`;
       $("updateCurrentVersion").textContent = `v${data.version}`;
+      $("rollbackSnapshot").innerHTML = data.rollback_snapshots.length ? data.rollback_snapshots.map(item => `<option value="${esc(item.name)}">${esc(item.name)} · ${Math.ceil(item.size / 1024)} KiB</option>`).join("") : '<option value="">没有可用快照</option>';
+      $("rollbackButton").disabled = !data.rollback_snapshots.length;
+    }
+
+    function downloadBase64(filename, encoded) {
+      const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function fileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("无法读取备份文件"));
+        reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function discoveryPayload() {
+      return {
+        ak: $("discoverAk").value.trim(),
+        sk: $("discoverSk").value.trim(),
+        regions: $("discoverRegions").value.trim(),
+        tag_key: $("discoverTagKey").value.trim(),
+        tag_value: $("discoverTagValue").value.trim(),
+      };
+    }
+
+    function renderDiscoveredInstances(items) {
+      $("discoveryList").innerHTML = items.length ? items.map((item, index) => `<label class="node-row"><input type="checkbox" data-discovery-index="${index}" ${item.already_configured ? "disabled" : "checked"}><div><div class="node-name">${esc(item.name)} · ${esc(item.status)}</div><div class="muted small">${esc(item.region)} · ${esc(item.instance_id)}${item.public_ip ? ` · ${esc(item.public_ip)}` : ""}${item.already_configured ? " · 已配置" : ""}</div></div></label>`).join("") : '<div class="node-row muted">没有发现符合条件的 ECS</div>';
+      $("importInstancesButton").disabled = !items.some(item => !item.already_configured);
     }
 
     async function loadDashboard(showErrors = true) {
@@ -1344,10 +1434,94 @@
           start_wait_seconds: Number($("startWait").value),
           stop_wait_seconds: Number($("stopWait").value),
           start_poll_seconds: Number($("pollSeconds").value),
+          watchdog: { enabled: $("watchdogEnabled").checked, timeout_seconds: Number($("watchdogTimeout").value), failure_threshold: Number($("watchdogFailures").value) },
         } });
         toast("全局设置已保存");
         await Promise.all([loadDashboard(), loadManagement()]);
       } catch (error) { toast(error.message, true); }
+    });
+
+    $("backupCreateForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const data = await api("/api/backup/create", { method: "POST", body: { password: $("backupPassword").value, include_state: $("backupState").checked, include_logs: $("backupLogs").checked } });
+        downloadBase64(data.result.filename, data.result.backup_base64);
+        $("backupPassword").value = "";
+        toast(`加密备份已创建：${data.result.filename}`);
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+
+    $("restoreFile").addEventListener("change", () => { state.restorePreviewReady = false; state.restoreBackupBase64 = null; $("restoreBackupButton").disabled = true; setInlineResult($("restorePreview"), ""); });
+    $("restorePassword").addEventListener("input", () => { state.restorePreviewReady = false; $("restoreBackupButton").disabled = true; });
+    $("previewRestoreButton").addEventListener("click", async () => {
+      const file = $("restoreFile").files[0];
+      if (!file) return toast("请选择备份文件", true);
+      $("previewRestoreButton").disabled = true;
+      try {
+        state.restoreBackupBase64 = await fileAsBase64(file);
+        const data = await api("/api/backup/preview", { method: "POST", body: { backup_base64: state.restoreBackupBase64, password: $("restorePassword").value } });
+        const changed = data.result.files.filter(item => item.action !== "unchanged");
+        setInlineResult($("restorePreview"), `备份包含 ${data.result.summary.instances || 0} 个实例、${data.result.summary.nodes || 0} 个节点；${changed.length} 个文件将新增或替换：${changed.map(item => item.path).join("、") || "无变化"}`);
+        state.restorePreviewReady = true;
+        $("restoreBackupButton").disabled = false;
+      } catch (error) { state.restorePreviewReady = false; $("restoreBackupButton").disabled = true; setInlineResult($("restorePreview"), error.message, true); }
+      finally { $("previewRestoreButton").disabled = false; }
+    });
+    $("backupRestoreForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!state.restorePreviewReady || !state.restoreBackupBase64) return;
+      if (!confirm("确认按预览结果恢复？当前配置会先自动创建安全备份。")) return;
+      try {
+        await api("/api/backup/restore", { method: "POST", body: { backup_base64: state.restoreBackupBase64, password: $("restorePassword").value, include_logs: $("restoreLogs").checked } });
+        toast("备份已恢复，后台服务即将重启");
+        state.restorePreviewReady = false;
+        $("restoreBackupButton").disabled = true;
+      } catch (error) { toast(error.message, true); }
+    });
+    $("rollbackButton").addEventListener("click", async () => {
+      const snapshot = $("rollbackSnapshot").value;
+      if (!snapshot || !confirm(`确认回滚到 ${snapshot}？配置、状态和日志不会改变。`)) return;
+      $("rollbackButton").disabled = true;
+      try { await api("/api/rollback", { method: "POST", body: { snapshot } }); toast("程序已回滚，后台服务即将重启"); }
+      catch (error) { toast(error.message, true); $("rollbackButton").disabled = false; }
+    });
+
+    $("discoverInstanceButton").addEventListener("click", () => {
+      state.discoveredInstances = [];
+      state.discoveryCredentials = null;
+      $("discoverAk").value = ""; $("discoverSk").value = "";
+      renderDiscoveredInstances([]);
+      setInlineResult($("discoveryResult"), "");
+      $("discoveryDialog").showModal();
+    });
+    $("scanInstancesButton").addEventListener("click", async () => {
+      const credentials = discoveryPayload();
+      $("scanInstancesButton").disabled = true;
+      setInlineResult($("discoveryResult"), "正在跨 Region 扫描 ECS...");
+      try {
+        const data = await api("/api/discovery/scan", { method: "POST", body: credentials });
+        state.discoveredInstances = data.result.instances;
+        state.discoveryCredentials = { ak: credentials.ak, sk: credentials.sk };
+        renderDiscoveredInstances(state.discoveredInstances);
+        setInlineResult($("discoveryResult"), `发现 ${data.result.instances.length} 台 ECS；${data.result.errors.length} 个 Region 扫描失败`, Boolean(data.result.errors.length));
+      } catch (error) { setInlineResult($("discoveryResult"), error.message, true); }
+      finally { $("scanInstancesButton").disabled = false; }
+    });
+    $("discoveryForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!state.discoveryCredentials) return;
+      const selected = Array.from(document.querySelectorAll("[data-discovery-index]:checked")).map(input => state.discoveredInstances[Number(input.dataset.discoveryIndex)]);
+      if (!selected.length) return toast("请选择至少一个实例", true);
+      $("importInstancesButton").disabled = true;
+      try {
+        const data = await api("/api/discovery/import", { method: "POST", body: { ...state.discoveryCredentials, instances: selected, traffic_limit_gb: Number($("discoverLimit").value), actions_enabled: $("discoverActions").checked, billing_site: $("discoverBillingSite").value } });
+        $("discoveryDialog").close();
+        toast(`已导入 ${data.result.count} 台 ECS`);
+        await Promise.all([loadDashboard(), loadManagement()]);
+      } catch (error) { toast(error.message, true); $("importInstancesButton").disabled = false; }
     });
 
     $("telegramIdentityForm").addEventListener("submit", async event => {

@@ -1106,7 +1106,9 @@ class UpdateTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
-        ) as download, mock.patch.object(manager.subprocess, "call", return_value=0) as run:
+        ) as download, mock.patch.object(
+            manager.backup_manager, "create_program_snapshot", return_value=Path("snapshot.tar.gz")
+        ), mock.patch.object(manager.subprocess, "call", return_value=0) as run:
             with mock.patch("sys.stdout", output):
                 result = manager.update_from_github(
                     confirm_update=False,
@@ -1179,6 +1181,25 @@ class InstallerTemplateTests(unittest.TestCase):
         )
         self.assertIn('"telegram_control.py", "telegram_control.py"', builder)
         self.assertIn('"$APP_DIR/telegram_control.py"', template)
+
+    def test_installer_embeds_backup_watchdog_and_supervision(self):
+        builder = (ROOT / "packaging" / "build_installer.py").read_text(
+            encoding="utf-8"
+        )
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"backup_manager.py", "backup_manager.py"', builder)
+        self.assertIn('"watchdog.py", "watchdog.py"', builder)
+        self.assertIn("$SERVICE_NAME-watchdog.timer", template)
+        self.assertIn("# aliyun-guard-watchdog", template)
+        self.assertIn("cryptography>=42,<46", template)
+        self.assertIn('if [ "$START_BACKEND" = yes ]; then', template)
+        control = (ROOT / "src" / "control.sh").read_text(encoding="utf-8")
+        self.assertIn('systemctl disable --now "$SERVICE_NAME-watchdog.timer"', control)
+        self.assertIn('systemctl disable --now "$SERVICE_NAME.service"', control)
+        self.assertIn('rc-update del "$SERVICE_NAME" default', control)
+        self.assertIn("disable_watchdog_cron", control)
 
 
 class FirstSetupFlowTests(unittest.TestCase):
@@ -1596,7 +1617,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager,
                 "check_for_github_update",
                 return_value={"available": True, "version": "1.3.0", "release_id": "b" * 64},
-            ) as check, mock.patch.object(manager, "prompt_int", return_value=17), mock.patch(
+            ) as check, mock.patch.object(manager, "prompt_int", return_value=19), mock.patch(
                 "sys.stdout", output
             ):
                 result = manager.menu()
@@ -1623,7 +1644,7 @@ class FirstSetupFlowTests(unittest.TestCase):
             ), mock.patch.object(
                 manager, "check_for_github_update", return_value=None
             ), mock.patch.object(
-                manager, "prompt_int", side_effect=[4, 17]
+                manager, "prompt_int", side_effect=[4, 19]
             ), mock.patch.object(
                 manager, "prompt", return_value=""
             ), mock.patch.object(
@@ -1644,7 +1665,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup", return_value=0
             ) as setup, mock.patch.object(manager, "run_control", return_value=0) as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=17):
+            ), mock.patch.object(manager, "prompt_int", return_value=19):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_called_once_with(force=False)
@@ -1659,7 +1680,7 @@ class FirstSetupFlowTests(unittest.TestCase):
                 manager, "initial_setup"
             ) as setup, mock.patch.object(manager, "run_control") as control, mock.patch.object(
                 manager, "load_config", return_value=config
-            ), mock.patch.object(manager, "prompt_int", return_value=17):
+            ), mock.patch.object(manager, "prompt_int", return_value=19):
                 result = manager.menu()
         self.assertEqual(result, 0)
         setup.assert_not_called()

@@ -3,6 +3,7 @@
 """Management operations exposed by the authenticated web panel."""
 
 import copy
+import base64
 import json
 import os
 from pathlib import Path
@@ -12,9 +13,13 @@ import sys
 import time
 
 import telegram_proxy
+import backup_manager
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+DATA_DIR = Path(
+    os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json")
+).parent
 UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
@@ -210,6 +215,15 @@ def management_payload(guard, backend="unknown"):
             "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
             "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
             "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+            "watchdog": {
+                "enabled": bool(config.get("watchdog", {}).get("enabled", True)),
+                "timeout_seconds": int(
+                    config.get("watchdog", {}).get("timeout_seconds", 600)
+                ),
+                "failure_threshold": int(
+                    config.get("watchdog", {}).get("failure_threshold", 2)
+                ),
+            },
         },
         "web": {
             "enabled": bool(web.get("enabled", False)),
@@ -219,7 +233,195 @@ def management_payload(guard, backend="unknown"):
             "password_configured": bool(str(web.get("password_hash", "")).strip()),
         },
         "backend": backend,
+        "rollback_snapshots": [
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "modified_at": int(path.stat().st_mtime),
+            }
+            for path in backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        ],
     }
+
+
+def _decode_backup(data):
+    encoded = str(data.get("backup_base64", "") or "").strip()
+    if not encoded:
+        raise ManagementError("请选择备份文件")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ManagementError("备份文件编码无效") from exc
+    if len(content) > backup_manager.MAX_BACKUP_FILE_BYTES:
+        raise ManagementError("备份文件过大", 413)
+    return content
+
+
+def _backup_tempfile(content):
+    directory = DATA_DIR / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / ".web-upload-{}-{}.agbackup".format(
+        os.getpid(), int(time.time() * 1000)
+    )
+    temporary.write_bytes(content)
+    os.chmod(str(temporary), 0o600)
+    return temporary
+
+
+def create_encrypted_backup(data):
+    password = str(data.get("password", "") or "")
+    include_state = _boolean(data, "include_state", True)
+    include_logs = _boolean(data, "include_logs", True)
+    try:
+        path = backup_manager.create_backup(
+            password,
+            app_dir=DATA_DIR,
+            include_state=include_state,
+            include_logs=include_logs,
+        )
+        content = path.read_bytes()
+        return {
+            "filename": path.name,
+            "backup_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+
+
+def preview_encrypted_backup(data):
+    content = _decode_backup(data)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.preview_restore(
+            temporary, str(data.get("password", "") or ""), app_dir=DATA_DIR
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_encrypted_backup(data):
+    content = _decode_backup(data)
+    include_logs = _boolean(data, "include_logs", True)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.restore_backup(
+            temporary,
+            str(data.get("password", "") or ""),
+            app_dir=DATA_DIR,
+            include_logs=include_logs,
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def rollback_program(snapshot_name=None):
+    snapshot = None
+    if snapshot_name:
+        name = Path(str(snapshot_name)).name
+        if name != str(snapshot_name) or not name.startswith("program-"):
+            raise ManagementError("程序快照名称无效")
+        snapshot = APP_DIR / "backups" / name
+    try:
+        return backup_manager.restore_program_snapshot(snapshot, app_dir=APP_DIR)
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc), 409)
+
+
+def discover_instances(guard, data):
+    if not isinstance(data, dict):
+        raise ManagementError("实例发现参数无效")
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    regions = data.get("regions", [])
+    if isinstance(regions, str):
+        regions = [item.strip() for item in regions.replace(";", ",").split(",") if item.strip()]
+    if not isinstance(regions, list):
+        raise ManagementError("Region 列表格式无效")
+    if not regions:
+        try:
+            regions = guard.discover_ecs_regions(ak, sk)
+        except Exception as exc:
+            raise ManagementError(
+                "自动获取 Region 失败: {}".format(
+                    guard.compact_error(exc, secrets=(ak, sk))
+                ),
+                502,
+            )
+    try:
+        result = guard.discover_ecs_instances(
+            ak,
+            sk,
+            regions,
+            tag_key=str(data.get("tag_key", "") or "").strip(),
+            tag_value=str(data.get("tag_value", "") or "").strip(),
+        )
+    except Exception as exc:
+        raise ManagementError(
+            guard.compact_error(exc, secrets=(ak, sk)), 502
+        )
+    existing = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in guard.load_config().get("users", [])
+    }
+    for item in result.get("instances", []):
+        item["already_configured"] = (ak, item["region"], item["instance_id"]) in existing
+    return result
+
+
+def import_discovered_instances(guard, data):
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    selected = data.get("instances", [])
+    if not isinstance(selected, list) or not selected:
+        raise ManagementError("请选择至少一个实例")
+    if len(selected) > 100:
+        raise ManagementError("一次最多导入 100 个实例")
+    limit = _number(data, "traffic_limit_gb", 180, 0.01)
+    actions_enabled = _boolean(data, "actions_enabled", True)
+    billing_site = str(data.get("billing_site", "china") or "china")
+    billing = _copy(BILLING_PRESETS.get(billing_site, BILLING_PRESETS["china"]))
+    config = guard.load_config()
+    users = config.setdefault("users", [])
+    identities = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in users
+    }
+    imported = []
+    skipped = []
+    for raw in selected:
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "") or "").strip()
+        instance_id = str(raw.get("instance_id", "") or "").strip()
+        identity = (ak, region, instance_id)
+        if not region or not instance_id or identity in identities:
+            skipped.append(instance_id or "无效实例")
+            continue
+        user = {
+            "name": str(raw.get("name", "") or instance_id).strip()[:80],
+            "ak": ak,
+            "sk": sk,
+            "region": region,
+            "instance_id": instance_id,
+            "traffic_limit_gb": limit,
+            "actions_enabled": actions_enabled,
+            "instance_log_enabled": False,
+            "paused": False,
+            "billing": _copy(billing),
+            "schedule": _copy(guard.DEFAULT_SCHEDULE),
+        }
+        users.append(user)
+        identities.add(identity)
+        imported.append(instance_id)
+    if not imported:
+        raise ManagementError("所选实例均已存在或数据无效", 409)
+    _save_config(guard, config)
+    return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
 
 def _normalize_billing(guard, raw, existing):
@@ -433,6 +635,33 @@ def update_global_settings(guard, data):
     config["start_poll_seconds"] = _integer(
         data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
     )
+    watchdog_data = data.get("watchdog", {})
+    if not isinstance(watchdog_data, dict):
+        raise ManagementError("watchdog 必须是对象")
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": _boolean(
+            watchdog_data,
+            "enabled",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": _integer(
+            watchdog_data,
+            "timeout_seconds",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": _integer(
+            watchdog_data,
+            "failure_threshold",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     _save_config(guard, config)
     return management_payload(guard)["settings"]
 

@@ -454,6 +454,43 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(saved["interval_seconds"], 600)
         self.assertEqual(saved["notification_mode"], "events")
 
+    def test_backup_and_discovery_endpoints_require_csrf(self):
+        cookie, csrf = self.login()
+        with mock.patch.object(
+            web_panel.web_actions, "DATA_DIR", Path(self.temp.name)
+        ):
+            status, _data, _headers = self.request(
+                "POST",
+                "/api/backup/create",
+                {"password": "correct-password", "include_state": True, "include_logs": False},
+                cookie=cookie,
+            )
+            self.assertEqual(status, 403)
+            status, data, _headers = self.request(
+                "POST",
+                "/api/backup/create",
+                {"password": "correct-password", "include_state": True, "include_logs": False},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["result"]["filename"].endswith(".agbackup"))
+
+        discovered = {"instances": [], "errors": [], "regions": ["cn-hongkong"]}
+        with mock.patch.object(
+            web_panel.web_actions, "discover_instances", return_value=discovered
+        ) as scan:
+            status, data, _headers = self.request(
+                "POST",
+                "/api/discovery/scan",
+                {"ak": "ak", "sk": "sk", "regions": ["cn-hongkong"]},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"], discovered)
+        scan.assert_called_once()
+
     def test_http_login_works_with_legacy_secure_option_enabled(self):
         self.config["web_panel"]["cookie_secure"] = True
         guard.atomic_write_json(guard.CONFIG_FILE, self.config)
@@ -700,6 +737,27 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn('id="tgControlEnabled"', html)
         self.assertIn('id="tgControlAdmins"', html)
         self.assertIn("control_admin_ids", html)
+
+    def test_backup_discovery_and_watchdog_controls_are_complete(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        panel = (ROOT / "src" / "web_panel.py").read_text(encoding="utf-8")
+        for marker in (
+            'id="discoverInstanceButton"',
+            'id="discoveryDialog"',
+            "/api/discovery/scan",
+            "/api/discovery/import",
+            'id="backupCreateForm"',
+            'id="backupRestoreForm"',
+            "/api/backup/preview",
+            "/api/backup/restore",
+            'id="rollbackButton"',
+            'id="watchdogEnabled"',
+            "failure_threshold",
+        ):
+            self.assertIn(marker, html)
+        self.assertIn("MAX_BODY_BYTES = 128 * 1024 * 1024", panel)
+        self.assertIn("backup_upload", panel)
+        self.assertIn("else 1024 * 1024", panel)
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "packaging" / "install.template.sh"
 PAYLOADS = [
+    (ROOT / "src" / "backup_manager.py", "backup_manager.py", "__AG_BACKUP_PY_EOF__"),
+    (ROOT / "src" / "watchdog.py", "watchdog.py", "__AG_WATCHDOG_PY_EOF__"),
     (ROOT / "src" / "telegram_proxy.py", "telegram_proxy.py", "__AG_PROXY_PY_EOF__"),
     (ROOT / "src" / "telegram_control.py", "telegram_control.py", "__AG_CONTROL_PY_EOF__"),
     (ROOT / "src" / "web_actions.py", "web_actions.py", "__AG_WEB_ACTIONS_PY_EOF__"),

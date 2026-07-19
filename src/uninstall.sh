@@ -60,13 +60,17 @@ fi
 case "$backend" in
     systemd)
         systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+        systemctl disable --now "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$SERVICE_NAME.service" \
+            "/etc/systemd/system/$SERVICE_NAME-watchdog.service" \
+            "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
         systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
     openrc)
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rm -f "/etc/init.d/$SERVICE_NAME"
+        rm -f "/etc/periodic/1min/$SERVICE_NAME-watchdog"
         ;;
     cron)
         cron_old=$(mktemp)

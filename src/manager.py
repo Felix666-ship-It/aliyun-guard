@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 
 import aliyun_guard as guard
+import backup_manager
 import telegram_proxy
 import web_panel
 
@@ -1112,6 +1113,27 @@ def edit_settings(config):
     config["stop_wait_seconds"] = prompt_int(
         "停止实例后等待确认时间（秒）", config.get("stop_wait_seconds", 45), 0, 600
     )
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": yes_no(
+            "启用监控失联告警与自动重启",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": prompt_int(
+            "心跳失联超时（秒）",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": prompt_int(
+            "连续失败多少次后告警",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     save_config(config)
     print("全局设置已保存。服务会在下一轮自动读取新配置。")
 
@@ -1285,6 +1307,8 @@ def update_from_github(confirm_update=True, release_info=None):
 
     temporary_path = None
     try:
+        snapshot = backup_manager.create_program_snapshot(APP_DIR, APP_VERSION)
+        print("更新前程序快照: {}".format(snapshot))
         with tempfile.NamedTemporaryFile(prefix="aliyun-guard-update-", suffix=".sh", delete=False) as handle:
             handle.write(installer)
             temporary_path = handle.name
@@ -1309,6 +1333,161 @@ def update_from_github(confirm_update=True, release_info=None):
         return False
     print("GitHub 最新版本已安装，后台服务已重启。")
     return True
+
+
+def backup_restore_menu():
+    while True:
+        title("备份、恢复与版本回滚")
+        snapshots = backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        print("程序回滚快照: {} 个".format(len(snapshots)))
+        print(" 1) 创建加密备份")
+        print(" 2) 预览备份差异")
+        print(" 3) 恢复加密备份")
+        print(" 4) 回滚到更新前程序版本")
+        print(" 5) 返回")
+        choice = prompt_int("请输入序号", 1, 1, 5)
+        if choice == 5:
+            return
+        try:
+            if choice == 1:
+                password = prompt_secret("备份密码（至少 8 个字符）")
+                confirmation = prompt_secret("再次输入备份密码")
+                if password != confirmation:
+                    print("两次输入的密码不一致。")
+                    continue
+                path = backup_manager.create_backup(
+                    password,
+                    guard.CONFIG_FILE.parent,
+                    include_state=yes_no("包含状态文件", True),
+                    include_logs=yes_no("包含日志", True),
+                )
+                print("加密备份已创建: {}".format(path))
+            elif choice in (2, 3):
+                path = Path(prompt("备份文件完整路径", required=True)).expanduser()
+                password = prompt_secret("备份密码")
+                preview = backup_manager.preview_restore(
+                    path, password, guard.CONFIG_FILE.parent
+                )
+                summary = preview.get("summary", {})
+                print(
+                    "备份配置: {} 个实例，{} 个节点".format(
+                        summary.get("instances", 0), summary.get("nodes", 0)
+                    )
+                )
+                for item in preview.get("files", []):
+                    print(" - {:<9} {}".format(item["action"], item["path"]))
+                if choice == 3 and yes_no("确认按以上差异恢复", False):
+                    result = backup_manager.restore_backup(
+                        path, password, guard.CONFIG_FILE.parent
+                    )
+                    print("已恢复 {} 个文件。".format(len(result["restored"])))
+                    print("恢复前安全备份: {}".format(result["safety_backup"]))
+                    run_control("restart")
+            elif choice == 4:
+                if not snapshots:
+                    print("当前没有程序回滚快照。")
+                    continue
+                for index, path in enumerate(snapshots, 1):
+                    print(" {:>2}) {}".format(index, path.name))
+                index = prompt_int("选择快照", 1, 1, len(snapshots)) - 1
+                if yes_no("确认恢复程序文件并重启服务", False):
+                    result = backup_manager.restore_program_snapshot(
+                        snapshots[index], APP_DIR
+                    )
+                    print("程序已回滚到快照版本: {}".format(result["version"]))
+                    run_control("restart")
+        except backup_manager.BackupError as exc:
+            print("操作失败: {}".format(exc))
+
+
+def discover_instances_menu(config):
+    title("自动发现阿里云 ECS")
+    ak = prompt_secret("AccessKey ID")
+    sk = prompt_secret("AccessKey Secret")
+    regions_text = prompt(
+        "扫描 Region（逗号分隔，留空扫描内置 Region）", ""
+    )
+    regions = [
+        item.strip()
+        for item in regions_text.replace(";", ",").split(",")
+        if item.strip()
+    ]
+    if not regions:
+        print("正在从阿里云账号读取可用 Region...")
+        regions = guard.discover_ecs_regions(ak, sk)
+    tag_key = prompt("标签键筛选（可留空）", "")
+    tag_value = prompt("标签值筛选（可留空）", "") if tag_key else ""
+    if config.get("force_ipv4", True):
+        guard.enable_ipv4_only()
+    result = guard.discover_ecs_instances(ak, sk, regions, tag_key, tag_value)
+    instances = result.get("instances", [])
+    for error in result.get("errors", []):
+        print("[{}] 扫描失败: {}".format(error["region"], error["error"]))
+    if not instances:
+        print("没有发现符合条件的 ECS 实例。")
+        return
+    title("发现 {} 台 ECS".format(len(instances)))
+    for index, item in enumerate(instances, 1):
+        print(
+            "{:>3}) {:<20} {:<18} {:<22} {}".format(
+                index,
+                item["region"],
+                item["status"],
+                item["instance_id"],
+                item["name"],
+            )
+        )
+    selection = prompt("选择序号（逗号分隔，输入 all 全选）", "all")
+    if selection.lower() == "all":
+        indexes = list(range(len(instances)))
+    else:
+        try:
+            indexes = sorted(
+                {
+                    int(value.strip()) - 1
+                    for value in selection.replace(";", ",").split(",")
+                    if value.strip()
+                }
+            )
+        except ValueError:
+            print("选择格式无效。")
+            return
+    selected = [instances[index] for index in indexes if 0 <= index < len(instances)]
+    if not selected:
+        print("没有选择有效实例。")
+        return
+    limit = prompt_float("统一 CDT 关机阈值（GB）", 180, 0.01)
+    actions_enabled = yes_no("允许自动开关机", True)
+    billing = configure_billing({})
+    existing = {
+        (str(item.get("ak")), str(item.get("region")), str(item.get("instance_id")))
+        for item in config.get("users", [])
+    }
+    imported = 0
+    for item in selected:
+        identity = (ak, item["region"], item["instance_id"])
+        if identity in existing:
+            continue
+        config.setdefault("users", []).append(
+            {
+                "name": item["name"] or item["instance_id"],
+                "ak": ak,
+                "sk": sk,
+                "region": item["region"],
+                "instance_id": item["instance_id"],
+                "traffic_limit_gb": limit,
+                "actions_enabled": actions_enabled,
+                "instance_log_enabled": False,
+                "paused": False,
+                "billing": dict(billing),
+                "schedule": dict(guard.DEFAULT_SCHEDULE),
+            }
+        )
+        existing.add(identity)
+        imported += 1
+    if imported:
+        save_config(config)
+    print("已导入 {} 台实例，重复实例已跳过。".format(imported))
 
 
 def show_status(config):
@@ -1397,8 +1576,10 @@ def menu():
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
         print("16) 更新 GitHub 版本{}".format(update_hint))
-        print("17) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 17)
+        print("17) 备份、恢复与版本回滚")
+        print("18) 自动发现并批量导入 ECS")
+        print("19) 退出")
+        choice = prompt_int("请输入序号", 19, 1, 19)
         try:
             if choice == 1:
                 show_status(config)
@@ -1435,10 +1616,14 @@ def menu():
                 if update_from_github(release_info=update_info) is True:
                     return 0
             elif choice == 17:
+                backup_restore_menu()
+            elif choice == 18:
+                discover_instances_menu(config)
+            elif choice == 19:
                 return 0
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 17:
+        if choice != 19:
             prompt("按回车返回菜单")
 
 
