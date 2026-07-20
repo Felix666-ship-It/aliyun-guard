@@ -539,6 +539,32 @@ class GuardNotificationTests(unittest.TestCase):
             )
         self.assertEqual(post.call_args.args[2], 30)
 
+    def test_telegram_reuses_session_and_rebuilds_after_proxy_change(self):
+        response = mock.MagicMock(status_code=200, text='{"ok": true, "result": {}}')
+        first = mock.MagicMock()
+        second = mock.MagicMock()
+        first.post.return_value = response
+        second.post.return_value = response
+        requests_module = mock.MagicMock()
+        requests_module.Session.side_effect = [first, second]
+        guard.close_telegram_session()
+        with mock.patch.object(guard, "requests", requests_module), mock.patch.object(
+            guard, "REQUESTS_IMPORT_ERROR", None
+        ):
+            guard._telegram_post("https://api.telegram.org/botx/getMe", {}, 5, None)
+            guard._telegram_post("https://api.telegram.org/botx/getMe", {}, 5, None)
+            guard._telegram_post(
+                "https://api.telegram.org/botx/getMe",
+                {},
+                5,
+                {"https": "http://127.0.0.1:8080"},
+            )
+        guard.close_telegram_session()
+        self.assertEqual(requests_module.Session.call_count, 2)
+        self.assertEqual(first.post.call_count, 2)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
     def test_telegram_uses_socks5_proxy(self):
         response = mock.MagicMock(status_code=200)
         response.text = '{"ok": true, "result": {"id": 1}}'
@@ -793,6 +819,93 @@ class GuardCdtAccountCacheTests(unittest.TestCase):
         code, traffic = self.run_cycle_with_users(users, RuntimeError("temporary"))
         self.assertEqual(code, 1)
         traffic.assert_called_once_with(users[0])
+
+
+class GuardPerformanceCacheTests(unittest.TestCase):
+    def test_billing_cache_reuses_success_and_keeps_value_on_refresh_error(self):
+        user = make_user(billing=dict(guard.DEFAULT_BILLING))
+        state = {}
+        now = dt.datetime(2026, 7, 21, 1, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.object(
+            guard, "query_instance_bill", return_value=(12.34, "CNY")
+        ) as query:
+            first = guard.query_instance_bill_cached(user, state, 3600, now=now)
+            cached = guard.query_instance_bill_cached(
+                user, state, 3600, now=now + dt.timedelta(minutes=30)
+            )
+        self.assertFalse(first[3])
+        self.assertTrue(cached[3])
+        query.assert_called_once_with(user)
+        with mock.patch.object(
+            guard, "query_instance_bill", side_effect=RuntimeError("temporary")
+        ):
+            failed = guard.query_instance_bill_cached(
+                user,
+                state,
+                3600,
+                now=now + dt.timedelta(hours=2),
+                force_refresh=True,
+            )
+        self.assertEqual(failed[:2], (12.34, "CNY"))
+        self.assertTrue(failed[3])
+        self.assertIsInstance(failed[4], RuntimeError)
+
+    def test_ecs_status_prefetch_groups_by_credentials_and_region(self):
+        users = [
+            make_user(instance_id="i-one"),
+            make_user(name="HK-2", instance_id="i-two"),
+            make_user(name="SG", region="ap-southeast-1", instance_id="i-three"),
+        ]
+
+        def batch(group):
+            return {
+                str(user["instance_id"]): "Running"
+                for user in group
+            }
+
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "query_instance_statuses", side_effect=batch
+        ) as query:
+            result = guard.prefetch_instance_statuses(users)
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(result[guard.ecs_status_cache_key(users[1])][0], "Running")
+
+    def test_ecs_status_prefetch_isolates_failed_instance(self):
+        users = [
+            make_user(name="HK-1", instance_id="i-one"),
+            make_user(name="HK-bad", instance_id="i-invalid"),
+            make_user(name="HK-2", instance_id="i-two"),
+            make_user(name="HK-3", instance_id="i-three"),
+        ]
+
+        def batch(group):
+            if any(user["instance_id"] == "i-invalid" for user in group):
+                raise RuntimeError("invalid instance id")
+            return {user["instance_id"]: "Running" for user in group}
+
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "query_instance_statuses", side_effect=batch
+        ) as query:
+            result = guard.prefetch_instance_statuses(users)
+        self.assertEqual(query.call_count, 5)
+        self.assertEqual(result[guard.ecs_status_cache_key(users[0])], ("Running", None))
+        self.assertIsInstance(result[guard.ecs_status_cache_key(users[1])][1], RuntimeError)
+        self.assertEqual(result[guard.ecs_status_cache_key(users[2])], ("Running", None))
+        self.assertEqual(result[guard.ecs_status_cache_key(users[3])], ("Running", None))
+
+    def test_heartbeat_uses_nondurable_atomic_write(self):
+        with mock.patch.object(guard, "atomic_write_json") as write:
+            guard.write_heartbeat("running")
+        self.assertFalse(write.call_args.kwargs["durable"])
+
+    def test_s3_protocol_import_does_not_eagerly_load_heavy_dependencies(self):
+        guard_source = (ROOT / "src" / "aliyun_guard.py").read_text(encoding="utf-8")
+        s3_source = (ROOT / "src" / "s3_backup.py").read_text(encoding="utf-8")
+        self.assertIn("\nimport s3_backup\n", guard_source)
+        self.assertNotIn("\nimport boto3\n", s3_source)
+        self.assertNotIn("\nimport backup_manager\n", s3_source)
+        self.assertIn('importlib.import_module("boto3")', s3_source)
+        self.assertIn('importlib.import_module("backup_manager")', s3_source)
 
 
 class ConfigTests(unittest.TestCase):

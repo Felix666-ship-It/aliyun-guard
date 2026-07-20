@@ -4,6 +4,7 @@
 
 import contextlib
 import datetime as dt
+import importlib
 import json
 import os
 from pathlib import Path
@@ -11,20 +12,12 @@ import re
 import tempfile
 import urllib.parse
 
-import backup_manager
-
-try:
-    import boto3
-    from botocore.config import Config
-    from botocore.exceptions import BotoCoreError, ClientError
-    from boto3.s3.transfer import TransferConfig
-    BOTO_IMPORT_ERROR = None
-except ImportError as exc:  # pragma: no cover - installer supplies boto3
-    boto3 = None
-    Config = None
-    TransferConfig = None
-    BotoCoreError = ClientError = Exception
-    BOTO_IMPORT_ERROR = exc
+boto3 = None
+Config = None
+TransferConfig = None
+BotoCoreError = ClientError = RuntimeError
+BOTO_IMPORT_ERROR = None
+backup_manager = None
 
 try:
     import fcntl
@@ -62,6 +55,31 @@ RETRY_SECONDS = 15 * 60
 
 class S3BackupError(RuntimeError):
     pass
+
+
+def _load_boto3():
+    global boto3, Config, TransferConfig, BotoCoreError, ClientError, BOTO_IMPORT_ERROR
+    if boto3 is not None:
+        return
+    if BOTO_IMPORT_ERROR is not None:
+        raise S3BackupError("缺少 S3 依赖 boto3: {}".format(BOTO_IMPORT_ERROR))
+    try:
+        boto3 = importlib.import_module("boto3")
+        Config = importlib.import_module("botocore.config").Config
+        exceptions = importlib.import_module("botocore.exceptions")
+        BotoCoreError = exceptions.BotoCoreError
+        ClientError = exceptions.ClientError
+        TransferConfig = importlib.import_module("boto3.s3.transfer").TransferConfig
+    except ImportError as exc:  # pragma: no cover - installer supplies boto3
+        BOTO_IMPORT_ERROR = exc
+        raise S3BackupError("缺少 S3 依赖 boto3: {}".format(exc)) from exc
+
+
+def _backup_manager():
+    global backup_manager
+    if backup_manager is None:
+        backup_manager = importlib.import_module("backup_manager")
+    return backup_manager
 
 
 def normalized_config(value):
@@ -132,8 +150,7 @@ def validate_config(value, require_ready=None):
 
 
 def _require_boto3():
-    if BOTO_IMPORT_ERROR is not None:
-        raise S3BackupError("缺少 S3 依赖 boto3: {}".format(BOTO_IMPORT_ERROR))
+    _load_boto3()
 
 
 def create_client(value):
@@ -161,7 +178,7 @@ def create_client(value):
 
 
 def _compact_error(exc, secrets=()):
-    if BOTO_IMPORT_ERROR is None and isinstance(exc, ClientError):
+    if ClientError is not RuntimeError and isinstance(exc, ClientError):
         error = exc.response.get("Error", {})
         text = "{}: {}".format(error.get("Code", "S3Error"), error.get("Message", str(exc)))
     else:
@@ -216,9 +233,10 @@ def test_connection(value):
 
 
 def _extra_args(config):
+    backups = _backup_manager()
     result = {
         "ContentType": "application/json",
-        "Metadata": {"format": backup_manager.BACKUP_FORMAT},
+        "Metadata": {"format": backups.BACKUP_FORMAT},
     }
     encryption = config["server_side_encryption"]
     if encryption:
@@ -295,11 +313,12 @@ def prune_local_backups(app_dir, retention):
 
 def create_and_upload(value, app_dir, now=None):
     config = validate_config(value, require_ready=True)
+    backups = _backup_manager()
     now = now or dt.datetime.now().astimezone()
     stamp = now.strftime("%Y%m%d-%H%M%S-%f")
     filename = "aliyun-guard-s3-{}.agbackup".format(stamp)
     local_path = Path(app_dir) / "backups" / filename
-    backup_manager.create_backup(
+    backups.create_backup(
         config["backup_password"],
         app_dir=Path(app_dir),
         output_path=local_path,
@@ -317,7 +336,7 @@ def create_and_upload(value, app_dir, now=None):
                 key,
                 ExtraArgs=_extra_args(config),
                 Config=TransferConfig(
-                    multipart_threshold=backup_manager.MAX_BACKUP_FILE_BYTES + 1
+                    multipart_threshold=backups.MAX_BACKUP_FILE_BYTES + 1
                 ),
             ),
             secrets=_config_secrets(config),
@@ -355,6 +374,7 @@ def _validate_remote_key(value, key):
 
 def download_backup(value, key, app_dir):
     config = validate_config(value, require_ready=True)
+    backups = _backup_manager()
     key, name = _validate_remote_key(config, key)
     directory = Path(app_dir) / "backups"
     directory.mkdir(parents=True, exist_ok=True)
@@ -370,14 +390,14 @@ def download_backup(value, key, app_dir):
             lambda: client.head_object(Bucket=config["bucket"], Key=key),
             secrets=_config_secrets(config),
         )
-        if int(metadata.get("ContentLength", 0)) > backup_manager.MAX_BACKUP_FILE_BYTES:
+        if int(metadata.get("ContentLength", 0)) > backups.MAX_BACKUP_FILE_BYTES:
             raise S3BackupError("S3 备份文件超过大小限制")
         _call(
             "下载 S3 加密备份",
             lambda: client.download_file(config["bucket"], key, str(temporary)),
             secrets=_config_secrets(config),
         )
-        if temporary.stat().st_size > backup_manager.MAX_BACKUP_FILE_BYTES:
+        if temporary.stat().st_size > backups.MAX_BACKUP_FILE_BYTES:
             raise S3BackupError("S3 备份文件超过大小限制")
         os.chmod(str(temporary), 0o600)
         os.replace(str(temporary), str(destination))

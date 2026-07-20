@@ -1297,60 +1297,63 @@ class TelegramControlService:
             self.commands_fingerprint = fingerprint
 
     def _run(self):
-        while not self.stop_event.is_set():
-            try:
-                config, telegram, admins = self._poll_config()
-                if telegram is None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    config, telegram, admins = self._poll_config()
+                    if telegram is None:
+                        self.stop_event.wait(RETRY_WAIT_SECONDS)
+                        continue
+                    self._prepare_token(telegram)
+                    updates = self._telegram_api(
+                        telegram,
+                        "getUpdates",
+                        {
+                            "offset": self.offset,
+                            "limit": 100,
+                            "timeout": POLL_TIMEOUT_SECONDS,
+                            "allowed_updates": json.dumps(["message", "callback_query"]),
+                        },
+                        long_poll=True,
+                    ) or []
+                    if updates:
+                        self.offset = max(
+                            int(item.get("update_id", -1)) for item in updates
+                        ) + 1
+                        _save_offset(self.guard, self.fingerprint, self.offset)
+                        latest_config, latest_telegram, latest_admins = self._poll_config()
+                        if latest_telegram is None:
+                            continue
+                        if _token_fingerprint(latest_telegram.get("bot_token")) != self.fingerprint:
+                            self.drain_pending = True
+                            continue
+                        for update in updates:
+                            try:
+                                self._handle_update(
+                                    latest_config,
+                                    latest_telegram,
+                                    latest_admins,
+                                    update,
+                                )
+                            except Exception as exc:
+                                self.guard.LOGGER.exception(
+                                    "Telegram Bot 单条更新处理失败: %s",
+                                    self.guard.compact_error(
+                                        exc,
+                                        secrets=self.guard.telegram_secrets(latest_telegram),
+                                    ),
+                                )
+                    if self.last_error is not None:
+                        self.guard.LOGGER.info("Telegram Bot 控制连接已恢复")
+                        self.last_error = None
+                except Exception as exc:
+                    detail = self.guard.compact_error(exc)
+                    if detail != self.last_error:
+                        self.guard.LOGGER.warning("Telegram Bot 控制轮询失败: %s", detail)
+                        self.last_error = detail
                     self.stop_event.wait(RETRY_WAIT_SECONDS)
-                    continue
-                self._prepare_token(telegram)
-                updates = self._telegram_api(
-                    telegram,
-                    "getUpdates",
-                    {
-                        "offset": self.offset,
-                        "limit": 100,
-                        "timeout": POLL_TIMEOUT_SECONDS,
-                        "allowed_updates": json.dumps(["message", "callback_query"]),
-                    },
-                    long_poll=True,
-                ) or []
-                if updates:
-                    self.offset = max(
-                        int(item.get("update_id", -1)) for item in updates
-                    ) + 1
-                    _save_offset(self.guard, self.fingerprint, self.offset)
-                    latest_config, latest_telegram, latest_admins = self._poll_config()
-                    if latest_telegram is None:
-                        continue
-                    if _token_fingerprint(latest_telegram.get("bot_token")) != self.fingerprint:
-                        self.drain_pending = True
-                        continue
-                    for update in updates:
-                        try:
-                            self._handle_update(
-                                latest_config,
-                                latest_telegram,
-                                latest_admins,
-                                update,
-                            )
-                        except Exception as exc:
-                            self.guard.LOGGER.exception(
-                                "Telegram Bot 单条更新处理失败: %s",
-                                self.guard.compact_error(
-                                    exc,
-                                    secrets=self.guard.telegram_secrets(latest_telegram),
-                                ),
-                            )
-                if self.last_error is not None:
-                    self.guard.LOGGER.info("Telegram Bot 控制连接已恢复")
-                    self.last_error = None
-            except Exception as exc:
-                detail = self.guard.compact_error(exc)
-                if detail != self.last_error:
-                    self.guard.LOGGER.warning("Telegram Bot 控制轮询失败: %s", detail)
-                    self.last_error = detail
-                self.stop_event.wait(RETRY_WAIT_SECONDS)
+        finally:
+            self.guard.close_telegram_session()
 
 
 def start_background(guard):

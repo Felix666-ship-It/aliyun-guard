@@ -30,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.5.9"
+APP_VERSION = "1.6.0"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -1103,6 +1103,12 @@ def edit_settings(config):
     config["interval_seconds"] = prompt_int(
         "检测间隔（秒，最小 60）", config.get("interval_seconds", 300), 60, 86400
     )
+    config["billing_cache_seconds"] = prompt_int(
+        "账单缓存时间（秒，300-86400）",
+        config.get("billing_cache_seconds", 3600),
+        300,
+        86400,
+    )
     config["notification_mode"] = choose_notification_mode(config.get("notification_mode", "always"))
     config["force_ipv4"] = yes_no("网络请求优先使用 IPv4", bool(config.get("force_ipv4", True)))
     config["notify_on_daemon_start"] = yes_no(
@@ -1150,6 +1156,11 @@ def run_once(dry_run=False):
     command = [sys.executable, str(APP_DIR / "aliyun_guard.py"), "once"]
     if dry_run:
         command.append("--dry-run")
+    return subprocess.call(command)
+
+
+def refresh_billing_once():
+    command = [sys.executable, str(APP_DIR / "aliyun_guard.py"), "refresh-billing"]
     return subprocess.call(command)
 
 
@@ -1814,6 +1825,7 @@ def parse_args(argv=None):
     subparsers.add_parser("menu", help="打开管理面板")
     subparsers.add_parser("status", help="显示状态")
     subparsers.add_parser("add", help="添加实例")
+    subparsers.add_parser("refresh-billing", help="强制刷新账单缓存")
     update = subparsers.add_parser("update", help="从 GitHub 更新程序")
     update.add_argument("--yes", action="store_true", help="无需交互确认")
     subparsers.add_parser("version", help="显示当前版本")
@@ -1834,6 +1846,8 @@ def main(argv=None):
             config = load_config()
             add_user(config)
             return 0
+        if args.command == "refresh-billing":
+            return refresh_billing_once()
         if args.command == "update":
             result = update_from_github(confirm_update=not args.yes)
             return 1 if result is False else 0

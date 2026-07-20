@@ -607,6 +607,29 @@ class WebApiTests(unittest.TestCase):
                 time.sleep(0.02)
         run_cycle.assert_called_once_with(dry_run=True)
 
+    def test_billing_refresh_runs_as_background_job(self):
+        cookie, csrf = self.login()
+        result = {"ok": True, "refreshed": 1, "failed": 0, "items": []}
+        with mock.patch.object(
+            web_panel.web_actions, "refresh_billing", return_value=result
+        ) as refresh:
+            status, data, _headers = self.request(
+                "POST", "/api/billing/refresh", {}, cookie=cookie, csrf=csrf
+            )
+            self.assertEqual(status, 202)
+            self.assertEqual(data["job"]["type"], "billing")
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                _status, job, _headers = self.request(
+                    "GET", "/api/job", cookie=cookie
+                )
+                if not job["running"]:
+                    break
+                time.sleep(0.02)
+        self.assertIsNone(job["error"])
+        self.assertEqual(job["result"]["refreshed"], 1)
+        refresh.assert_called_once_with(guard)
+
     def test_telegram_identity_blank_token_preserves_secret(self):
         cookie, csrf = self.login()
         status, data, _headers = self.request(

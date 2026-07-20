@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.9"
+APP_VERSION = "1.6.0"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -278,6 +278,8 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "bill_amount": current.get("bill_amount"),
                 "bill_currency": current.get("bill_currency"),
                 "bill_error": current.get("bill_error"),
+                "bill_checked_at": current.get("bill_checked_at"),
+                "bill_from_cache": bool(current.get("bill_from_cache", False)),
                 "bill_symbol": str(billing.get("currency_symbol", "")),
                 "billing_enabled": bool(billing.get("enabled", True)),
                 "schedule": {
@@ -809,6 +811,38 @@ class PanelServer(ThreadingHTTPServer):
         threading.Thread(target=worker, name="aliyun-guard-web-cycle", daemon=True).start()
         return dict(self.job)
 
+    def start_billing_job(self):
+        with self.job_lock:
+            if self.job.get("running"):
+                raise WebPanelError("已有后台任务正在运行", 409)
+            self.job = {
+                "running": True,
+                "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "finished_at": None,
+                "error": None,
+                "type": "billing",
+            }
+
+        def worker():
+            error = None
+            result = None
+            try:
+                result = web_actions.refresh_billing(self.guard)
+            except Exception as exc:
+                error = self.guard.compact_error(exc)
+            with self.job_lock:
+                self.job["running"] = False
+                self.job["finished_at"] = dt.datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+                self.job["error"] = error
+                self.job["result"] = result
+
+        threading.Thread(
+            target=worker, name="aliyun-guard-web-billing", daemon=True
+        ).start()
+        return dict(self.job)
+
 
 class PanelHandler(BaseHTTPRequestHandler):
     server_version = "AliyunGuardWeb"
@@ -1002,6 +1036,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                         ),
                     },
                     202,
+                )
+                return
+            if parts == ["api", "billing", "refresh"]:
+                self._read_json()
+                self._json(
+                    {"ok": True, "job": self.server.start_billing_job()}, 202
                 )
                 return
             if parts == ["api", "settings"]:

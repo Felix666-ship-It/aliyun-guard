@@ -107,6 +107,12 @@ class S3BackupTests(unittest.TestCase):
             "http://127.0.0.1:9000",
         )
 
+    def test_validation_does_not_load_boto3_or_backup_crypto(self):
+        with mock.patch.object(s3_backup.importlib, "import_module") as importer:
+            validated = s3_backup.validate_config(ready_config())
+        self.assertEqual(validated["bucket"], "guard-backups")
+        importer.assert_not_called()
+
     def test_schedule_slots_and_duplicate_attempt_suppression(self):
         config = ready_config()
         config.update({"schedule": "daily", "time": "03:00"})

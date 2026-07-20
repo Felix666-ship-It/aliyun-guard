@@ -588,6 +588,7 @@
           <div class="section-actions">
             <button id="dryRunButton" class="button secondary" type="button"><span data-icon="flask-conical"></span>演练检测</button>
             <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
+            <button id="refreshBillingButton" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新账单</button>
             <button id="addInstanceButton" class="button secondary" type="button"><span data-icon="plus"></span>添加实例</button>
             <button id="discoverInstanceButton" class="button secondary" type="button"><span data-icon="search"></span>自动发现</button>
           </div>
@@ -675,6 +676,7 @@
             <div class="panel-head"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div></div>
             <div class="panel-body form-grid">
               <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
+              <div class="field"><label for="billingCacheSeconds">账单缓存（秒）</label><input id="billingCacheSeconds" type="number" min="300" max="86400" required></div>
               <div class="field"><label for="notificationMode">Telegram 通知模式</label><select id="notificationMode"><option value="always">每轮通知</option><option value="events">仅事件与变化</option><option value="errors">仅错误</option></select></div>
               <label class="check-row"><input id="forceIpv4" type="checkbox">网络请求优先使用 IPv4</label>
               <label class="check-row"><input id="notifyOnStart" type="checkbox">服务启动时发送通知</label>
@@ -977,7 +979,8 @@
       const status = statusInfo(item.status, item.paused);
       const percent = item.traffic_percent === null ? 0 : Math.max(0, Math.min(100, item.traffic_percent));
       const barClass = percent >= 100 ? "danger" : percent >= 85 ? "warn" : "";
-      const bill = !item.billing_enabled ? "已关闭" : item.bill_error ? "查询失败" : item.bill_amount === null ? "--" : `${esc(item.bill_symbol)}${fmtNum(item.bill_amount)} ${esc(item.bill_currency || "")}`;
+      const bill = !item.billing_enabled ? "已关闭" : item.bill_amount === null ? (item.bill_error ? "查询失败" : "--") : `${esc(item.bill_symbol)}${fmtNum(item.bill_amount)} ${esc(item.bill_currency || "")}`;
+      const billTitle = item.bill_checked_at ? ` title="账单数据时间：${esc(fmtDate(item.bill_checked_at))}${item.bill_from_cache ? "（缓存）" : ""}${item.bill_error ? `；${esc(item.bill_error)}` : ""}"` : "";
       const sched = item.schedule.enabled ? `${esc(item.schedule.start_time)} - ${esc(item.schedule.stop_time)}` : "已关闭";
       const next = item.schedule.next_at ? `${item.schedule.next_action === "start" ? "开机" : "关机"} ${fmtDate(item.schedule.next_at)}` : "无计划";
       const powerAction = item.status === "Running" ? "stop" : "start";
@@ -1005,7 +1008,7 @@
           <div class="metric-grid">
             <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
-            <div class="metric"><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
+            <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
           </div>
           <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
@@ -1078,6 +1081,7 @@
 
       const settings = data.settings;
       $("intervalSeconds").value = settings.interval_seconds;
+      $("billingCacheSeconds").value = settings.billing_cache_seconds;
       $("notificationMode").value = settings.notification_mode;
       $("forceIpv4").checked = settings.force_ipv4;
       $("notifyOnStart").checked = settings.notify_on_daemon_start;
@@ -1424,6 +1428,27 @@
     $("logoutButton").addEventListener("click", async () => { try { await api("/api/logout", { method: "POST", body: {} }); } catch (_) {} showLogin(); });
     $("runButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: false } }); toast("检测任务已启动"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
     $("dryRunButton").addEventListener("click", async () => { try { await api("/api/run", { method: "POST", body: { dry_run: true } }); toast("演练检测已启动，不会执行开关机"); loadDashboard(false); } catch (error) { toast(error.message, true); } });
+    $("refreshBillingButton").addEventListener("click", async () => {
+      const button = $("refreshBillingButton");
+      button.disabled = true;
+      try {
+        await api("/api/billing/refresh", { method: "POST", body: {} });
+        toast("账单刷新任务已启动");
+        for (;;) {
+          await new Promise(resolve => setTimeout(resolve, 600));
+          const job = await api("/api/job");
+          if (!job.running) {
+            if (job.error) throw new Error(job.error);
+            toast(`账单已刷新：${job.result?.refreshed || 0} 个实例`);
+            break;
+          }
+        }
+        await loadDashboard(false);
+      } catch (error) {
+        toast(error.message, true);
+        await loadDashboard(false);
+      } finally { button.disabled = false; }
+    });
     $("addInstanceButton").addEventListener("click", async () => { if (!state.management) await loadManagement(); openInstanceDialog(); });
 
     $("instances").addEventListener("click", async event => {
@@ -1533,6 +1558,7 @@
       try {
         await api("/api/settings", { method: "POST", body: {
           interval_seconds: Number($("intervalSeconds").value),
+          billing_cache_seconds: Number($("billingCacheSeconds").value),
           notification_mode: $("notificationMode").value,
           force_ipv4: $("forceIpv4").checked,
           notify_on_daemon_start: $("notifyOnStart").checked,

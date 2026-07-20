@@ -210,6 +210,7 @@ def management_payload(guard, backend="unknown"):
         "telegram": telegram_payload(guard, config.get("telegram", {})),
         "settings": {
             "interval_seconds": int(config.get("interval_seconds", 300)),
+            "billing_cache_seconds": int(config.get("billing_cache_seconds", 3600)),
             "notification_mode": str(config.get("notification_mode", "always")),
             "force_ipv4": bool(config.get("force_ipv4", True)),
             "notify_on_daemon_start": bool(config.get("notify_on_daemon_start", False)),
@@ -826,6 +827,13 @@ def update_global_settings(guard, data):
     config["interval_seconds"] = _integer(
         data, "interval_seconds", config.get("interval_seconds", 300), 60, 86400
     )
+    config["billing_cache_seconds"] = _integer(
+        data,
+        "billing_cache_seconds",
+        config.get("billing_cache_seconds", 3600),
+        300,
+        86400,
+    )
     config["notification_mode"] = mode
     config["force_ipv4"] = _boolean(
         data, "force_ipv4", bool(config.get("force_ipv4", True))
@@ -873,6 +881,25 @@ def update_global_settings(guard, data):
     }
     _save_config(guard, config)
     return management_payload(guard)["settings"]
+
+
+def refresh_billing(guard):
+    try:
+        with guard.cycle_lock() as locked:
+            if not locked:
+                raise ManagementError("检测任务正在运行，请稍后刷新账单", 409)
+            result = guard.refresh_billing_cache()
+    except ManagementError:
+        raise
+    except Exception as exc:
+        raise ManagementError(guard.compact_error(exc), 502)
+    if not result.get("ok"):
+        raise ManagementError(
+            "账单刷新完成，但有 {} 个实例失败".format(result.get("failed", 0)),
+            502,
+            result,
+        )
+    return result
 
 
 def update_web_settings(guard, data):

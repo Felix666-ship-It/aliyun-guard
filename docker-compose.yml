@@ -3,8 +3,8 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "1.5.9"
-    image: aliyun-guard:1.5.9
+        APP_VERSION: "1.6.0"
+    image: aliyun-guard:1.6.0
     container_name: aliyun-guard
     restart: unless-stopped
     environment:

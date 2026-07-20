@@ -179,6 +179,7 @@ status                查看服务和最近检测状态
 run                    立即执行一轮检测并通知
 dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
+refresh-billing        强制刷新所有实例账单缓存
 web                    查看网页控制面板地址和状态
 update                 从 GitHub 下载并安装最新版本
 version                显示当前版本号
@@ -217,6 +218,9 @@ case "$command_name" in
         ;;
     test-telegram)
         exec "$PYTHON" "$APP" test-telegram
+        ;;
+    refresh-billing)
+        exec "$PYTHON" "$APP" refresh-billing
         ;;
     web)
         exec "$PYTHON" "$MANAGER" web

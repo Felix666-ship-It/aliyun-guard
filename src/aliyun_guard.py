@@ -63,6 +63,7 @@ LOG_FILE = LOG_DIR / "guard.log"
 DEFAULT_CONFIG = {
     "version": 2,
     "interval_seconds": 300,
+    "billing_cache_seconds": 3600,
     "notification_mode": "always",
     "notify_on_daemon_start": False,
     "force_ipv4": True,
@@ -120,6 +121,7 @@ _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
 _CYCLE_THREAD_LOCK = threading.Lock()
 _INSTANCE_LOG_LOCK = threading.Lock()
+_TELEGRAM_LOCAL = threading.local()
 
 
 class GuardError(RuntimeError):
@@ -240,14 +242,15 @@ def load_state():
         return {}
 
 
-def atomic_write_json(path, value, mode=0o600):
+def atomic_write_json(path, value, mode=0o600, durable=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
         handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        if durable:
+            handle.flush()
+            os.fsync(handle.fileno())
     os.chmod(str(temporary), mode)
     os.replace(str(temporary), str(path))
 
@@ -266,7 +269,7 @@ def write_heartbeat(status="running", detail=None, now=None):
     }
     if detail:
         value["detail"] = str(detail)[:500]
-    atomic_write_json(HEARTBEAT_FILE, value)
+    atomic_write_json(HEARTBEAT_FILE, value, durable=False)
     return value
 
 
@@ -277,6 +280,14 @@ def validate_config(config):
         raise GuardError("interval_seconds 必须是整数")
     if interval < 60:
         raise GuardError("interval_seconds 不能小于 60 秒")
+    try:
+        billing_cache_seconds = int(
+            config.get("billing_cache_seconds", DEFAULT_CONFIG["billing_cache_seconds"])
+        )
+    except (TypeError, ValueError):
+        raise GuardError("billing_cache_seconds 必须是整数")
+    if not 300 <= billing_cache_seconds <= 86400:
+        raise GuardError("billing_cache_seconds 必须在 300 到 86400 秒之间")
     for field, minimum in (("start_wait_seconds", 0), ("stop_wait_seconds", 0), ("start_poll_seconds", 1)):
         try:
             value = int(config.get(field, DEFAULT_CONFIG[field]))
@@ -761,6 +772,103 @@ def query_instance_bill(user):
     return amount, currency or str(billing.get("currency_code", ""))
 
 
+def billing_cache_key(user, now=None):
+    billing = get_billing_config(user)
+    now = now or dt.datetime.now().astimezone()
+    material = "\0".join(
+        (
+            str(user.get("ak", "") or "").strip(),
+            str(user.get("sk", "") or "").strip(),
+            str(user.get("instance_id", "") or "").strip(),
+            str(billing.get("endpoint", "") or "").strip(),
+            str(billing.get("region", "") or "").strip(),
+            now.strftime("%Y-%m"),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def billing_cache_entries(state):
+    if not isinstance(state, dict):
+        return {}
+    cache = state.get("billing_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["billing_cache"] = cache
+    return cache
+
+
+def query_instance_bill_cached(
+    user,
+    state,
+    cache_seconds=3600,
+    now=None,
+    force_refresh=False,
+):
+    now = now or dt.datetime.now().astimezone()
+    cache = billing_cache_entries(state)
+    key = billing_cache_key(user, now)
+    cached = cache.get(key)
+    if isinstance(cached, dict) and not force_refresh and int(cache_seconds) > 0:
+        try:
+            next_refresh_at = dt.datetime.fromisoformat(
+                str(cached.get("next_refresh_at") or cached["checked_at"])
+            )
+        except (KeyError, TypeError, ValueError):
+            next_refresh_at = None
+        if next_refresh_at is not None and now < next_refresh_at:
+            return (
+                cached.get("amount"),
+                str(cached.get("currency", "") or ""),
+                str(cached.get("checked_at", "") or ""),
+                True,
+                None,
+            )
+    try:
+        amount, currency = query_instance_bill(user)
+    except Exception as exc:
+        if isinstance(cached, dict) and cached.get("checked_at"):
+            cached["next_refresh_at"] = (
+                now + dt.timedelta(seconds=min(int(cache_seconds), 900))
+            ).isoformat(timespec="seconds")
+            return (
+                cached.get("amount"),
+                str(cached.get("currency", "") or ""),
+                str(cached.get("checked_at", "") or ""),
+                True,
+                exc,
+            )
+        raise
+    checked_at = now.isoformat(timespec="seconds")
+    cache[key] = {
+        "amount": amount,
+        "currency": currency,
+        "checked_at": checked_at,
+        "next_refresh_at": (
+            now + dt.timedelta(seconds=int(cache_seconds))
+        ).isoformat(timespec="seconds"),
+        "instance_id": str(user.get("instance_id", "") or ""),
+        "billing_cycle": now.strftime("%Y-%m"),
+    }
+    for old_key, old_value in list(cache.items()):
+        if old_key != key and (
+            not isinstance(old_value, dict)
+            or old_value.get("billing_cycle") not in (None, now.strftime("%Y-%m"))
+        ):
+            cache.pop(old_key, None)
+    if len(cache) > 1024:
+        retained = sorted(
+            cache.items(),
+            key=lambda item: str(item[1].get("checked_at", ""))
+            if isinstance(item[1], dict)
+            else "",
+            reverse=True,
+        )[:512]
+        cache.clear()
+        cache.update(retained)
+    return amount, currency, checked_at, False, None
+
+
 def query_cdt_traffic_gb(user):
     require_sdk()
     request = CommonRequest()
@@ -820,6 +928,97 @@ def query_instance_status(user):
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
+
+
+def ecs_status_group_key(user):
+    credentials = "{}\0{}".format(
+        str(user.get("ak", "") or "").strip(),
+        str(user.get("sk", "") or "").strip(),
+    )
+    return (
+        hashlib.sha256(credentials.encode("utf-8")).digest(),
+        str(user.get("region", "") or "").strip(),
+    )
+
+
+def ecs_status_cache_key(user):
+    group_key = ecs_status_group_key(user)
+    return group_key + (str(user.get("instance_id", "") or "").strip(),)
+
+
+def query_instance_statuses(users):
+    users = list(users or [])
+    if not users:
+        return {}
+    require_sdk()
+    request = DescribeInstancesRequest()
+    request.set_protocol_type("https")
+    request.set_accept_format("json")
+    request.set_InstanceIds(
+        json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
+    )
+    request.set_PageSize(min(100, len(users)))
+    request.set_connect_timeout(5000)
+    request.set_read_timeout(15000)
+    response = make_client(users[0]).do_action_with_exception(request)
+    data = json.loads(response.decode("utf-8"))
+    instances = data.get("Instances", {}).get("Instance", [])
+    if not isinstance(instances, list):
+        raise GuardError("ECS 返回实例列表格式无法识别")
+    return {
+        str(item.get("InstanceId", "")): str(item.get("Status", "Unknown"))
+        for item in instances
+        if isinstance(item, dict) and item.get("InstanceId")
+    }
+
+
+def _prefetch_instance_status_batch(batch, results):
+    try:
+        statuses = query_instance_statuses(batch)
+    except Exception as exc:
+        if len(batch) == 1:
+            results[ecs_status_cache_key(batch[0])] = (None, exc)
+            return
+        midpoint = len(batch) // 2
+        _prefetch_instance_status_batch(batch[:midpoint], results)
+        _prefetch_instance_status_batch(batch[midpoint:], results)
+        return
+
+    for user in batch:
+        instance_id = str(user.get("instance_id", "") or "").strip()
+        if instance_id in statuses:
+            results[ecs_status_cache_key(user)] = (statuses[instance_id], None)
+            continue
+        try:
+            results[ecs_status_cache_key(user)] = (query_instance_status(user), None)
+        except Exception as exc:
+            results[ecs_status_cache_key(user)] = (None, exc)
+
+
+def prefetch_instance_statuses(users):
+    groups = {}
+    for user in users or []:
+        if user.get("paused"):
+            continue
+        groups.setdefault(ecs_status_group_key(user), []).append(user)
+    results = {}
+    if SDK_IMPORT_ERROR is not None:
+        for user in users or []:
+            if user.get("paused"):
+                continue
+            try:
+                results[ecs_status_cache_key(user)] = (
+                    query_instance_status(user),
+                    None,
+                )
+            except Exception as exc:
+                results[ecs_status_cache_key(user)] = (None, exc)
+        return results
+    for group in groups.values():
+        for offset in range(0, len(group), 100):
+            batch = group[offset : offset + 100]
+            _prefetch_instance_status_batch(batch, results)
+    return results
 
 
 def _instance_tags(instance):
@@ -1101,9 +1300,32 @@ def append_telegram_connection_notice(telegram, text):
 def _telegram_post(url, data, timeout, proxies):
     if REQUESTS_IMPORT_ERROR is not None:
         raise GuardError("Telegram HTTP 依赖未安装: {}".format(REQUESTS_IMPORT_ERROR))
-    with requests.Session() as session:
+    connection_key = (
+        urllib.parse.urlsplit(url).scheme,
+        urllib.parse.urlsplit(url).netloc,
+        repr(proxies),
+    )
+    session = getattr(_TELEGRAM_LOCAL, "session", None)
+    if getattr(_TELEGRAM_LOCAL, "connection_key", None) != connection_key:
+        close_telegram_session()
+        session = None
+    if session is None:
+        session = requests.Session()
         session.trust_env = False
-        return session.post(url, data=data, timeout=timeout, proxies=proxies)
+        _TELEGRAM_LOCAL.session = session
+        _TELEGRAM_LOCAL.connection_key = connection_key
+    return session.post(url, data=data, timeout=timeout, proxies=proxies)
+
+
+def close_telegram_session():
+    session = getattr(_TELEGRAM_LOCAL, "session", None)
+    if session is not None:
+        try:
+            session.close()
+        finally:
+            delattr(_TELEGRAM_LOCAL, "session")
+    if hasattr(_TELEGRAM_LOCAL, "connection_key"):
+        delattr(_TELEGRAM_LOCAL, "connection_key")
 
 
 def telegram_api(config, method, data=None, request_timeout=None):
@@ -1237,6 +1459,9 @@ def check_one(
     now=None,
     scheduled_action=None,
     cdt_cycle_cache=None,
+    ecs_cycle_cache=None,
+    billing_state=None,
+    billing_force_refresh=False,
 ):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
@@ -1254,6 +1479,8 @@ def check_one(
         "bill_currency": None,
         "bill_symbol": str(billing.get("currency_symbol", "")),
         "bill_error": None,
+        "bill_checked_at": None,
+        "bill_from_cache": False,
         "action": "none",
         "action_performed": False,
         "level": "ok",
@@ -1282,8 +1509,17 @@ def check_one(
         LOGGER.error("[%s] %s", name, message)
 
     try:
-        result["status_before"] = query_instance_status(user)
-        result["status_after"] = result["status_before"]
+        if ecs_cycle_cache is None:
+            status = query_instance_status(user)
+        else:
+            status, status_error = ecs_cycle_cache.get(
+                ecs_status_cache_key(user),
+                (None, GuardError("ECS 批量查询缺少实例结果")),
+            )
+            if status_error is not None:
+                raise status_error
+        result["status_before"] = status
+        result["status_after"] = status
     except Exception as exc:
         message = "ECS 实例查询失败: {}".format(compact_error(exc, secrets=user_secrets))
         result["errors"].append(message)
@@ -1292,14 +1528,45 @@ def check_one(
     core_error_count = len(result["errors"])
     if result["billing_enabled"]:
         try:
-            result["bill_amount"], result["bill_currency"] = query_instance_bill(user)
+            cached_bill_error = None
+            if billing_state is None:
+                result["bill_amount"], result["bill_currency"] = query_instance_bill(user)
+                result["bill_checked_at"] = (now or dt.datetime.now().astimezone()).isoformat(
+                    timespec="seconds"
+                )
+            else:
+                (
+                    result["bill_amount"],
+                    result["bill_currency"],
+                    result["bill_checked_at"],
+                    result["bill_from_cache"],
+                    cached_bill_error,
+                ) = query_instance_bill_cached(
+                    user,
+                    billing_state,
+                    cache_seconds=int(
+                        config.get(
+                            "billing_cache_seconds",
+                            DEFAULT_CONFIG["billing_cache_seconds"],
+                        )
+                    ),
+                    now=now,
+                    force_refresh=billing_force_refresh,
+                )
             LOGGER.info(
-                "[%s] 本月实例账单 %s%.2f (%s)",
+                "[%s] 本月实例账单 %s%.2f (%s)%s",
                 name,
                 result["bill_symbol"],
                 result["bill_amount"],
                 result["bill_currency"],
+                "（缓存）" if result["bill_from_cache"] else "",
             )
+            if cached_bill_error is not None:
+                result["bill_error"] = "BSS 账单刷新失败，继续使用缓存: {}".format(
+                    compact_error(cached_bill_error, secrets=user_secrets)
+                )
+                result["errors"].append(result["bill_error"])
+                LOGGER.warning("[%s] %s", name, result["bill_error"])
         except Exception as exc:
             result["bill_error"] = "BSS 账单查询失败: {}".format(
                 compact_error(exc, secrets=user_secrets)
@@ -1542,7 +1809,17 @@ def build_summary(results, started_at, duration, dry_run=False):
             status = "{} -> {}".format(status, item["status_after"])
         lines.append("  ECS: {}".format(status))
         if item.get("billing_enabled", True):
-            if item.get("bill_error"):
+            if item.get("bill_error") and item.get("bill_amount") is not None:
+                currency = str(item.get("bill_currency") or "")
+                symbol = item.get("bill_symbol") or {"CNY": "¥", "USD": "$"}.get(
+                    currency, ""
+                )
+                lines.append(
+                    "  账单: {}{:.2f} ({}, 缓存；刷新失败)".format(
+                        symbol, item["bill_amount"], currency or "未知币种"
+                    )
+                )
+            elif item.get("bill_error"):
                 lines.append("  账单: 查询失败")
             elif item.get("bill_amount") is not None:
                 currency = str(item.get("bill_currency") or "")
@@ -1621,6 +1898,8 @@ def update_state(
             "bill_amount": item.get("bill_amount"),
             "bill_currency": item.get("bill_currency"),
             "bill_error": item.get("bill_error"),
+            "bill_checked_at": item.get("bill_checked_at"),
+            "bill_from_cache": bool(item.get("bill_from_cache", False)),
             "level": item["level"],
             "message": item["message"],
             "checked_at": started_at.isoformat(timespec="seconds"),
@@ -1702,6 +1981,8 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         previous_instances = {}
     results = []
     cdt_cycle_cache = {}
+    ecs_cycle_cache = prefetch_instance_statuses(config.get("users", []))
+    billing_state = previous_state
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
@@ -1716,6 +1997,9 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             now=started_at,
             scheduled_action=transition,
             cdt_cycle_cache=cdt_cycle_cache,
+            ecs_cycle_cache=ecs_cycle_cache,
+            billing_state=billing_state,
+            billing_force_refresh=False,
         )
         results.append(result)
         write_instance_log(user, result, dry_run=dry_run)
@@ -1750,6 +2034,93 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             "{} 个错误".format(error_count) if error_count else "检测完成",
         )
     return 1 if error_count else 0
+
+
+def refresh_billing_cache(started_at=None):
+    config = load_config()
+    if config.get("force_ipv4", True):
+        enable_ipv4_only()
+    started_at = started_at or dt.datetime.now().astimezone()
+    state = load_state()
+    results = []
+    for user in config.get("users", []):
+        billing = get_billing_config(user)
+        item = {
+            "name": str(user.get("name") or user.get("instance_id") or "未命名"),
+            "instance_id": str(user.get("instance_id", "") or ""),
+            "enabled": bool(billing.get("enabled", True)),
+            "ok": True,
+            "amount": None,
+            "currency": None,
+            "checked_at": None,
+            "from_cache": False,
+            "error": None,
+            "skipped": False,
+        }
+        if not item["enabled"] or user.get("paused"):
+            item["skipped"] = True
+            results.append(item)
+            continue
+        try:
+            (
+                item["amount"],
+                item["currency"],
+                item["checked_at"],
+                item["from_cache"],
+                refresh_error,
+            ) = query_instance_bill_cached(
+                user,
+                state,
+                cache_seconds=int(
+                    config.get(
+                        "billing_cache_seconds", DEFAULT_CONFIG["billing_cache_seconds"]
+                    )
+                ),
+                now=started_at,
+                force_refresh=True,
+            )
+            if refresh_error is not None:
+                raise refresh_error
+        except Exception as exc:
+            item["ok"] = False
+            item["error"] = compact_error(
+                exc, secrets=(user.get("ak"), user.get("sk"))
+            )
+        if not isinstance(state.get("instances"), dict):
+            state["instances"] = {}
+        current = state["instances"].get(item["instance_id"], {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update(
+            {
+                "name": item["name"],
+                "bill_amount": item["amount"],
+                "bill_currency": item["currency"],
+                "bill_checked_at": item["checked_at"],
+                "bill_from_cache": item["from_cache"],
+                "bill_error": (
+                    "BSS 账单刷新失败，继续使用缓存: {}".format(item["error"])
+                    if item["error"] and item["amount"] is not None
+                    else (
+                        "BSS 账单查询失败: {}".format(item["error"])
+                        if item["error"]
+                        else None
+                    )
+                ),
+            }
+        )
+        state["instances"][item["instance_id"]] = current
+        results.append(item)
+    save_state(state)
+    return {
+        "ok": all(item["ok"] for item in results),
+        "at": started_at.isoformat(timespec="seconds"),
+        "refreshed": sum(
+            1 for item in results if not item["skipped"] and item["ok"]
+        ),
+        "failed": sum(1 for item in results if not item["ok"]),
+        "items": results,
+    }
 
 
 def is_due(config, state, now=None):
@@ -2048,6 +2419,7 @@ def parse_args(argv=None):
     subparsers.add_parser("daemon", help="以前台守护进程运行")
     subparsers.add_parser("status", help="显示最近运行状态")
     subparsers.add_parser("test-telegram", help="测试 Telegram 配置")
+    subparsers.add_parser("refresh-billing", help="强制刷新账单缓存")
     return parser.parse_args(argv)
 
 
@@ -2080,6 +2452,21 @@ def main(argv=None):
                 )
             )
             return 0
+        if command == "refresh-billing":
+            with cycle_lock() as locked:
+                if not locked:
+                    print("已有检测正在运行，请稍后再试", file=sys.stderr)
+                    return 3
+                result = refresh_billing_cache()
+            print(
+                "账单刷新完成：{} 个成功，{} 个失败".format(
+                    result["refreshed"], result["failed"]
+                )
+            )
+            for item in result["items"]:
+                if item["error"]:
+                    print("[ERROR] {}: {}".format(item["name"], item["error"]))
+            return 0 if result["ok"] else 1
         with cycle_lock() as locked:
             if not locked:
                 print("已有检测正在运行，请稍后再试", file=sys.stderr)

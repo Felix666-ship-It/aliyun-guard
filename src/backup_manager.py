@@ -6,6 +6,7 @@ import base64
 import datetime as dt
 import hashlib
 import hmac
+import importlib
 import json
 import os
 from pathlib import Path
@@ -14,12 +15,8 @@ import shutil
 import tarfile
 import tempfile
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    CRYPTOGRAPHY_IMPORT_ERROR = None
-except ImportError as exc:
-    AESGCM = None
-    CRYPTOGRAPHY_IMPORT_ERROR = exc
+AESGCM = None
+CRYPTOGRAPHY_IMPORT_ERROR = None
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
@@ -86,10 +83,20 @@ def _derive_keys(passphrase, salt, iterations):
 
 
 def _require_cryptography():
+    global AESGCM, CRYPTOGRAPHY_IMPORT_ERROR
+    if AESGCM is not None:
+        return
     if CRYPTOGRAPHY_IMPORT_ERROR is not None:
         raise BackupError(
             "缺少备份加密依赖 cryptography: {}".format(CRYPTOGRAPHY_IMPORT_ERROR)
         )
+    try:
+        AESGCM = importlib.import_module(
+            "cryptography.hazmat.primitives.ciphers.aead"
+        ).AESGCM
+    except ImportError as exc:
+        CRYPTOGRAPHY_IMPORT_ERROR = exc
+        raise BackupError("缺少备份加密依赖 cryptography: {}".format(exc)) from exc
 
 
 def encrypt_payload(payload, passphrase, iterations=PBKDF2_ITERATIONS):
