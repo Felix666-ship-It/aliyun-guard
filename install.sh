@@ -4960,7 +4960,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -6807,6 +6807,24 @@ __AG_WEB_PY_EOF__
     .panel-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .panel-head h2 { margin: 0; font-size: 15px; }
     .panel-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+    .collapsible-panel { overflow: hidden; }
+    .collapsible-panel > summary { cursor: pointer; list-style: none; }
+    .collapsible-panel > summary::-webkit-details-marker { display: none; }
+    .collapsible-panel > summary::after {
+      content: "";
+      width: 8px;
+      height: 8px;
+      margin-right: 3px;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(45deg) translateY(-2px);
+      transition: transform .16s ease;
+      flex: 0 0 auto;
+    }
+    .collapsible-panel[open] > summary::after { transform: rotate(225deg) translate(-2px, -2px); }
+    .collapsible-panel:not([open]) > summary { border-bottom: 0; }
+    .collapsible-panel > summary:hover { background: var(--surface-alt); }
+    .collapsible-panel > summary:focus-visible { outline: 3px solid rgba(8, 119, 90, .22); outline-offset: -3px; }
     .panel-body { padding: 16px; }
     .panel-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
@@ -7083,8 +7101,9 @@ __AG_WEB_PY_EOF__
       <section id="settingsTab" class="tab-panel" hidden>
         <div class="section-heading"><div><h1>设置</h1><p>后台检测与网页入口</p></div></div>
         <div class="panel-grid">
-          <form id="settingsForm" class="panel">
-            <div class="panel-head"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div></div>
+          <details class="panel collapsible-panel" open>
+            <summary class="panel-head" title="展开或收起全局检测设置"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div></summary>
+            <form id="settingsForm">
             <div class="panel-body form-grid">
               <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
               <div class="field"><label for="billingCacheSeconds">账单缓存（秒）</label><input id="billingCacheSeconds" type="number" min="300" max="86400" required></div>
@@ -7099,10 +7118,12 @@ __AG_WEB_PY_EOF__
               <div class="field"><label for="watchdogFailures">连续失败次数</label><input id="watchdogFailures" type="number" min="1" max="10" required></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存全局设置</button></div>
-          </form>
+            </form>
+          </details>
 
-          <form id="webSettingsForm" class="panel">
-            <div class="panel-head"><div><h2>网页控制面板</h2><p>支持 HTTP 与 HTTPS 反向代理访问</p></div></div>
+          <details class="panel collapsible-panel">
+            <summary class="panel-head" title="展开或收起网页控制面板设置"><div><h2>网页控制面板</h2><p>支持 HTTP 与 HTTPS 反向代理访问</p></div></summary>
+            <form id="webSettingsForm">
             <div class="panel-body form-grid">
               <label class="check-row wide"><input id="webEnabled" type="checkbox">启用网页控制面板</label>
               <div class="field"><label for="webHost">监听方式</label><select id="webHost"><option value="127.0.0.1">仅本机 127.0.0.1</option><option value="0.0.0.0">所有 IPv4 网卡</option></select></div>
@@ -7113,7 +7134,8 @@ __AG_WEB_PY_EOF__
               <p id="webWarning" class="wide muted small"></p>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存并应用</button></div>
-          </form>
+            </form>
+          </details>
         </div>
       </section>
 
@@ -10846,8 +10868,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.0"
-LOCAL_RELEASE_ID = "c5c7c3df78199c79f088fca89ffa9eac345067b41fc315126f3a395168756cd6"
+APP_VERSION = "1.6.1"
+LOCAL_RELEASE_ID = "6431804ff8024f2076c658fe8f989c137d835d248ccaa0cb79184cddc544fc12"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

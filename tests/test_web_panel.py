@@ -764,6 +764,15 @@ class ManualControlTests(unittest.TestCase):
 
 
 class WebHtmlTests(unittest.TestCase):
+    def test_settings_forms_keep_existing_ids_inside_collapsible_panels(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertIn('<details class="panel collapsible-panel" open>', html)
+        self.assertIn('title="展开或收起全局检测设置"', html)
+        self.assertIn('title="展开或收起网页控制面板设置"', html)
+        self.assertIn('<form id="settingsForm">', html)
+        self.assertIn('<form id="webSettingsForm">', html)
+        self.assertIn(".collapsible-panel > summary", html)
+
     def test_update_panel_has_real_progress_and_reconnect_polling(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertIn('id="updateProgressBar"', html)
