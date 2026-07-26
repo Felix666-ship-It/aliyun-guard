@@ -4960,7 +4960,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -7038,8 +7038,9 @@ __AG_WEB_PY_EOF__
           <button id="telegramTestButton" class="button primary" type="button"><span data-icon="send"></span>发送测试消息</button>
         </div>
         <div class="panel-grid">
-          <form id="telegramIdentityForm" class="panel">
-            <div class="panel-head"><div><h2>机器人身份</h2><p>密钥留空时保留原配置</p></div></div>
+          <details class="panel collapsible-panel" open>
+            <summary class="panel-head" title="展开或收起机器人配置"><div><h2>机器人身份</h2><p>密钥留空时保留原配置</p></div></summary>
+            <form id="telegramIdentityForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="tgToken">Bot Token</label><input id="tgToken" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
               <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
@@ -7049,10 +7050,12 @@ __AG_WEB_PY_EOF__
               <div id="tgControlAdminsField" class="field wide"><label for="tgControlAdmins">管理员 Telegram 用户 ID</label><input id="tgControlAdmins" autocomplete="off" placeholder="留空使用正数私聊 Chat ID"><div id="tgControlHint" class="muted small"></div></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
-          </form>
+            </form>
+          </details>
 
-          <form id="connectionForm" class="panel">
-            <div class="panel-head"><div><h2>连接方式</h2><p id="connectionDescription">直连</p></div></div>
+          <details class="panel collapsible-panel">
+            <summary class="panel-head" title="展开或收起 Telegram 连接设置"><div><h2>连接方式</h2><p id="connectionDescription">直连</p></div></summary>
+            <form id="connectionForm">
             <div class="panel-body">
               <div class="mode-grid" role="radiogroup" aria-label="Telegram 连接方式">
                 <label class="mode-option"><input type="radio" name="connectionMode" value="direct"><span>直连</span></label>
@@ -7072,17 +7075,18 @@ __AG_WEB_PY_EOF__
               <button id="connectionTestButton" class="button secondary" type="button"><span data-icon="gauge"></span>单独检测</button>
               <button class="button primary" type="submit"><span data-icon="save"></span>测试并保存</button>
             </div>
-          </form>
+            </form>
+          </details>
 
-          <div class="panel full">
-            <div class="panel-head"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks；测试可达后才会保存</p></div><strong id="nodeCount">0 个节点</strong></div>
+          <details class="panel full collapsible-panel">
+            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks；测试可达后才会保存</p></div><strong id="nodeCount">0 个节点</strong></summary>
             <form id="nodeAddForm" class="panel-body">
               <div class="field"><label for="nodeUrl">节点链接</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess:// 或 ss://" required></textarea></div>
               <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>测试并保存节点</button></div>
               <div id="nodeResult" class="inline-result" hidden></div>
             </form>
             <div id="nodeList" class="node-list"></div>
-          </div>
+          </details>
         </div>
       </section>
 
@@ -7142,8 +7146,8 @@ __AG_WEB_PY_EOF__
       <section id="systemTab" class="tab-panel" hidden>
         <div class="section-heading"><div><h1>系统</h1><p>服务状态与 GitHub 版本</p></div></div>
         <div class="panel-grid">
-          <div class="panel">
-            <div class="panel-head"><div><h2>运行环境</h2><p>当前安装实例</p></div></div>
+          <details class="panel collapsible-panel" open>
+            <summary class="panel-head" title="展开或收起运行环境"><div><h2>运行环境</h2><p>当前安装实例</p></div></summary>
             <div class="panel-body system-list">
               <div class="system-row"><span>调度后端</span><strong id="systemBackend">--</strong></div>
               <div class="system-row"><span>访问 IPv4</span><strong id="systemLocalIp">--</strong></div>
@@ -7151,9 +7155,9 @@ __AG_WEB_PY_EOF__
               <div class="system-row"><span>当前版本</span><strong id="systemCurrentVersion">--</strong></div>
             </div>
             <div class="panel-actions"><button id="restartServiceButton" class="button warning" type="button"><span data-icon="refresh-cw"></span>重启后台服务</button></div>
-          </div>
-          <div class="panel">
-            <div class="panel-head"><div><h2>GitHub 更新</h2><p>从正式发布版本更新</p></div></div>
+          </details>
+          <details class="panel collapsible-panel">
+            <summary class="panel-head" title="展开或收起 GitHub 更新"><div><h2>GitHub 更新</h2><p>从正式发布版本更新</p></div></summary>
             <div class="panel-body system-list">
               <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
               <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
@@ -7164,18 +7168,21 @@ __AG_WEB_PY_EOF__
               </div>
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
-          </div>
-          <form id="backupCreateForm" class="panel">
-            <div class="panel-head"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div></div>
+          </details>
+          <details class="panel collapsible-panel">
+            <summary class="panel-head" title="展开或收起加密备份"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div></summary>
+            <form id="backupCreateForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="backupPassword">备份密码</label><input id="backupPassword" type="password" minlength="8" autocomplete="new-password" required></div>
               <label class="check-row"><input id="backupState" type="checkbox" checked>包含状态</label>
               <label class="check-row"><input id="backupLogs" type="checkbox" checked>包含日志</label>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="download"></span>创建并下载</button></div>
-          </form>
-          <form id="backupRestoreForm" class="panel">
-            <div class="panel-head"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div></div>
+            </form>
+          </details>
+          <details class="panel collapsible-panel">
+            <summary class="panel-head" title="展开或收起恢复备份"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div></summary>
+            <form id="backupRestoreForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="restoreFile">备份文件</label><input id="restoreFile" type="file" accept=".agbackup,application/json" required></div>
               <div class="field wide"><label for="restorePassword">备份密码</label><input id="restorePassword" type="password" minlength="8" autocomplete="current-password" required></div>
@@ -7183,9 +7190,11 @@ __AG_WEB_PY_EOF__
               <div id="restorePreview" class="inline-result wide" hidden></div>
             </div>
             <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
-          </form>
-          <form id="s3BackupForm" class="panel full">
-            <div class="panel-head"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></div>
+            </form>
+          </details>
+          <details class="panel full collapsible-panel">
+            <summary class="panel-head" title="展开或收起 AWS S3 自动备份"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></summary>
+            <form id="s3BackupForm">
             <div class="panel-body form-grid">
               <label class="check-row wide"><input id="s3Enabled" type="checkbox">启用自动备份</label>
               <div class="field"><label for="s3Bucket">Bucket</label><input id="s3Bucket" autocomplete="off"></div>
@@ -7214,12 +7223,13 @@ __AG_WEB_PY_EOF__
             </div>
             <div class="panel-actions"><button id="s3TestButton" class="button secondary" type="button"><span data-icon="gauge"></span>测试连接</button><button id="s3RunButton" class="button secondary" type="button"><span data-icon="upload"></span>立即备份</button><button id="s3ListButton" class="button secondary" type="button"><span data-icon="search"></span>云端备份</button><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
             <div id="s3BackupList" class="node-list"></div>
-          </form>
-          <div class="panel full">
-            <div class="panel-head"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></div>
+            </form>
+          </details>
+          <details class="panel full collapsible-panel">
+            <summary class="panel-head" title="展开或收起程序版本回滚"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></summary>
             <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
             <div class="panel-actions"><button id="rollbackButton" class="button warning" type="button" disabled><span data-icon="refresh-cw"></span>回滚并重启</button></div>
-          </div>
+          </details>
         </div>
       </section>
     </main>
@@ -10868,8 +10878,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.1"
-LOCAL_RELEASE_ID = "6431804ff8024f2076c658fe8f989c137d835d248ccaa0cb79184cddc544fc12"
+APP_VERSION = "1.6.2"
+LOCAL_RELEASE_ID = "033fd79640d759c9a34a199147dab5ed5dbe8558218aa74c3ccb2c354fd0a64c"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
