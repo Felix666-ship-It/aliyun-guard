@@ -2241,7 +2241,7 @@ def _subscription_target(value):
             port or (443 if parsed.scheme.lower() == "https" else 80),
             type=socket.SOCK_STREAM,
         )
-    except OSError:
+    except (OSError, ValueError):
         raise ProxyError("无法解析订阅服务器地址")
     resolved = []
     for item in addresses:
@@ -5188,7 +5188,10 @@ def add_telegram_node(guard, data):
     node_url = str(data.get("node_url", "") or "").strip()
     if not node_url:
         raise ManagementError("节点或订阅链接不能为空")
-    scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    try:
+        scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    except ValueError:
+        raise ManagementError("节点或订阅链接格式无效")
     if scheme in ("http", "https"):
         return _add_telegram_subscription(guard, data, node_url)
     try:
@@ -5227,6 +5230,11 @@ def _add_telegram_subscription(guard, data, subscription_url):
         )
     except telegram_proxy.ProxyError as exc:
         raise ManagementError("订阅导入失败: {}".format(exc), 400)
+    except Exception as exc:
+        guard.LOGGER.warning(
+            "Unexpected subscription import error: %s", type(exc).__name__
+        )
+        raise ManagementError("订阅导入失败: 无法下载或解析订阅", 502)
     config = guard.load_config()
     current = config.setdefault("telegram", {})
     existing_nodes = guard.telegram_node_urls(current)
@@ -5660,7 +5668,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -11701,8 +11709,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.3"
-LOCAL_RELEASE_ID = "134fd0794bcda55ab4592595ac07840fb0e2f01a723a4c3103fd638792ac5d18"
+APP_VERSION = "1.6.4"
+LOCAL_RELEASE_ID = "2ae0d12786a81337f3d3f33d2bd85483f782cf6cdd72c96c46f28cf8309b3d6a"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

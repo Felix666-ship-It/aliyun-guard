@@ -1117,7 +1117,10 @@ def add_telegram_node(guard, data):
     node_url = str(data.get("node_url", "") or "").strip()
     if not node_url:
         raise ManagementError("节点或订阅链接不能为空")
-    scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    try:
+        scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    except ValueError:
+        raise ManagementError("节点或订阅链接格式无效")
     if scheme in ("http", "https"):
         return _add_telegram_subscription(guard, data, node_url)
     try:
@@ -1156,6 +1159,11 @@ def _add_telegram_subscription(guard, data, subscription_url):
         )
     except telegram_proxy.ProxyError as exc:
         raise ManagementError("订阅导入失败: {}".format(exc), 400)
+    except Exception as exc:
+        guard.LOGGER.warning(
+            "Unexpected subscription import error: %s", type(exc).__name__
+        )
+        raise ManagementError("订阅导入失败: 无法下载或解析订阅", 502)
     config = guard.load_config()
     current = config.setdefault("telegram", {})
     existing_nodes = guard.telegram_node_urls(current)

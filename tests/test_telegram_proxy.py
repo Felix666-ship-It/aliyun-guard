@@ -172,6 +172,18 @@ class NodeParserTests(unittest.TestCase):
             with self.assertRaises(telegram_proxy.ProxyError):
                 telegram_proxy._subscription_url("https://subscription.example/list")
 
+    def test_dns_encoding_failure_is_a_subscription_error(self):
+        with mock.patch.object(
+            telegram_proxy.socket,
+            "getaddrinfo",
+            side_effect=UnicodeError("invalid host"),
+        ):
+            with self.assertRaises(telegram_proxy.ProxyError) as raised:
+                telegram_proxy._subscription_url(
+                    "https://subscription.example/list"
+                )
+        self.assertIn("无法解析", str(raised.exception))
+
     def test_malformed_node_link_is_a_proxy_error_and_subscription_skips_it(self):
         malformed = "anytls://password@[broken:443"
         valid = "anytls://password@valid.example:443#Valid"

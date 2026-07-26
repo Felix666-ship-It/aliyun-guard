@@ -342,6 +342,31 @@ class WebActionTests(unittest.TestCase):
                 )
         self.assertEqual(guard.load_config()["telegram"], before)
 
+    def test_malformed_subscription_url_is_a_client_error(self):
+        before = copy.deepcopy(guard.load_config()["telegram"])
+        with self.assertRaises(web_actions.ManagementError) as raised:
+            web_actions.add_telegram_node(
+                guard, {"node_url": "https://[broken"}
+            )
+        self.assertEqual(raised.exception.status, 400)
+        self.assertIn("链接格式无效", str(raised.exception))
+        self.assertEqual(guard.load_config()["telegram"], before)
+
+    def test_unexpected_subscription_failure_is_a_gateway_error(self):
+        before = copy.deepcopy(guard.load_config()["telegram"])
+        with mock.patch.object(
+            web_actions.telegram_proxy,
+            "fetch_subscription_nodes",
+            side_effect=RuntimeError("unexpected"),
+        ):
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.add_telegram_node(
+                    guard, {"node_url": "https://subscription.example/list"}
+                )
+        self.assertEqual(raised.exception.status, 502)
+        self.assertIn("无法下载或解析订阅", str(raised.exception))
+        self.assertEqual(guard.load_config()["telegram"], before)
+
     def test_container_rejects_internal_listener_changes(self):
         config = guard.load_config()
         config["web_panel"].update(

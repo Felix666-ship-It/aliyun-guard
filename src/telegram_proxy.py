@@ -456,7 +456,7 @@ def _subscription_target(value):
             port or (443 if parsed.scheme.lower() == "https" else 80),
             type=socket.SOCK_STREAM,
         )
-    except OSError:
+    except (OSError, ValueError):
         raise ProxyError("无法解析订阅服务器地址")
     resolved = []
     for item in addresses:

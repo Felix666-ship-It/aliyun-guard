@@ -658,6 +658,19 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(saved["control_enabled"])
         self.assertEqual(saved["control_admin_ids"], [7001, 7002])
 
+    def test_malformed_subscription_returns_400_instead_of_500(self):
+        cookie, csrf = self.login()
+        status, data, _headers = self.request(
+            "POST",
+            "/api/telegram/nodes",
+            {"node_url": "https://[broken"},
+            cookie=cookie,
+            csrf=csrf,
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(data["ok"])
+        self.assertIn("链接格式无效", data["error"])
+
 
 class ManualControlTests(unittest.TestCase):
     def test_manual_start_is_blocked_when_traffic_reaches_limit(self):
