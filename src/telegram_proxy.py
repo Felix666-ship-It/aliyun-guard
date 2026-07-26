@@ -5,12 +5,15 @@
 import atexit
 import base64
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -44,6 +47,19 @@ SING_BOX_ASSETS = {
         "e01a58d28512b1447ab6156017afdeeaa306169a95d27abc00e112599e4ae46c",
     ),
 }
+SUPPORTED_NODE_SCHEMES = (
+    "vless",
+    "vmess",
+    "ss",
+    "trojan",
+    "hysteria2",
+    "hy2",
+    "tuic",
+    "anytls",
+)
+MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024
+MAX_SUBSCRIPTION_NODES = 300
+SUBSCRIPTION_TIMEOUT_SECONDS = 20
 
 _PROCESS = None
 _PROCESS_KEY = None
@@ -94,9 +110,13 @@ def _build_tls(query, server, security):
         return None
     tls = {
         "enabled": True,
-        "server_name": _query_value(query, "sni", "serverName", default=server),
+        "server_name": _query_value(
+            query, "sni", "serverName", "server_name", "peer", default=server
+        ),
     }
-    if _truthy(_query_value(query, "allowInsecure", "insecure")):
+    if _truthy(
+        _query_value(query, "allowInsecure", "allow_insecure", "insecure")
+    ):
         tls["insecure"] = True
     alpn = _query_value(query, "alpn")
     if alpn:
@@ -274,16 +294,339 @@ def parse_shadowsocks_link(link):
     return outbound
 
 
+def _parsed_password(parsed, label):
+    username = urllib.parse.unquote(parsed.username or "").strip()
+    password = urllib.parse.unquote(parsed.password or "").strip()
+    if username and password:
+        return "{}:{}".format(username, password)
+    value = username or password
+    if not value:
+        raise ProxyError("{} 节点缺少密码或认证信息".format(label))
+    return value
+
+
+def parse_trojan_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "Trojan")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "trojan",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+    }
+    security = _query_value(query, "security", default="tls").lower()
+    tls = _build_tls(query, server, security)
+    if tls:
+        outbound["tls"] = tls
+    transport = _build_transport(
+        _query_value(query, "type", "network", default="tcp"),
+        query,
+        _query_value(query, "host"),
+        _query_value(query, "path"),
+    )
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def parse_hysteria2_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "Hysteria2")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "hysteria2",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "tls": _build_tls(query, server, "tls"),
+    }
+    obfs_type = _query_value(query, "obfs", "obfs_type")
+    obfs_password = _query_value(
+        query, "obfs-password", "obfs_password", "obfsParam"
+    )
+    if obfs_type:
+        if not obfs_password:
+            raise ProxyError("Hysteria2 混淆缺少密码")
+        outbound["obfs"] = {"type": obfs_type, "password": obfs_password}
+    return outbound
+
+
+def parse_tuic_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    uuid = urllib.parse.unquote(parsed.username or "").strip()
+    password = urllib.parse.unquote(parsed.password or "").strip()
+    if not uuid or not password:
+        raise ProxyError("TUIC 节点缺少 UUID 或密码")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "tuic",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "uuid": uuid,
+        "password": password,
+        "congestion_control": _query_value(
+            query, "congestion_control", "congestion-controller", default="bbr"
+        ),
+        "tls": _build_tls(query, server, "tls"),
+    }
+    udp_relay_mode = _query_value(query, "udp_relay_mode", "udp-relay-mode")
+    if udp_relay_mode:
+        outbound["udp_relay_mode"] = udp_relay_mode
+    if _truthy(_query_value(query, "zero_rtt_handshake", "allow_insecure_0rtt")):
+        outbound["zero_rtt_handshake"] = True
+    return outbound
+
+
+def parse_anytls_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "AnyTLS")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    return {
+        "type": "anytls",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "tls": _build_tls(query, server, "tls"),
+    }
+
+
 def parse_node_link(link):
     link = str(link or "").strip()
-    scheme = urllib.parse.urlsplit(link).scheme.lower()
-    if scheme == "vless":
-        return parse_vless_link(link)
-    if scheme == "vmess":
-        return parse_vmess_link(link)
-    if scheme == "ss":
-        return parse_shadowsocks_link(link)
-    raise ProxyError("节点链接必须以 vless://、vmess:// 或 ss:// 开头")
+    try:
+        scheme = urllib.parse.urlsplit(link).scheme.lower()
+        if scheme == "vless":
+            return parse_vless_link(link)
+        if scheme == "vmess":
+            return parse_vmess_link(link)
+        if scheme == "ss":
+            return parse_shadowsocks_link(link)
+        if scheme == "trojan":
+            return parse_trojan_link(link)
+        if scheme in ("hysteria2", "hy2"):
+            return parse_hysteria2_link(link)
+        if scheme == "tuic":
+            return parse_tuic_link(link)
+        if scheme == "anytls":
+            return parse_anytls_link(link)
+    except ProxyError:
+        raise
+    except ValueError as exc:
+        raise ProxyError("节点链接格式无效: {}".format(exc))
+    raise ProxyError(
+        "节点链接协议不受支持；可使用 VLESS、VMess、Shadowsocks、Trojan、"
+        "Hysteria2、TUIC 或 AnyTLS"
+    )
+
+
+def is_node_link(value):
+    try:
+        scheme = urllib.parse.urlsplit(str(value or "").strip()).scheme.lower()
+    except ValueError:
+        return False
+    return scheme in SUPPORTED_NODE_SCHEMES
+
+
+def _subscription_target(value):
+    value = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        raise ProxyError("订阅链接格式无效")
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ProxyError("订阅链接必须是有效的 HTTP 或 HTTPS 地址")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ProxyError("订阅链接不能指向本机或内网地址")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ProxyError("订阅链接端口无效")
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            port or (443 if parsed.scheme.lower() == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        raise ProxyError("无法解析订阅服务器地址")
+    resolved = []
+    for item in addresses:
+        address_text = str(item[4][0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            raise ProxyError("订阅服务器返回了无效地址")
+        if address not in resolved:
+            resolved.append(address)
+    if not resolved or any(not address.is_global for address in resolved):
+        raise ProxyError("订阅链接不能指向本机或内网地址")
+    return value, parsed, tuple(str(address) for address in resolved)
+
+
+def _subscription_url(value):
+    return _subscription_target(value)[0]
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, address, timeout):
+        super().__init__(host, port=port, timeout=timeout)
+        self._resolved_address = address
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._resolved_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, address, timeout):
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._resolved_address = address
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._resolved_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self.host
+        )
+
+
+def _subscription_request(url, timeout):
+    safe_url, parsed, addresses = _subscription_target(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    host = parsed.hostname
+    host_header = "[{}]".format(host) if ":" in host else host
+    if port != (443 if scheme == "https" else 80):
+        host_header = "{}:{}".format(host_header, port)
+    target = urllib.parse.urlunsplit(
+        ("", "", parsed.path or "/", parsed.query, "")
+    )
+    headers = {
+        "Host": host_header,
+        "User-Agent": "Aliyun-Guard-Subscription/1",
+        "Accept": "text/plain, application/octet-stream;q=0.9, */*;q=0.1",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+    last_error = None
+    for address in addresses:
+        connection = None
+        try:
+            connection_type = (
+                _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+            )
+            connection = connection_type(host, port, address, timeout)
+            connection.request("GET", target, headers=headers)
+            response = connection.getresponse()
+            content_length = response.getheader("Content-Length")
+            if content_length and int(content_length) > MAX_SUBSCRIPTION_BYTES:
+                raise ProxyError("订阅内容超过 2 MiB 限制")
+            content = response.read(MAX_SUBSCRIPTION_BYTES + 1)
+            return (
+                response.status,
+                response.getheader("Location"),
+                content,
+                safe_url,
+            )
+        except ProxyError:
+            raise
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            if connection is not None:
+                connection.close()
+    raise ProxyError("订阅下载失败") from last_error
+
+
+def _subscription_nodes_from_text(text):
+    nodes = []
+    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
+        value = raw_line.strip().lstrip("\ufeff")
+        if value.startswith("- "):
+            value = value[2:].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+        if not is_node_link(value):
+            continue
+        try:
+            parse_node_link(value)
+        except ProxyError:
+            continue
+        if value not in nodes:
+            nodes.append(value)
+        if len(nodes) > MAX_SUBSCRIPTION_NODES:
+            raise ProxyError(
+                "订阅节点超过 {} 个限制".format(MAX_SUBSCRIPTION_NODES)
+            )
+    return nodes
+
+
+def parse_subscription_content(content):
+    if isinstance(content, bytes):
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ProxyError("订阅内容不是有效的 UTF-8 文本")
+    else:
+        text = str(content or "").lstrip("\ufeff")
+    nodes = _subscription_nodes_from_text(text)
+    if nodes:
+        return nodes
+    compact = "".join(text.split())
+    if compact:
+        compact += "=" * (-len(compact) % 4)
+        try:
+            decoded = base64.b64decode(
+                compact.encode("ascii"), altchars=b"-_", validate=True
+            ).decode("utf-8-sig")
+        except (ValueError, UnicodeError):
+            decoded = ""
+        nodes = _subscription_nodes_from_text(decoded)
+    if not nodes:
+        raise ProxyError("订阅中没有可用的受支持节点链接")
+    return nodes
+
+
+def fetch_subscription_nodes(subscription_url, timeout=SUBSCRIPTION_TIMEOUT_SECONDS):
+    current_url = _subscription_url(subscription_url)
+    request_timeout = max(3, int(timeout))
+    for _redirect in range(6):
+        status, location, content, final_url = _subscription_request(
+            current_url, request_timeout
+        )
+        if status in (301, 302, 303, 307, 308):
+            if not location:
+                raise ProxyError("订阅重定向缺少目标地址")
+            current_url = _subscription_url(
+                urllib.parse.urljoin(final_url, location)
+            )
+            continue
+        if status < 200 or status >= 300:
+            raise ProxyError("订阅下载返回 HTTP {}".format(status))
+        if len(content) > MAX_SUBSCRIPTION_BYTES:
+            raise ProxyError("订阅内容超过 2 MiB 限制")
+        return parse_subscription_content(content)
+    raise ProxyError("订阅重定向次数过多")
 
 
 def _clean_display_label(value, limit=80):

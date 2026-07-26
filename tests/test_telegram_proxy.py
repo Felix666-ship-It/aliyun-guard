@@ -119,6 +119,87 @@ class NodeParserTests(unittest.TestCase):
         self.assertEqual(outbound["password"], "secret-password")
         self.assertEqual(outbound["server_port"], 8388)
 
+    def test_parses_trojan_hysteria2_tuic_and_anytls(self):
+        trojan = telegram_proxy.parse_node_link(
+            "trojan://trojan-password@trojan.example:443?sni=edge.example.com#Trojan"
+        )
+        hysteria2 = telegram_proxy.parse_node_link(
+            "hy2://hy2-password@hy2.example:443?obfs=salamander&obfs-password=obfs-secret#Hysteria2"
+        )
+        tuic = telegram_proxy.parse_node_link(
+            "tuic://33333333-3333-3333-3333-333333333333:tuic-password@tuic.example:443?congestion_control=bbr#TUIC"
+        )
+        anytls = telegram_proxy.parse_node_link(
+            "anytls://anytls-password@anytls.example:443?sni=edge.example.com#AnyTLS"
+        )
+
+        self.assertEqual(trojan["type"], "trojan")
+        self.assertEqual(trojan["password"], "trojan-password")
+        self.assertEqual(hysteria2["type"], "hysteria2")
+        self.assertEqual(hysteria2["obfs"], {"type": "salamander", "password": "obfs-secret"})
+        self.assertEqual(tuic["type"], "tuic")
+        self.assertEqual(tuic["uuid"], "33333333-3333-3333-3333-333333333333")
+        self.assertEqual(anytls["type"], "anytls")
+        self.assertEqual(anytls["tls"]["server_name"], "edge.example.com")
+        self.assertEqual(
+            telegram_proxy.describe_node_link(
+                "anytls://anytls-password@anytls.example:443#AnyTLS"
+            ),
+            "ANYTLS 节点（AnyTLS）",
+        )
+
+    def test_parses_plain_and_base64_subscription_nodes(self):
+        vless = (
+            "vless://11111111-1111-1111-1111-111111111111@node.example:443"
+            "?security=tls#First"
+        )
+        anytls = "anytls://subscription-password@anytls.example:443#AnyTLS"
+        plain = "{}\nunsupported://ignored\n{}\n{}\n".format(vless, anytls, vless)
+        self.assertEqual(
+            telegram_proxy.parse_subscription_content(plain), [vless, anytls]
+        )
+        encoded_subscription = base64.b64encode(plain.encode("utf-8"))
+        self.assertEqual(
+            telegram_proxy.parse_subscription_content(encoded_subscription), [vless, anytls]
+        )
+
+    def test_rejects_private_subscription_address(self):
+        with mock.patch.object(
+            telegram_proxy.socket,
+            "getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 443))],
+        ):
+            with self.assertRaises(telegram_proxy.ProxyError):
+                telegram_proxy._subscription_url("https://subscription.example/list")
+
+    def test_malformed_node_link_is_a_proxy_error_and_subscription_skips_it(self):
+        malformed = "anytls://password@[broken:443"
+        valid = "anytls://password@valid.example:443#Valid"
+        with self.assertRaises(telegram_proxy.ProxyError):
+            telegram_proxy.parse_node_link(malformed)
+        self.assertEqual(
+            telegram_proxy.parse_subscription_content(malformed + "\n" + valid),
+            [valid],
+        )
+
+    def test_subscription_fetch_connects_to_validated_address(self):
+        response = mock.MagicMock(status=200)
+        response.getheader.return_value = None
+        response.read.return_value = b"anytls://password@node.example:443#Node"
+        connection = mock.MagicMock()
+        connection.getresponse.return_value = response
+        addresses = [(2, 1, 6, "", ("8.8.8.8", 443))]
+        with mock.patch.object(
+            telegram_proxy.socket, "getaddrinfo", return_value=addresses
+        ), mock.patch.object(
+            telegram_proxy, "_PinnedHTTPSConnection", return_value=connection
+        ) as pinned:
+            nodes = telegram_proxy.fetch_subscription_nodes(
+                "https://subscription.example/list"
+            )
+        pinned.assert_called_once_with("subscription.example", 443, "8.8.8.8", 20)
+        self.assertEqual(nodes, ["anytls://password@node.example:443#Node"])
+
     def test_node_description_falls_back_to_server(self):
         link = "ss://{}@ss.example.com:8388".format(
             encoded("aes-256-gcm:secret-password")
@@ -138,7 +219,7 @@ class NodeParserTests(unittest.TestCase):
 
     def test_rejects_unknown_node_scheme(self):
         with self.assertRaises(telegram_proxy.ProxyError):
-            telegram_proxy.parse_node_link("trojan://password@example.com:443")
+            telegram_proxy.parse_node_link("unsupported://password@example.com:443")
 
     def test_maps_supported_linux_architectures(self):
         expected = {

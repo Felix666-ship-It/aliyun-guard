@@ -287,6 +287,61 @@ class WebActionTests(unittest.TestCase):
                 web_actions.add_telegram_node(guard, {"node_url": NODE_URL})
         self.assertNotIn(NODE_URL, guard.load_config()["telegram"]["node_urls"])
 
+    def test_subscription_selects_first_reachable_node_and_saves_all(self):
+        first = "anytls://first-password@first.example:443#First"
+        second = "anytls://second-password@second.example:443#Second"
+        successful_result = {
+            "username": "example_bot",
+            "latency_ms": 88.0,
+            "latency_attempts": 1,
+            "connection": "节点链接",
+        }
+        with mock.patch.object(
+            web_actions.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=[first, second],
+        ), mock.patch.object(
+            web_actions,
+            "_telegram_test",
+            side_effect=[
+                web_actions.ManagementError("Telegram 测试失败", 502),
+                successful_result,
+            ],
+        ) as test_connection, mock.patch.object(
+            web_actions.telegram_proxy, "stop_node_proxy"
+        ):
+            result = web_actions.add_telegram_node(
+                guard, {"node_url": "https://subscription.example/list"}
+            )
+
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["node_urls"], [first, second])
+        self.assertEqual(saved["node_url"], second)
+        self.assertEqual(saved["connection_mode"], "node")
+        self.assertEqual(result["source"], "subscription")
+        self.assertEqual(result["imported_count"], 2)
+        self.assertEqual(result["tested_count"], 2)
+        self.assertEqual(test_connection.call_count, 2)
+        self.assertEqual(test_connection.call_args.kwargs["latency_attempts"], 1)
+
+    def test_failed_subscription_does_not_change_configuration(self):
+        before = copy.deepcopy(guard.load_config()["telegram"])
+        node = "anytls://unreachable-password@unreachable.example:443#Unreachable"
+        with mock.patch.object(
+            web_actions.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=[node],
+        ), mock.patch.object(
+            web_actions,
+            "_telegram_test",
+            side_effect=web_actions.ManagementError("Telegram 测试失败", 502),
+        ), mock.patch.object(web_actions.telegram_proxy, "stop_node_proxy"):
+            with self.assertRaises(web_actions.ManagementError):
+                web_actions.add_telegram_node(
+                    guard, {"node_url": "https://subscription.example/list"}
+                )
+        self.assertEqual(guard.load_config()["telegram"], before)
+
     def test_container_rejects_internal_listener_changes(self):
         config = guard.load_config()
         config["web_panel"].update(

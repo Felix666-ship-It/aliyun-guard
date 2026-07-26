@@ -690,7 +690,7 @@ class TelegramControlService:
             stop_time = self.guard.normalize_schedule_time(parts[1], "关机时间")
             if start_time == stop_time:
                 raise self.guard.GuardError("开机时间和关机时间不能相同")
-            with self.guard.cycle_lock() as locked:
+            with self.guard.cycle_lock() as locked, self.guard.config_lock():
                 if not locked:
                     raise self.guard.GuardError("检测任务正在运行，请稍后重新输入")
                 config = self.guard.load_config()
@@ -798,7 +798,7 @@ class TelegramControlService:
     def _set_schedule_enabled(
         self, telegram, chat_id, user_id, index, enabled, message_id=None
     ):
-        with self.guard.cycle_lock() as locked:
+        with self.guard.cycle_lock() as locked, self.guard.config_lock():
             if not locked:
                 raise self.guard.GuardError("检测任务正在运行，请稍后再试")
             config = self.guard.load_config()

@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.2-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.3-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -22,7 +22,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 - **账单缓存与手动刷新**：BSS 账单默认缓存 1 小时，可在终端或网页调整，并可随时强制刷新；刷新失败时保留最近一次成功金额并明确告警。
 - **错误来源分离**：CDT、ECS、BSS 和 Telegram 分别记录结果；账单失败不会阻断保活判断。
 - **每轮 Telegram 汇总**：默认每轮都通知，也可切换为仅事件或仅错误通知；临时网络失败自动重试。
-- **Telegram 多连接方式**：支持直连、SOCKS5、HTTP/HTTPS、API 反向代理，以及保存、切换多个 VLESS、VMess、Shadowsocks 单节点链接。
+- **Telegram 多连接方式**：支持直连、SOCKS5、HTTP/HTTPS、API 反向代理，以及保存、切换多个 VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS 节点；也可导入订阅并自动选择可用节点。
 - **通知标明代理节点**：使用代理时，每条 Bot 通知都会显示脱敏后的代理端点或节点备注。
 - **Telegram 路径延迟测试**：按当前连接方式向 Telegram Bot API 发起 3 次请求，并在终端和测试通知中显示平均往返延迟。
 - **Telegram Bot 单消息控制**：默认启用管理员私聊控制，状态、实例、检测、开关机和定时计划都在同一条 Bot 消息内切换；真实动作均需按钮确认，关机实例开机需要连续两次确认。
@@ -396,7 +396,7 @@ ALIYUN_GUARD_BIND_IP=127.0.0.1
 Docker 数据位置：
 
 - `./docker-data`：`config.json`、`state.json`、日志和锁文件，删除或重建容器不会丢失。
-- `aliyun-guard-bin` 卷：使用 VLESS、VMess 或 Shadowsocks 时下载并校验的 sing-box。
+- `aliyun-guard-bin` 卷：使用节点协议时下载并校验的 sing-box。
 - 镜像内不包含 Bot Token、AccessKey、代理凭据或节点链接。
 
 常用 Docker 命令：
@@ -604,7 +604,7 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 菜单标题下会直接显示当前方式；使用节点链接时还会显示节点协议和备注，例如：
 
 ```text
-当前方式: 节点链接（VLESS / VMess / Shadowsocks）
+当前方式: 节点链接（VLESS / VMess / Shadowsocks / Trojan / Hysteria2 / TUIC / AnyTLS）
 当前节点: VLESS 节点（Hong Kong 01）
 ```
 
@@ -612,7 +612,7 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 1) 直连
 2) SOCKS5 代理
 3) HTTP/HTTPS 代理
-4) 节点链接（VLESS / VMess / Shadowsocks）  [已保存 2 个]
+4) 节点链接（VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS）  [已保存 2 个]
 5) Telegram API 反向代理
 6) 查看当前选择
 7) 取消并返回
@@ -625,12 +625,13 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 - API 反向代理只填写 HTTPS 基础地址，不要包含 `/botTOKEN`。
 - 第 4 项会显示已保存节点数量；进入后可选择旧节点、添加新节点或删除节点。
 - 从 `v1.2.3` 及更早版本升级时，`config.json` 中仍存在的 `telegram.node_url` 会自动加入节点列表，并标记为“上次使用”，不需要重新输入。
-- 添加节点时可直接粘贴单个 `vless://`、`vmess://` 或 `ss://` 链接；重复链接不会重复保存。
+- 添加节点时可直接粘贴单个 `vless://`、`vmess://`、`ss://`、`trojan://`、`hysteria2://` / `hy2://`、`tuic://` 或 `anytls://` 链接；重复链接不会重复保存。
+- 也可粘贴 HTTP/HTTPS 订阅地址。支持常见的明文 URI 列表和 Base64 URI 列表；会先解析并去重，再按顺序检测前 32 个节点，自动保存全部解析结果并选用第一个能连接 Telegram 的节点。订阅全部不可用时不修改已有配置。
 - 存在多个节点时，每个节点都会显示独立序号和脱敏说明；选择序号即可将其设为待使用节点，不会覆盖其他节点。
 - 新增节点会临时通过该节点访问 Telegram Bot API，预热后测量 3 次平均往返延迟并发送测试消息；全部成功才加入节点列表，失败则丢弃本次新增内容。无论成功或失败，当前直连、代理或正在使用的节点都不会被切换。
 - 选择第 1 项直连时会立即检测 Telegram 直连；检测成功后直接切换并保存，检测失败则保留原连接方式。切换直连不会删除已保存节点。
 - VLESS 支持 TLS、Reality、TCP、WebSocket、gRPC、HTTP 和 HTTPUpgrade 常用参数。
-- VMess 支持 TCP、WebSocket 和 gRPC 常用参数。
+- VMess 支持 TCP、WebSocket 和 gRPC 常用参数；Trojan、Hysteria2、TUIC 和 AnyTLS 支持各自常用 TLS 连接参数。
 - 节点模式使用 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 作为协议核心，支持 Linux amd64、arm64、armv7 和 386。
 - 首次使用节点模式时会下载固定版本的官方 sing-box，并核对内置 SHA-256 后安装。
 - sing-box 仅监听随机的 `127.0.0.1` 回环端口，只代理 Telegram 请求；阿里云 API 继续直连。
@@ -640,8 +641,6 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 - 直连测量“本机 -> Telegram Bot API”；节点模式测量“本机 -> 所选节点 -> Telegram Bot API”；SOCKS5、HTTP 和 API 反代同样测量各自完整请求路径，不再只测节点服务器端口。
 - 从节点模式切换到其他方式时会要求明确确认；所有已保存节点仍保存在本机，之后可从节点列表直接切回。
 - 第 7 项放弃本次修改；第 8 项只检测当前选择且绝不保存，检测结果显示后会等待按回车再重绘菜单；第 9 项确认当前待保存方式的 `getMe` 和 `sendMessage` 都成功后提交配置。
-
-机场订阅地址不是单节点链接，当前版本不解析订阅。可以先用 sing-box/Xray 客户端把订阅节点转换成本机 SOCKS5，再选择第 2 项。
 
 ## 从 GitHub 更新
 
@@ -662,7 +661,7 @@ aliyun-guard update
 5. 保留 `config.json`、`state.json` 和日志。
 6. 更新代码与依赖，然后自动重启后台服务。
 
-更新前安装器会临时保护 `config.json`、`state.json` 和本机 sing-box；更新后恢复原配置，因此网页登录设置、每日开关机计划、Telegram 连接方式、代理地址和全部 VLESS/VMess/Shadowsocks 节点都会保留。
+更新前安装器会临时保护 `config.json`、`state.json` 和本机 sing-box；更新后恢复原配置，因此网页登录设置、每日开关机计划、Telegram 连接方式、代理地址和全部已保存节点都会保留。
 
 从不带更新菜单的早期版本升级时，可重新执行一键安装命令，在已有配置菜单中选择“更新程序并保留配置”。完成这一次升级后，后续即可直接使用菜单或 `aliyun-guard update`。
 

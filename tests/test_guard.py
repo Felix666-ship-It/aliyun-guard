@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 
@@ -893,6 +895,39 @@ class GuardPerformanceCacheTests(unittest.TestCase):
         self.assertEqual(result[guard.ecs_status_cache_key(users[2])], ("Running", None))
         self.assertEqual(result[guard.ecs_status_cache_key(users[3])], ("Running", None))
 
+    def test_ecs_status_prefetch_caps_global_failure_retries(self):
+        users = [
+            make_user(name="HK-{}".format(index), instance_id="i-{}".format(index))
+            for index in range(100)
+        ]
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "query_instance_statuses", side_effect=RuntimeError("region outage")
+        ) as query:
+            result = guard.prefetch_instance_statuses(users)
+        self.assertEqual(query.call_count, guard.MAX_ECS_STATUS_BATCH_CALLS)
+        self.assertEqual(len(result), len(users))
+        self.assertTrue(all(error is not None for _status, error in result.values()))
+
+    def test_telegram_429_honors_retry_after(self):
+        limited = mock.MagicMock(status_code=429)
+        limited.text = '{"ok": false, "parameters": {"retry_after": 30}}'
+        limited.headers = {"Retry-After": "30"}
+        success = mock.MagicMock(status_code=200)
+        success.text = '{"ok": true, "result": {"id": 1}}'
+        telegram = {
+            "bot_token": "token",
+            "chat_id": "123",
+            "timeout_seconds": 5,
+            "retries": 2,
+            "connection_mode": "direct",
+        }
+        with mock.patch.object(
+            guard, "_telegram_post", side_effect=[limited, success]
+        ), mock.patch.object(guard.time, "sleep") as sleep:
+            result = guard.telegram_api(telegram, "getMe")
+        self.assertEqual(result["id"], 1)
+        sleep.assert_called_once_with(30)
+
     def test_heartbeat_uses_nondurable_atomic_write(self):
         with mock.patch.object(guard, "atomic_write_json") as write:
             guard.write_heartbeat("running")
@@ -909,6 +944,22 @@ class GuardPerformanceCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_atomic_json_writes_are_safe_under_thread_contention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            barrier = threading.Barrier(24)
+
+            def write(index):
+                barrier.wait()
+                guard.atomic_write_json(path, {"index": index, "value": "x" * 1024})
+
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                futures = [pool.submit(write, index) for index in range(24)]
+                for future in futures:
+                    future.result()
+            self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
     def test_bot_control_defaults_to_enabled_and_uses_private_chat_id(self):
         config = make_config()
         config["telegram"].update({"chat_id": "5902850250"})
@@ -1448,7 +1499,7 @@ class FirstSetupFlowTests(unittest.TestCase):
         ):
             manager.configure_telegram_connection(candidate, force_ipv4=False)
         self.assertIn(
-            "当前方式: 节点链接（VLESS / VMess / Shadowsocks）",
+            "当前方式: 节点链接（VLESS / VMess / Shadowsocks / Trojan / Hysteria2 / TUIC / AnyTLS）",
             output.getvalue(),
         )
         self.assertIn("当前节点: VLESS 节点（Hong Kong 01）", output.getvalue())
@@ -1525,6 +1576,54 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertEqual(selected, "selected")
         self.assertEqual(telegram["node_urls"], [node_url])
         self.assertEqual(telegram["node_url"], node_url)
+
+    def test_subscription_selects_second_reachable_node(self):
+        first = "anytls://first-password@first.example:443#First"
+        second = "anytls://second-password@second.example:443#Second"
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update({"connection_mode": "direct", "node_urls": []})
+        with mock.patch.object(
+            manager, "prompt_secret", return_value="https://subscription.example/list"
+        ), mock.patch.object(
+            manager.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=[first, second],
+        ), mock.patch.object(
+            manager, "test_telegram_connection", side_effect=[False, True]
+        ) as test_connection, mock.patch.object(
+            manager.telegram_proxy, "stop_node_proxy"
+        ):
+            selected = manager.add_telegram_node(telegram, force_ipv4=False)
+        self.assertEqual(selected, "subscription")
+        self.assertEqual(telegram["node_urls"], [first, second])
+        self.assertEqual(telegram["node_url"], second)
+        self.assertEqual(telegram["connection_mode"], "node")
+        self.assertEqual(test_connection.call_count, 2)
+        self.assertEqual(test_connection.call_args.kwargs["latency_attempts"], 1)
+
+    def test_failed_subscription_leaves_cli_configuration_unchanged(self):
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update(
+            {
+                "connection_mode": "direct",
+                "node_url": "",
+                "node_urls": [],
+            }
+        )
+        before = json.loads(json.dumps(telegram, ensure_ascii=False))
+        node = "anytls://unreachable-password@unreachable.example:443#Unreachable"
+        with mock.patch.object(
+            manager, "prompt_secret", return_value="https://subscription.example/list"
+        ), mock.patch.object(
+            manager.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=[node],
+        ), mock.patch.object(
+            manager, "test_telegram_connection", return_value=False
+        ), mock.patch.object(manager.telegram_proxy, "stop_node_proxy"):
+            selected = manager.add_telegram_node(telegram, force_ipv4=False)
+        self.assertEqual(selected, "cancelled")
+        self.assertEqual(telegram, before)
 
     def test_multi_node_menu_selects_requested_node(self):
         first = (

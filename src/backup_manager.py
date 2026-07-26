@@ -27,6 +27,9 @@ PBKDF2_ITERATIONS = 240000
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 MAX_BACKUP_FILE_BYTES = 88 * 1024 * 1024
+# Base64 and JSON metadata expand source files before encryption. Keep collection
+# below the encrypted payload limit without building an oversized object in RAM.
+MAX_BACKUP_SOURCE_BYTES = 45 * 1024 * 1024
 
 DATA_FILES = (
     "config.json",
@@ -125,6 +128,97 @@ def encrypt_payload(payload, passphrase, iterations=PBKDF2_ITERATIONS):
     }
 
 
+def _write_encrypted_payload(payload, passphrase, destination, iterations=PBKDF2_ITERATIONS):
+    """Write the existing v1 envelope without materializing plaintext/ciphertext twice."""
+    _require_cryptography()
+    try:
+        cipher_module = importlib.import_module(
+            "cryptography.hazmat.primitives.ciphers"
+        )
+        algorithms = importlib.import_module(
+            "cryptography.hazmat.primitives.ciphers.algorithms"
+        )
+        modes = importlib.import_module("cryptography.hazmat.primitives.ciphers.modes")
+    except ImportError as exc:
+        raise BackupError("缺少备份加密依赖 cryptography: {}".format(exc)) from exc
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    encryption_key = _derive_keys(passphrase, salt, iterations)
+    associated_data = (
+        BACKUP_FORMAT.encode("ascii") + b"\0" + str(int(iterations)).encode("ascii")
+    )
+    descriptor, ciphertext_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name), suffix=".cipher.tmp", dir=str(destination.parent)
+    )
+    ciphertext_path = Path(ciphertext_name)
+    envelope_path = None
+    try:
+        encryptor = cipher_module.Cipher(
+            algorithms.AES(encryption_key), modes.GCM(nonce)
+        ).encryptor()
+        encryptor.authenticate_additional_data(associated_data)
+        plaintext_size = 0
+        encoder = json.JSONEncoder(
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            for piece in encoder.iterencode(payload):
+                data = piece.encode("utf-8")
+                plaintext_size += len(data)
+                if plaintext_size > MAX_BACKUP_BYTES:
+                    raise BackupError(
+                        "备份内容超过 {} MiB 限制".format(
+                            MAX_BACKUP_BYTES // 1048576
+                        )
+                    )
+                handle.write(encryptor.update(data))
+            handle.write(encryptor.finalize())
+            handle.write(encryptor.tag)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        descriptor, envelope_name = tempfile.mkstemp(
+            prefix=".{}-".format(destination.name), suffix=".envelope.tmp", dir=str(destination.parent)
+        )
+        envelope_path = Path(envelope_name)
+        fields = (
+            ("format", BACKUP_FORMAT),
+            ("created_at", _now_text()),
+            ("kdf", "pbkdf2-hmac-sha256"),
+            ("cipher", "aes-256-gcm"),
+            ("iterations", int(iterations)),
+            ("salt", _b64encode(salt)),
+            ("nonce", _b64encode(nonce)),
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write("{\n")
+            for key, value in fields:
+                handle.write(
+                    "  {}: {},\n".format(
+                        json.dumps(key), json.dumps(value, ensure_ascii=True)
+                    )
+                )
+            handle.write('  "ciphertext": "')
+            with ciphertext_path.open("rb") as ciphertext:
+                while True:
+                    chunk = ciphertext.read(768 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(_b64encode(chunk))
+            handle.write("\"\n}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(envelope_path), 0o600)
+        os.replace(str(envelope_path), str(destination))
+    finally:
+        ciphertext_path.unlink(missing_ok=True)
+        if envelope_path is not None:
+            envelope_path.unlink(missing_ok=True)
+
+
 def decrypt_payload(envelope, passphrase):
     _require_cryptography()
     if not isinstance(envelope, dict) or envelope.get("format") != BACKUP_FORMAT:
@@ -159,6 +253,135 @@ def decrypt_payload(envelope, passphrase):
     return payload
 
 
+class _StreamingBackupUnavailable(RuntimeError):
+    pass
+
+
+def _load_backup_streaming(path, passphrase):
+    """Decode the v1 JSON envelope without holding its Base64 ciphertext in RAM."""
+    backup_path = Path(path)
+    markers = (b'"ciphertext": "', b'"ciphertext":"')
+    with backup_path.open("rb") as source:
+        header = b""
+        marker_index = -1
+        marker = None
+        while len(header) <= 65536:
+            chunk = source.read(8192)
+            if not chunk:
+                break
+            header += chunk
+            found = [(header.find(value), value) for value in markers]
+            found = [item for item in found if item[0] >= 0]
+            if found:
+                marker_index, marker = min(found, key=lambda item: item[0])
+                break
+        if marker is None:
+            raise _StreamingBackupUnavailable()
+        try:
+            prefix = header[:marker_index].decode("utf-8").rstrip()
+            envelope = json.loads(prefix.rstrip(",") + "\n}")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise BackupError("备份文件头无效") from exc
+        if not isinstance(envelope, dict) or envelope.get("format") != BACKUP_FORMAT:
+            raise BackupError("不是受支持的 Aliyun Guard 备份")
+        try:
+            iterations = int(envelope.get("iterations"))
+        except (TypeError, ValueError) as exc:
+            raise BackupError("备份 KDF 参数无效") from exc
+        if iterations < 100000 or iterations > 2000000:
+            raise BackupError("备份 KDF 参数超出安全范围")
+        if envelope.get("cipher") != "aes-256-gcm":
+            raise BackupError("备份加密算法不受支持")
+        salt = _b64decode(envelope.get("salt", ""), "salt")
+        nonce = _b64decode(envelope.get("nonce", ""), "nonce")
+        encryption_key = _derive_keys(passphrase, salt, iterations)
+        associated_data = (
+            BACKUP_FORMAT.encode("ascii") + b"\0" + str(iterations).encode("ascii")
+        )
+        try:
+            cipher_module = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers"
+            )
+            algorithms = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers.algorithms"
+            )
+            modes = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers.modes"
+            )
+        except ImportError as exc:
+            raise BackupError("缺少备份加密依赖 cryptography: {}".format(exc)) from exc
+        decryptor = cipher_module.Cipher(
+            algorithms.AES(encryption_key), modes.GCM(nonce)
+        ).decryptor()
+        decryptor.authenticate_additional_data(associated_data)
+        descriptor, plaintext_name = tempfile.mkstemp(
+            prefix=".{}-".format(backup_path.name),
+            suffix=".plaintext.tmp",
+            dir=str(backup_path.parent),
+        )
+        plaintext_path = Path(plaintext_name)
+        ciphertext_size = 0
+        tail = b""
+        remainder = b""
+
+        def write_decoded(encoded, handle):
+            nonlocal ciphertext_size, tail, remainder
+            data = remainder + encoded
+            usable = len(data) - (len(data) % 4)
+            if usable:
+                try:
+                    decoded = base64.b64decode(data[:usable], validate=True)
+                except Exception as exc:
+                    raise BackupError("备份中的 ciphertext 格式无效") from exc
+                ciphertext_size += len(decoded)
+                if ciphertext_size > MAX_BACKUP_BYTES + 16:
+                    raise BackupError("备份内容过大")
+                tail += decoded
+                if len(tail) > 16:
+                    handle.write(decryptor.update(tail[:-16]))
+                    tail = tail[-16:]
+            remainder = data[usable:]
+
+        try:
+            encoded = header[marker_index + len(marker):]
+            with os.fdopen(descriptor, "wb") as plaintext:
+                while True:
+                    closing_quote = encoded.find(b'"')
+                    if closing_quote >= 0:
+                        write_decoded(encoded[:closing_quote], plaintext)
+                        break
+                    write_decoded(encoded, plaintext)
+                    encoded = source.read(64 * 1024)
+                    if not encoded:
+                        raise BackupError("备份中的 ciphertext 不完整")
+                if remainder:
+                    try:
+                        decoded = base64.b64decode(remainder, validate=True)
+                    except Exception as exc:
+                        raise BackupError("备份中的 ciphertext 格式无效") from exc
+                    ciphertext_size += len(decoded)
+                    tail += decoded
+                    remainder = b""
+                if len(tail) != 16:
+                    raise BackupError("备份中的 ciphertext 无效")
+                try:
+                    plaintext.write(decryptor.finalize_with_tag(tail))
+                except Exception as exc:
+                    raise BackupError("备份密码错误或文件已损坏") from exc
+                plaintext.flush()
+                os.fsync(plaintext.fileno())
+            try:
+                with plaintext_path.open("r", encoding="utf-8") as plaintext:
+                    payload = json.load(plaintext)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise BackupError("备份解密后内容无效") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+                raise BackupError("备份内容结构无效")
+            return payload
+        finally:
+            plaintext_path.unlink(missing_ok=True)
+
+
 def _safe_relative_path(value):
     text = str(value or "").replace("\\", "/").strip("/")
     path = Path(text)
@@ -185,18 +408,34 @@ def _read_file(path):
 def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
     root = Path(app_dir)
     files = {}
+    total_size = 0
+
+    def add_file(name, path):
+        nonlocal total_size
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise BackupError("文件过大，未加入备份: {}".format(path.name))
+        total_size += size
+        if total_size > MAX_BACKUP_SOURCE_BYTES:
+            raise BackupError(
+                "备份源文件超过 {} MiB 限制".format(
+                    MAX_BACKUP_SOURCE_BYTES // 1048576
+                )
+            )
+        data = path.read_bytes()
+        files[name] = {
+            "content": _b64encode(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mode": int(path.stat().st_mode & 0o777),
+        }
+
     selected = ["config.json", "service_backend"]
     if include_state:
         selected.extend(("state.json", "telegram-control-state.json"))
     for name in selected:
         path = root / name
         if path.is_file():
-            data = _read_file(path)
-            files[name] = {
-                "content": _b64encode(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "mode": int(path.stat().st_mode & 0o777),
-            }
+            add_file(name, path)
     if include_logs:
         log_dir = root / "logs"
         if log_dir.is_dir():
@@ -204,12 +443,7 @@ def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
                 if not path.is_file():
                     continue
                 relative = "logs/" + path.relative_to(log_dir).as_posix()
-                data = _read_file(path)
-                files[relative] = {
-                    "content": _b64encode(data),
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "mode": int(path.stat().st_mode & 0o777),
-                }
+                add_file(relative, path)
     return files
 
 
@@ -230,22 +464,22 @@ def create_backup(
         "source": "Aliyun Guard",
         "files": files,
     }
-    envelope = encrypt_payload(payload, passphrase)
     destination = Path(output_path) if output_path else root / "backups" / (
         "aliyun-guard-{}.agbackup".format(_stamp())
     )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(envelope, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
-    )
-    os.chmod(str(destination), 0o600)
+    _write_encrypted_payload(payload, passphrase, destination)
     return destination
 
 
 def load_backup(path, passphrase):
     backup_path = Path(path)
     try:
-        envelope = json.loads(backup_path.read_text(encoding="utf-8"))
+        return _load_backup_streaming(backup_path, passphrase)
+    except _StreamingBackupUnavailable:
+        pass
+    try:
+        with backup_path.open("r", encoding="utf-8") as handle:
+            envelope = json.load(handle)
     except (OSError, ValueError) as exc:
         raise BackupError("无法读取备份: {}".format(exc)) from exc
     return decrypt_payload(envelope, passphrase)
@@ -271,8 +505,7 @@ def _config_summary(content):
     }
 
 
-def preview_restore(path, passphrase, app_dir=APP_DIR):
-    payload = load_backup(path, passphrase)
+def _preview_payload(payload, app_dir=APP_DIR):
     root = Path(app_dir)
     changes = []
     config_summary = None
@@ -301,9 +534,13 @@ def preview_restore(path, passphrase, app_dir=APP_DIR):
     }
 
 
+def preview_restore(path, passphrase, app_dir=APP_DIR):
+    return _preview_payload(load_backup(path, passphrase), app_dir)
+
+
 def restore_backup(path, passphrase, app_dir=APP_DIR, include_logs=True):
-    preview = preview_restore(path, passphrase, app_dir)
     payload = load_backup(path, passphrase)
+    preview = _preview_payload(payload, app_dir)
     root = Path(app_dir)
     config_entry = payload["files"].get("config.json")
     if not isinstance(config_entry, dict):

@@ -15,6 +15,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -120,7 +121,10 @@ LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
 _CYCLE_THREAD_LOCK = threading.Lock()
+_CONFIG_THREAD_LOCK = threading.RLock()
+_JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
+MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
 
 
@@ -243,16 +247,41 @@ def load_state():
 
 
 def atomic_write_json(path, value, mode=0o600, durable=True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
-        handle.write("\n")
-        if durable:
-            handle.flush()
-            os.fsync(handle.fileno())
-    os.chmod(str(temporary), mode)
-    os.replace(str(temporary), str(path))
+    path = Path(path)
+    with _JSON_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
+                handle.write("\n")
+                if durable:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            os.chmod(str(temporary), mode)
+            os.replace(str(temporary), str(path))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def config_lock():
+    """Serialize config read-modify-write transactions across threads/processes."""
+    with _CONFIG_THREAD_LOCK:
+        lock_path = CONFIG_FILE.with_name(CONFIG_FILE.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
 
 def save_state(state):
@@ -480,7 +509,7 @@ def _instance_log_value(value, user, limit=500):
         if secret:
             text = text.replace(secret, "***")
     text = re.sub(
-        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss)://[^\s；，,]+",
+        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss|trojan|hysteria2|hy2|tuic|anytls)://[^\s；，,]+",
         "[链接已隐藏]",
         text,
     )
@@ -972,16 +1001,27 @@ def query_instance_statuses(users):
     }
 
 
-def _prefetch_instance_status_batch(batch, results):
+def _prefetch_instance_status_batch(batch, results, budget=None):
+    if budget is None:
+        budget = {"remaining": MAX_ECS_STATUS_BATCH_CALLS, "last_error": None}
+    if budget["remaining"] <= 0:
+        error = budget.get("last_error") or GuardError(
+            "ECS 批量查询失败次数过多，本轮停止继续拆分"
+        )
+        for user in batch:
+            results[ecs_status_cache_key(user)] = (None, error)
+        return
+    budget["remaining"] -= 1
     try:
         statuses = query_instance_statuses(batch)
     except Exception as exc:
+        budget["last_error"] = exc
         if len(batch) == 1:
             results[ecs_status_cache_key(batch[0])] = (None, exc)
             return
         midpoint = len(batch) // 2
-        _prefetch_instance_status_batch(batch[:midpoint], results)
-        _prefetch_instance_status_batch(batch[midpoint:], results)
+        _prefetch_instance_status_batch(batch[:midpoint], results, budget)
+        _prefetch_instance_status_batch(batch[midpoint:], results, budget)
         return
 
     for user in batch:
@@ -1354,7 +1394,27 @@ def telegram_api(config, method, data=None, request_timeout=None):
                     raise GuardError(
                         "Telegram HTTP {}: {}".format(response.status_code, body[:300])
                     )
-                time.sleep(min(2 ** attempt, 8))
+                delay = min(2 ** attempt, 8)
+                if response.status_code == 429:
+                    retry_after = None
+                    try:
+                        retry_after = response.headers.get("Retry-After")
+                    except Exception:
+                        pass
+                    if not retry_after:
+                        try:
+                            retry_after = (
+                                json.loads(body).get("parameters", {}).get(
+                                    "retry_after"
+                                )
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            retry_after = None
+                    try:
+                        delay = max(1, min(60, int(float(retry_after))))
+                    except (TypeError, ValueError):
+                        pass
+                time.sleep(delay)
                 continue
             break
         except GuardError:

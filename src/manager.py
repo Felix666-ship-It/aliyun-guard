@@ -30,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -183,11 +183,12 @@ def load_config(allow_missing=False):
 
 
 def save_config(config):
-    telegram = config.get("telegram", {})
-    if isinstance(telegram, dict):
-        telegram["node_urls"] = guard.telegram_node_urls(telegram)
-    guard.validate_config(config)
-    guard.atomic_write_json(CONFIG_FILE, config, mode=0o600)
+    with guard.config_lock():
+        telegram = config.get("telegram", {})
+        if isinstance(telegram, dict):
+            telegram["node_urls"] = guard.telegram_node_urls(telegram)
+        guard.validate_config(config)
+        guard.atomic_write_json(CONFIG_FILE, config, mode=0o600)
 
 
 def mask_key(value):
@@ -261,7 +262,7 @@ TELEGRAM_CONNECTION_LABELS = {
     "direct": "直连",
     "socks5": "SOCKS5 代理",
     "http": "HTTP/HTTPS 代理",
-    "node": "节点链接（VLESS / VMess / Shadowsocks）",
+    "node": "节点链接（VLESS / VMess / Shadowsocks / Trojan / Hysteria2 / TUIC / AnyTLS）",
     "api_proxy": "Telegram API 反向代理",
 }
 
@@ -351,9 +352,75 @@ def _sync_saved_nodes(telegram):
     return nodes
 
 
-def add_telegram_node(telegram):
+def add_telegram_subscription(telegram, subscription_url, force_ipv4=True):
+    try:
+        subscription_nodes = telegram_proxy.fetch_subscription_nodes(subscription_url)
+    except telegram_proxy.ProxyError as exc:
+        print("订阅导入失败: {}".format(exc))
+        return "cancelled"
+
+    existing_nodes = guard.telegram_node_urls(telegram)
+    merged_nodes = list(existing_nodes)
+    for node_url in subscription_nodes:
+        if node_url not in merged_nodes:
+            merged_nodes.append(node_url)
+
+    max_probes = 32
+    probe_nodes = subscription_nodes[:max_probes]
+    print(
+        "订阅解析到 {} 个节点，正在依次检测并自动选择首个可用节点...".format(
+            len(subscription_nodes)
+        )
+    )
+    for index, node_url in enumerate(probe_nodes, 1):
+        candidate = json.loads(json.dumps(telegram, ensure_ascii=False))
+        candidate["node_urls"] = merged_nodes
+        candidate["node_url"] = node_url
+        candidate["connection_mode"] = "node"
+        candidate["timeout_seconds"] = min(
+            8, max(3, int(candidate.get("timeout_seconds", 12)))
+        )
+        candidate["retries"] = 1
+        print(
+            "检测节点 {}/{}: {}".format(
+                index, len(probe_nodes), _saved_node_description(node_url)
+            )
+        )
+        if test_telegram_connection(
+            candidate, force_ipv4=force_ipv4, latency_attempts=1
+        ):
+            telegram["node_urls"] = merged_nodes
+            telegram["node_url"] = node_url
+            telegram["connection_mode"] = "node"
+            added = len(merged_nodes) - len(existing_nodes)
+            print(
+                "订阅已导入 {} 个新节点，已自动选择: {}".format(
+                    added, _saved_node_description(node_url)
+                )
+            )
+            return "subscription"
+        telegram_proxy.stop_node_proxy()
+
+    telegram_proxy.stop_node_proxy()
+    limit_note = (
+        "（为控制检测时间，本次最多检测前 {} 个节点）".format(max_probes)
+        if len(subscription_nodes) > max_probes
+        else ""
+    )
+    print("订阅节点均无法连接 Telegram，未保存本次导入。{}".format(limit_note))
+    return "cancelled"
+
+
+def add_telegram_node(telegram, force_ipv4=True):
     while True:
-        node_url = prompt_secret("节点链接（vless://、vmess:// 或 ss://）")
+        node_url = prompt_secret(
+            "节点链接或订阅地址（vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://）"
+        )
+        scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+        if scheme in ("http", "https"):
+            return add_telegram_subscription(
+                telegram, node_url, force_ipv4=force_ipv4
+            )
         try:
             description = telegram_proxy.describe_node_link(node_url)
         except telegram_proxy.ProxyError as exc:
@@ -398,12 +465,12 @@ def delete_telegram_node(telegram, nodes):
     return True
 
 
-def configure_telegram_nodes(telegram):
+def configure_telegram_nodes(telegram, force_ipv4=True):
     nodes = _sync_saved_nodes(telegram)
     if not nodes:
         title("Telegram 节点")
         print("尚未保存节点，将添加第一个节点。")
-        return add_telegram_node(telegram)
+        return add_telegram_node(telegram, force_ipv4=force_ipv4)
     while True:
         nodes = _sync_saved_nodes(telegram)
         title("Telegram 节点（已保存 {} 个）".format(len(nodes)))
@@ -431,7 +498,7 @@ def configure_telegram_nodes(telegram):
             print("已选择: {}".format(_saved_node_description(telegram["node_url"])))
             return "selected"
         if choice == add_choice:
-            return add_telegram_node(telegram)
+            return add_telegram_node(telegram, force_ipv4=force_ipv4)
         if choice == delete_choice:
             delete_telegram_node(telegram, nodes)
             if not _sync_saved_nodes(telegram):
@@ -448,13 +515,18 @@ def _telegram_connection_signature(telegram):
     return connection + (tuple(guard.telegram_node_urls(telegram)),)
 
 
-def run_telegram_connection_test(telegram):
+def run_telegram_connection_test(telegram, latency_attempts=3):
+    latency_attempts = max(1, min(5, int(latency_attempts)))
     print("本次测试方式: {}".format(describe_telegram_connection(telegram)))
-    print("正在测试当前连接到 Telegram Bot API 的往返延迟（3 次）并发送消息...")
+    print(
+        "正在测试当前连接到 Telegram Bot API 的往返延迟（{} 次）并发送消息...".format(
+            latency_attempts
+        )
+    )
     details = {}
     username = guard.test_telegram(
         telegram,
-        latency_attempts=3,
+        latency_attempts=latency_attempts,
         result_details=details,
     )
     print(
@@ -466,7 +538,7 @@ def run_telegram_connection_test(telegram):
     return username
 
 
-def test_telegram_connection(telegram, force_ipv4=True):
+def test_telegram_connection(telegram, force_ipv4=True, latency_attempts=3):
     try:
         guard.validate_telegram_config(telegram)
     except Exception as exc:
@@ -488,7 +560,9 @@ def test_telegram_connection(telegram, force_ipv4=True):
     if force_ipv4:
         guard.enable_ipv4_only()
     try:
-        username = run_telegram_connection_test(telegram)
+        username = run_telegram_connection_test(
+            telegram, latency_attempts=latency_attempts
+        )
         print("Telegram 检测成功，Bot: @{}".format(username))
         return True
     except Exception as exc:
@@ -591,7 +665,7 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 2) SOCKS5 代理")
         print(" 3) HTTP/HTTPS 代理")
         print(
-            " 4) 节点链接（VLESS / VMess / Shadowsocks）  [已保存 {} 个]".format(
+            " 4) 节点链接（VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS）  [已保存 {} 个]".format(
                 len(guard.telegram_node_urls(candidate))
             )
         )
@@ -629,7 +703,11 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             )
         elif choice == 4:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
-            node_action = configure_telegram_nodes(candidate)
+            node_action = configure_telegram_nodes(
+                candidate, force_ipv4=force_ipv4
+            )
+            if node_action == "subscription":
+                return candidate, True
             if node_action == "added":
                 print("正在检测新节点，检测通过后将自动保存...")
                 if test_telegram_connection(candidate, force_ipv4=force_ipv4):

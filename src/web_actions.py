@@ -4,6 +4,7 @@
 
 import copy
 import base64
+import functools
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 
 import telegram_proxy
 import backup_manager
@@ -24,6 +26,7 @@ DATA_DIR = Path(
 UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
+MAX_SUBSCRIPTION_PROBES = 32
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -58,6 +61,15 @@ class ManagementError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+def _config_transaction(function):
+    @functools.wraps(function)
+    def wrapped(guard, *args, **kwargs):
+        with guard.config_lock():
+            return function(guard, *args, **kwargs)
+
+    return wrapped
 
 
 def _copy(value):
@@ -346,6 +358,7 @@ def _s3_candidate(guard, data, save=False):
     return candidate
 
 
+@_config_transaction
 def save_s3_backup_settings(guard, data):
     candidate = _s3_candidate(guard, data, save=True)
     return s3_backup_payload(candidate)
@@ -429,6 +442,7 @@ def preview_s3_backup(guard, key):
             path.unlink(missing_ok=True)
 
 
+@_config_transaction
 def restore_s3_backup(guard, key, include_logs=True):
     config = guard.load_config()
     backup = s3_backup.normalized_config(config.get("s3_backup", {}))
@@ -583,6 +597,7 @@ def discover_instances(guard, data):
     return result
 
 
+@_config_transaction
 def import_discovered_instances(guard, data):
     ak = _required_text(data, "ak", label="AccessKey ID")
     sk = _required_text(data, "sk", label="AccessKey Secret")
@@ -731,6 +746,7 @@ def _validate_candidate_config(guard, config):
         raise ManagementError(guard.compact_error(exc))
 
 
+@_config_transaction
 def save_instance(guard, data, index=None):
     config = guard.load_config()
     users = config.setdefault("users", [])
@@ -791,6 +807,7 @@ def validate_instance(guard, index):
         )
 
 
+@_config_transaction
 def update_instance_logging(guard, index, enabled):
     if not isinstance(enabled, bool):
         raise ManagementError("enabled 必须是布尔值")
@@ -806,6 +823,7 @@ def update_instance_logging(guard, index, enabled):
     }
 
 
+@_config_transaction
 def delete_instance(guard, index, instance_id):
     config = guard.load_config()
     users = config.get("users", [])
@@ -819,6 +837,7 @@ def delete_instance(guard, index, instance_id):
     return {"name": deleted.get("name"), "instance_id": current_id}
 
 
+@_config_transaction
 def update_global_settings(guard, data):
     config = guard.load_config()
     mode = str(data.get("notification_mode", config.get("notification_mode", "always")))
@@ -902,6 +921,7 @@ def refresh_billing(guard):
     return result
 
 
+@_config_transaction
 def update_web_settings(guard, data):
     import web_panel
 
@@ -967,6 +987,7 @@ def update_web_settings(guard, data):
     }
 
 
+@_config_transaction
 def update_telegram_identity(guard, data):
     config = guard.load_config()
     telegram = config.setdefault("telegram", {})
@@ -1000,7 +1021,9 @@ def update_telegram_identity(guard, data):
     return telegram_payload(guard, telegram)
 
 
-def _telegram_test(guard, telegram, force_ipv4=True, install_core=True):
+def _telegram_test(
+    guard, telegram, force_ipv4=True, install_core=True, latency_attempts=3
+):
     try:
         guard.validate_telegram_config(telegram)
         if telegram.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
@@ -1011,7 +1034,9 @@ def _telegram_test(guard, telegram, force_ipv4=True, install_core=True):
             guard.enable_ipv4_only()
         details = {}
         username = guard.test_telegram(
-            telegram, latency_attempts=3, result_details=details
+            telegram,
+            latency_attempts=max(1, min(5, int(latency_attempts))),
+            result_details=details,
         )
         return {
             "username": username,
@@ -1066,6 +1091,7 @@ def _connection_candidate(guard, data, config):
     return telegram
 
 
+@_config_transaction
 def configure_telegram_connection(guard, data):
     config = guard.load_config()
     candidate = _connection_candidate(guard, data, config)
@@ -1086,10 +1112,14 @@ def configure_telegram_connection(guard, data):
     return result
 
 
+@_config_transaction
 def add_telegram_node(guard, data):
     node_url = str(data.get("node_url", "") or "").strip()
     if not node_url:
-        raise ManagementError("节点链接不能为空")
+        raise ManagementError("节点或订阅链接不能为空")
+    scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    if scheme in ("http", "https"):
+        return _add_telegram_subscription(guard, data, node_url)
     try:
         description = telegram_proxy.describe_node_link(node_url)
     except telegram_proxy.ProxyError as exc:
@@ -1113,10 +1143,100 @@ def add_telegram_node(guard, data):
     config["telegram"] = current
     _save_config(guard, config)
     telegram_proxy.stop_node_proxy()
-    result.update({"saved": True, "description": description})
+    result.update(
+        {"saved": True, "description": description, "source": "single"}
+    )
     return result
 
 
+def _add_telegram_subscription(guard, data, subscription_url):
+    try:
+        subscription_nodes = telegram_proxy.fetch_subscription_nodes(
+            subscription_url
+        )
+    except telegram_proxy.ProxyError as exc:
+        raise ManagementError("订阅导入失败: {}".format(exc), 400)
+    config = guard.load_config()
+    current = config.setdefault("telegram", {})
+    existing_nodes = guard.telegram_node_urls(current)
+    merged_nodes = list(existing_nodes)
+    for node_url in subscription_nodes:
+        if node_url not in merged_nodes:
+            merged_nodes.append(node_url)
+    failures = []
+    selected_node = None
+    selected_result = None
+    probe_nodes = subscription_nodes[:MAX_SUBSCRIPTION_PROBES]
+    for node_url in probe_nodes:
+        candidate = _copy(current)
+        candidate["node_url"] = node_url
+        candidate["node_urls"] = merged_nodes
+        candidate["connection_mode"] = "node"
+        candidate["timeout_seconds"] = min(
+            8, max(3, int(candidate.get("timeout_seconds", 12)))
+        )
+        candidate["retries"] = 1
+        try:
+            selected_result = _telegram_test(
+                guard,
+                candidate,
+                bool(config.get("force_ipv4", True)),
+                bool(data.get("install_core", True)),
+                latency_attempts=1,
+            )
+            selected_node = node_url
+            break
+        except ManagementError as exc:
+            failures.append(
+                {
+                    "description": _node_description(node_url),
+                    "error": str(exc)[:300],
+                }
+            )
+            telegram_proxy.stop_node_proxy()
+    if selected_node is None:
+        telegram_proxy.stop_node_proxy()
+        tested = len(probe_nodes)
+        suffix = (
+            "；为控制检测时间，本次最多检测前 {} 个节点".format(
+                MAX_SUBSCRIPTION_PROBES
+            )
+            if len(subscription_nodes) > MAX_SUBSCRIPTION_PROBES
+            else ""
+        )
+        raise ManagementError(
+            "订阅解析到 {} 个节点，但检测的 {} 个节点均无法连接 Telegram{}".format(
+                len(subscription_nodes), tested, suffix
+            ),
+            502,
+            details={
+                "subscription_nodes": len(subscription_nodes),
+                "tested_nodes": tested,
+                "failures": failures,
+            },
+        )
+    current["node_urls"] = merged_nodes
+    current["node_url"] = selected_node
+    current["connection_mode"] = "node"
+    config["telegram"] = current
+    _save_config(guard, config)
+    imported_count = len(merged_nodes) - len(existing_nodes)
+    selected_result.update(
+        {
+            "saved": True,
+            "source": "subscription",
+            "subscription_count": len(subscription_nodes),
+            "imported_count": imported_count,
+            "duplicate_count": len(subscription_nodes) - imported_count,
+            "tested_count": len(failures) + 1,
+            "description": _node_description(selected_node),
+            "telegram": telegram_payload(guard, current),
+        }
+    )
+    return selected_result
+
+
+@_config_transaction
 def telegram_node_action(guard, index, action):
     config = guard.load_config()
     telegram = config.setdefault("telegram", {})

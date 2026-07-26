@@ -668,10 +668,10 @@
           </details>
 
           <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks；测试可达后才会保存</p></div><strong id="nodeCount">0 个节点</strong></summary>
+            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><strong id="nodeCount">0 个节点</strong></summary>
             <form id="nodeAddForm" class="panel-body">
-              <div class="field"><label for="nodeUrl">节点链接</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess:// 或 ss://" required></textarea></div>
-              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>测试并保存节点</button></div>
+              <div class="field"><label for="nodeUrl">节点链接或订阅地址</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://" required></textarea></div>
+              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>导入订阅或测试保存节点</button></div>
               <div id="nodeResult" class="inline-result" hidden></div>
             </form>
             <div id="nodeList" class="node-list"></div>
@@ -1790,11 +1790,15 @@
       event.preventDefault();
       const submit = event.currentTarget.querySelector('button[type="submit"]');
       submit.disabled = true;
-      setInlineResult($("nodeResult"), "正在测试节点到 Telegram Bot API 的往返延迟...");
+      setInlineResult($("nodeResult"), "正在导入或测试节点到 Telegram Bot API 的连通性...");
       try {
         const data = await api("/api/telegram/nodes", { method: "POST", body: { node_url: $("nodeUrl").value.trim() } });
         $("nodeUrl").value = "";
-        setInlineResult($("nodeResult"), `${telegramTestText(data.result)} · 节点已保存，当前连接方式未切换`);
+        const result = data.result;
+        const message = result.source === "subscription"
+          ? `${telegramTestText(result)} · 已解析 ${result.subscription_count} 个节点，新增 ${result.imported_count} 个，已自动选用 ${result.description}`
+          : `${telegramTestText(result)} · 节点已保存，当前连接方式未切换`;
+        setInlineResult($("nodeResult"), message);
         await loadManagement();
       } catch (error) { setInlineResult($("nodeResult"), error.message, true); }
       finally { submit.disabled = false; }

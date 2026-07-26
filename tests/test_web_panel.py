@@ -322,6 +322,10 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(data["secure_cookie"])
 
+    def test_server_limits_worker_threads_and_sets_socket_timeout(self):
+        self.assertEqual(self.server.request_queue_size, 64)
+        self.assertEqual(self.server.request_slots._value, web_panel.MAX_REQUEST_THREADS)
+
     def test_update_progress_is_available_during_service_restart(self):
         progress_dir = Path(self.temp.name) / "app"
         with mock.patch.object(web_panel.web_actions, "APP_DIR", progress_dir):
@@ -779,6 +783,9 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn('<form id="connectionForm">', telegram)
         self.assertIn('<form id="nodeAddForm" class="panel-body">', telegram)
         self.assertIn('id="nodeList"', telegram)
+        self.assertIn('节点链接或订阅地址', telegram)
+        self.assertIn('anytls://', telegram)
+        self.assertIn('result.source === "subscription"', html)
 
     def test_settings_forms_keep_existing_ids_inside_collapsible_panels(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")

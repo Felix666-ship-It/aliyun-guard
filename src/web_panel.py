@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -38,6 +38,8 @@ SUPERVISOR_LOCK_FILE = APP_DIR / "web-panel-supervisor.lock"
 DISABLED_FILE = APP_DIR / "disabled"
 BACKEND_FILE = APP_DIR / "service_backend"
 MAX_BODY_BYTES = 128 * 1024 * 1024
+MAX_REQUEST_THREADS = 32
+REQUEST_SOCKET_TIMEOUT_SECONDS = 15
 SESSION_SECONDS = 12 * 60 * 60
 PASSWORD_ITERATIONS = 260000
 
@@ -397,6 +399,7 @@ def save_config(guard, config):
     guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
 
 
+@web_actions._config_transaction
 def update_schedule(guard, index, data):
     config = guard.load_config()
     users = config.get("users", [])
@@ -423,6 +426,7 @@ def update_schedule(guard, index, data):
     return users[index]["schedule"]
 
 
+@web_actions._config_transaction
 def update_pause(guard, index, paused):
     if not isinstance(paused, bool):
         raise WebPanelError("paused 必须是布尔值")
@@ -435,6 +439,7 @@ def update_pause(guard, index, paused):
     return paused
 
 
+@web_actions._config_transaction
 def update_settings(guard, data):
     config = guard.load_config()
     try:
@@ -545,9 +550,29 @@ def control_instance(
                     threshold_overridden = True
                 if before != "Running":
                     if threshold_overridden and pause_on_threshold_override:
+                        with guard.config_lock():
+                            latest_config = guard.load_config()
+                            latest_user = next(
+                                (
+                                    item
+                                    for item in latest_config.get("users", [])
+                                    if str(item.get("instance_id", ""))
+                                    == str(user.get("instance_id", ""))
+                                    and str(item.get("region", ""))
+                                    == str(user.get("region", ""))
+                                ),
+                                None,
+                            )
+                            if latest_user is None:
+                                raise WebPanelError(
+                                    "实例配置已经变化，请重新操作", 409
+                                )
+                            latest_user["paused"] = True
+                            guard.validate_config(latest_config)
+                            guard.atomic_write_json(
+                                guard.CONFIG_FILE, latest_config, mode=0o600
+                            )
                         user["paused"] = True
-                        guard.validate_config(config)
-                        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
                         monitor_paused = True
                     guard.start_instance(user)
                     performed = True
@@ -699,6 +724,7 @@ def control_instance(
 class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
     def __init__(self, address, handler, guard, config, html):
         super().__init__(address, handler)
@@ -709,8 +735,34 @@ class PanelServer(ThreadingHTTPServer):
         self.session_lock = threading.Lock()
         self.login_attempts = {}
         self.login_attempt_lock = threading.Lock()
+        self.mutation_lock = threading.RLock()
+        self.request_slots = threading.BoundedSemaphore(MAX_REQUEST_THREADS)
         self.job_lock = threading.Lock()
         self.job = {"running": False, "started_at": None, "finished_at": None, "error": None}
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        request.settimeout(REQUEST_SOCKET_TIMEOUT_SECONDS)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
 
     def delayed_restart(self, delay=0.6):
         def restart():
@@ -1013,12 +1065,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.server.guard.LOGGER.exception("Web GET error: %s", exc)
 
     def do_POST(self):
+        mutation_acquired = False
         try:
             parts = self._route_parts()
             if parts == ["api", "login"]:
                 self._handle_login()
                 return
             session_id, _session = self._authenticated(require_csrf=True)
+            self.server.mutation_lock.acquire()
+            mutation_acquired = True
             if parts == ["api", "logout"]:
                 self.server.delete_session(session_id)
                 self._json(
@@ -1147,7 +1202,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "backup", "restore"]:
                 self._authenticated(require_csrf=True)
-                result = web_actions.restore_encrypted_backup(self._read_json())
+                with self.server.guard.config_lock():
+                    result = web_actions.restore_encrypted_backup(self._read_json())
                 self.server.delayed_restart()
                 self._json({"ok": True, "result": result}, 202)
                 return
@@ -1237,6 +1293,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web POST error: %s", exc)
+        finally:
+            if mutation_acquired:
+                self.server.mutation_lock.release()
 
     def _handle_login(self):
         address = self.client_address[0]

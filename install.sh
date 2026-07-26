@@ -358,6 +358,9 @@ PBKDF2_ITERATIONS = 240000
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 MAX_BACKUP_FILE_BYTES = 88 * 1024 * 1024
+# Base64 and JSON metadata expand source files before encryption. Keep collection
+# below the encrypted payload limit without building an oversized object in RAM.
+MAX_BACKUP_SOURCE_BYTES = 45 * 1024 * 1024
 
 DATA_FILES = (
     "config.json",
@@ -456,6 +459,97 @@ def encrypt_payload(payload, passphrase, iterations=PBKDF2_ITERATIONS):
     }
 
 
+def _write_encrypted_payload(payload, passphrase, destination, iterations=PBKDF2_ITERATIONS):
+    """Write the existing v1 envelope without materializing plaintext/ciphertext twice."""
+    _require_cryptography()
+    try:
+        cipher_module = importlib.import_module(
+            "cryptography.hazmat.primitives.ciphers"
+        )
+        algorithms = importlib.import_module(
+            "cryptography.hazmat.primitives.ciphers.algorithms"
+        )
+        modes = importlib.import_module("cryptography.hazmat.primitives.ciphers.modes")
+    except ImportError as exc:
+        raise BackupError("缺少备份加密依赖 cryptography: {}".format(exc)) from exc
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    encryption_key = _derive_keys(passphrase, salt, iterations)
+    associated_data = (
+        BACKUP_FORMAT.encode("ascii") + b"\0" + str(int(iterations)).encode("ascii")
+    )
+    descriptor, ciphertext_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name), suffix=".cipher.tmp", dir=str(destination.parent)
+    )
+    ciphertext_path = Path(ciphertext_name)
+    envelope_path = None
+    try:
+        encryptor = cipher_module.Cipher(
+            algorithms.AES(encryption_key), modes.GCM(nonce)
+        ).encryptor()
+        encryptor.authenticate_additional_data(associated_data)
+        plaintext_size = 0
+        encoder = json.JSONEncoder(
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            for piece in encoder.iterencode(payload):
+                data = piece.encode("utf-8")
+                plaintext_size += len(data)
+                if plaintext_size > MAX_BACKUP_BYTES:
+                    raise BackupError(
+                        "备份内容超过 {} MiB 限制".format(
+                            MAX_BACKUP_BYTES // 1048576
+                        )
+                    )
+                handle.write(encryptor.update(data))
+            handle.write(encryptor.finalize())
+            handle.write(encryptor.tag)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        descriptor, envelope_name = tempfile.mkstemp(
+            prefix=".{}-".format(destination.name), suffix=".envelope.tmp", dir=str(destination.parent)
+        )
+        envelope_path = Path(envelope_name)
+        fields = (
+            ("format", BACKUP_FORMAT),
+            ("created_at", _now_text()),
+            ("kdf", "pbkdf2-hmac-sha256"),
+            ("cipher", "aes-256-gcm"),
+            ("iterations", int(iterations)),
+            ("salt", _b64encode(salt)),
+            ("nonce", _b64encode(nonce)),
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write("{\n")
+            for key, value in fields:
+                handle.write(
+                    "  {}: {},\n".format(
+                        json.dumps(key), json.dumps(value, ensure_ascii=True)
+                    )
+                )
+            handle.write('  "ciphertext": "')
+            with ciphertext_path.open("rb") as ciphertext:
+                while True:
+                    chunk = ciphertext.read(768 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(_b64encode(chunk))
+            handle.write("\"\n}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(envelope_path), 0o600)
+        os.replace(str(envelope_path), str(destination))
+    finally:
+        ciphertext_path.unlink(missing_ok=True)
+        if envelope_path is not None:
+            envelope_path.unlink(missing_ok=True)
+
+
 def decrypt_payload(envelope, passphrase):
     _require_cryptography()
     if not isinstance(envelope, dict) or envelope.get("format") != BACKUP_FORMAT:
@@ -490,6 +584,135 @@ def decrypt_payload(envelope, passphrase):
     return payload
 
 
+class _StreamingBackupUnavailable(RuntimeError):
+    pass
+
+
+def _load_backup_streaming(path, passphrase):
+    """Decode the v1 JSON envelope without holding its Base64 ciphertext in RAM."""
+    backup_path = Path(path)
+    markers = (b'"ciphertext": "', b'"ciphertext":"')
+    with backup_path.open("rb") as source:
+        header = b""
+        marker_index = -1
+        marker = None
+        while len(header) <= 65536:
+            chunk = source.read(8192)
+            if not chunk:
+                break
+            header += chunk
+            found = [(header.find(value), value) for value in markers]
+            found = [item for item in found if item[0] >= 0]
+            if found:
+                marker_index, marker = min(found, key=lambda item: item[0])
+                break
+        if marker is None:
+            raise _StreamingBackupUnavailable()
+        try:
+            prefix = header[:marker_index].decode("utf-8").rstrip()
+            envelope = json.loads(prefix.rstrip(",") + "\n}")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise BackupError("备份文件头无效") from exc
+        if not isinstance(envelope, dict) or envelope.get("format") != BACKUP_FORMAT:
+            raise BackupError("不是受支持的 Aliyun Guard 备份")
+        try:
+            iterations = int(envelope.get("iterations"))
+        except (TypeError, ValueError) as exc:
+            raise BackupError("备份 KDF 参数无效") from exc
+        if iterations < 100000 or iterations > 2000000:
+            raise BackupError("备份 KDF 参数超出安全范围")
+        if envelope.get("cipher") != "aes-256-gcm":
+            raise BackupError("备份加密算法不受支持")
+        salt = _b64decode(envelope.get("salt", ""), "salt")
+        nonce = _b64decode(envelope.get("nonce", ""), "nonce")
+        encryption_key = _derive_keys(passphrase, salt, iterations)
+        associated_data = (
+            BACKUP_FORMAT.encode("ascii") + b"\0" + str(iterations).encode("ascii")
+        )
+        try:
+            cipher_module = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers"
+            )
+            algorithms = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers.algorithms"
+            )
+            modes = importlib.import_module(
+                "cryptography.hazmat.primitives.ciphers.modes"
+            )
+        except ImportError as exc:
+            raise BackupError("缺少备份加密依赖 cryptography: {}".format(exc)) from exc
+        decryptor = cipher_module.Cipher(
+            algorithms.AES(encryption_key), modes.GCM(nonce)
+        ).decryptor()
+        decryptor.authenticate_additional_data(associated_data)
+        descriptor, plaintext_name = tempfile.mkstemp(
+            prefix=".{}-".format(backup_path.name),
+            suffix=".plaintext.tmp",
+            dir=str(backup_path.parent),
+        )
+        plaintext_path = Path(plaintext_name)
+        ciphertext_size = 0
+        tail = b""
+        remainder = b""
+
+        def write_decoded(encoded, handle):
+            nonlocal ciphertext_size, tail, remainder
+            data = remainder + encoded
+            usable = len(data) - (len(data) % 4)
+            if usable:
+                try:
+                    decoded = base64.b64decode(data[:usable], validate=True)
+                except Exception as exc:
+                    raise BackupError("备份中的 ciphertext 格式无效") from exc
+                ciphertext_size += len(decoded)
+                if ciphertext_size > MAX_BACKUP_BYTES + 16:
+                    raise BackupError("备份内容过大")
+                tail += decoded
+                if len(tail) > 16:
+                    handle.write(decryptor.update(tail[:-16]))
+                    tail = tail[-16:]
+            remainder = data[usable:]
+
+        try:
+            encoded = header[marker_index + len(marker):]
+            with os.fdopen(descriptor, "wb") as plaintext:
+                while True:
+                    closing_quote = encoded.find(b'"')
+                    if closing_quote >= 0:
+                        write_decoded(encoded[:closing_quote], plaintext)
+                        break
+                    write_decoded(encoded, plaintext)
+                    encoded = source.read(64 * 1024)
+                    if not encoded:
+                        raise BackupError("备份中的 ciphertext 不完整")
+                if remainder:
+                    try:
+                        decoded = base64.b64decode(remainder, validate=True)
+                    except Exception as exc:
+                        raise BackupError("备份中的 ciphertext 格式无效") from exc
+                    ciphertext_size += len(decoded)
+                    tail += decoded
+                    remainder = b""
+                if len(tail) != 16:
+                    raise BackupError("备份中的 ciphertext 无效")
+                try:
+                    plaintext.write(decryptor.finalize_with_tag(tail))
+                except Exception as exc:
+                    raise BackupError("备份密码错误或文件已损坏") from exc
+                plaintext.flush()
+                os.fsync(plaintext.fileno())
+            try:
+                with plaintext_path.open("r", encoding="utf-8") as plaintext:
+                    payload = json.load(plaintext)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise BackupError("备份解密后内容无效") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+                raise BackupError("备份内容结构无效")
+            return payload
+        finally:
+            plaintext_path.unlink(missing_ok=True)
+
+
 def _safe_relative_path(value):
     text = str(value or "").replace("\\", "/").strip("/")
     path = Path(text)
@@ -516,18 +739,34 @@ def _read_file(path):
 def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
     root = Path(app_dir)
     files = {}
+    total_size = 0
+
+    def add_file(name, path):
+        nonlocal total_size
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise BackupError("文件过大，未加入备份: {}".format(path.name))
+        total_size += size
+        if total_size > MAX_BACKUP_SOURCE_BYTES:
+            raise BackupError(
+                "备份源文件超过 {} MiB 限制".format(
+                    MAX_BACKUP_SOURCE_BYTES // 1048576
+                )
+            )
+        data = path.read_bytes()
+        files[name] = {
+            "content": _b64encode(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mode": int(path.stat().st_mode & 0o777),
+        }
+
     selected = ["config.json", "service_backend"]
     if include_state:
         selected.extend(("state.json", "telegram-control-state.json"))
     for name in selected:
         path = root / name
         if path.is_file():
-            data = _read_file(path)
-            files[name] = {
-                "content": _b64encode(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "mode": int(path.stat().st_mode & 0o777),
-            }
+            add_file(name, path)
     if include_logs:
         log_dir = root / "logs"
         if log_dir.is_dir():
@@ -535,12 +774,7 @@ def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
                 if not path.is_file():
                     continue
                 relative = "logs/" + path.relative_to(log_dir).as_posix()
-                data = _read_file(path)
-                files[relative] = {
-                    "content": _b64encode(data),
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "mode": int(path.stat().st_mode & 0o777),
-                }
+                add_file(relative, path)
     return files
 
 
@@ -561,22 +795,22 @@ def create_backup(
         "source": "Aliyun Guard",
         "files": files,
     }
-    envelope = encrypt_payload(payload, passphrase)
     destination = Path(output_path) if output_path else root / "backups" / (
         "aliyun-guard-{}.agbackup".format(_stamp())
     )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(envelope, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
-    )
-    os.chmod(str(destination), 0o600)
+    _write_encrypted_payload(payload, passphrase, destination)
     return destination
 
 
 def load_backup(path, passphrase):
     backup_path = Path(path)
     try:
-        envelope = json.loads(backup_path.read_text(encoding="utf-8"))
+        return _load_backup_streaming(backup_path, passphrase)
+    except _StreamingBackupUnavailable:
+        pass
+    try:
+        with backup_path.open("r", encoding="utf-8") as handle:
+            envelope = json.load(handle)
     except (OSError, ValueError) as exc:
         raise BackupError("无法读取备份: {}".format(exc)) from exc
     return decrypt_payload(envelope, passphrase)
@@ -602,8 +836,7 @@ def _config_summary(content):
     }
 
 
-def preview_restore(path, passphrase, app_dir=APP_DIR):
-    payload = load_backup(path, passphrase)
+def _preview_payload(payload, app_dir=APP_DIR):
     root = Path(app_dir)
     changes = []
     config_summary = None
@@ -632,9 +865,13 @@ def preview_restore(path, passphrase, app_dir=APP_DIR):
     }
 
 
+def preview_restore(path, passphrase, app_dir=APP_DIR):
+    return _preview_payload(load_backup(path, passphrase), app_dir)
+
+
 def restore_backup(path, passphrase, app_dir=APP_DIR, include_logs=True):
-    preview = preview_restore(path, passphrase, app_dir)
     payload = load_backup(path, passphrase)
+    preview = _preview_payload(payload, app_dir)
     root = Path(app_dir)
     config_entry = payload["files"].get("config.json")
     if not isinstance(config_entry, dict):
@@ -1553,12 +1790,15 @@ __AG_WATCHDOG_PY_EOF__
 import atexit
 import base64
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -1592,6 +1832,19 @@ SING_BOX_ASSETS = {
         "e01a58d28512b1447ab6156017afdeeaa306169a95d27abc00e112599e4ae46c",
     ),
 }
+SUPPORTED_NODE_SCHEMES = (
+    "vless",
+    "vmess",
+    "ss",
+    "trojan",
+    "hysteria2",
+    "hy2",
+    "tuic",
+    "anytls",
+)
+MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024
+MAX_SUBSCRIPTION_NODES = 300
+SUBSCRIPTION_TIMEOUT_SECONDS = 20
 
 _PROCESS = None
 _PROCESS_KEY = None
@@ -1642,9 +1895,13 @@ def _build_tls(query, server, security):
         return None
     tls = {
         "enabled": True,
-        "server_name": _query_value(query, "sni", "serverName", default=server),
+        "server_name": _query_value(
+            query, "sni", "serverName", "server_name", "peer", default=server
+        ),
     }
-    if _truthy(_query_value(query, "allowInsecure", "insecure")):
+    if _truthy(
+        _query_value(query, "allowInsecure", "allow_insecure", "insecure")
+    ):
         tls["insecure"] = True
     alpn = _query_value(query, "alpn")
     if alpn:
@@ -1822,16 +2079,339 @@ def parse_shadowsocks_link(link):
     return outbound
 
 
+def _parsed_password(parsed, label):
+    username = urllib.parse.unquote(parsed.username or "").strip()
+    password = urllib.parse.unquote(parsed.password or "").strip()
+    if username and password:
+        return "{}:{}".format(username, password)
+    value = username or password
+    if not value:
+        raise ProxyError("{} 节点缺少密码或认证信息".format(label))
+    return value
+
+
+def parse_trojan_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "Trojan")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "trojan",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+    }
+    security = _query_value(query, "security", default="tls").lower()
+    tls = _build_tls(query, server, security)
+    if tls:
+        outbound["tls"] = tls
+    transport = _build_transport(
+        _query_value(query, "type", "network", default="tcp"),
+        query,
+        _query_value(query, "host"),
+        _query_value(query, "path"),
+    )
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def parse_hysteria2_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "Hysteria2")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "hysteria2",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "tls": _build_tls(query, server, "tls"),
+    }
+    obfs_type = _query_value(query, "obfs", "obfs_type")
+    obfs_password = _query_value(
+        query, "obfs-password", "obfs_password", "obfsParam"
+    )
+    if obfs_type:
+        if not obfs_password:
+            raise ProxyError("Hysteria2 混淆缺少密码")
+        outbound["obfs"] = {"type": obfs_type, "password": obfs_password}
+    return outbound
+
+
+def parse_tuic_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    uuid = urllib.parse.unquote(parsed.username or "").strip()
+    password = urllib.parse.unquote(parsed.password or "").strip()
+    if not uuid or not password:
+        raise ProxyError("TUIC 节点缺少 UUID 或密码")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    outbound = {
+        "type": "tuic",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "uuid": uuid,
+        "password": password,
+        "congestion_control": _query_value(
+            query, "congestion_control", "congestion-controller", default="bbr"
+        ),
+        "tls": _build_tls(query, server, "tls"),
+    }
+    udp_relay_mode = _query_value(query, "udp_relay_mode", "udp-relay-mode")
+    if udp_relay_mode:
+        outbound["udp_relay_mode"] = udp_relay_mode
+    if _truthy(_query_value(query, "zero_rtt_handshake", "allow_insecure_0rtt")):
+        outbound["zero_rtt_handshake"] = True
+    return outbound
+
+
+def parse_anytls_link(link):
+    parsed = urllib.parse.urlsplit(link)
+    server, port = _require_server(parsed)
+    password = _parsed_password(parsed, "AnyTLS")
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    return {
+        "type": "anytls",
+        "tag": "telegram-node",
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "tls": _build_tls(query, server, "tls"),
+    }
+
+
 def parse_node_link(link):
     link = str(link or "").strip()
-    scheme = urllib.parse.urlsplit(link).scheme.lower()
-    if scheme == "vless":
-        return parse_vless_link(link)
-    if scheme == "vmess":
-        return parse_vmess_link(link)
-    if scheme == "ss":
-        return parse_shadowsocks_link(link)
-    raise ProxyError("节点链接必须以 vless://、vmess:// 或 ss:// 开头")
+    try:
+        scheme = urllib.parse.urlsplit(link).scheme.lower()
+        if scheme == "vless":
+            return parse_vless_link(link)
+        if scheme == "vmess":
+            return parse_vmess_link(link)
+        if scheme == "ss":
+            return parse_shadowsocks_link(link)
+        if scheme == "trojan":
+            return parse_trojan_link(link)
+        if scheme in ("hysteria2", "hy2"):
+            return parse_hysteria2_link(link)
+        if scheme == "tuic":
+            return parse_tuic_link(link)
+        if scheme == "anytls":
+            return parse_anytls_link(link)
+    except ProxyError:
+        raise
+    except ValueError as exc:
+        raise ProxyError("节点链接格式无效: {}".format(exc))
+    raise ProxyError(
+        "节点链接协议不受支持；可使用 VLESS、VMess、Shadowsocks、Trojan、"
+        "Hysteria2、TUIC 或 AnyTLS"
+    )
+
+
+def is_node_link(value):
+    try:
+        scheme = urllib.parse.urlsplit(str(value or "").strip()).scheme.lower()
+    except ValueError:
+        return False
+    return scheme in SUPPORTED_NODE_SCHEMES
+
+
+def _subscription_target(value):
+    value = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        raise ProxyError("订阅链接格式无效")
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ProxyError("订阅链接必须是有效的 HTTP 或 HTTPS 地址")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ProxyError("订阅链接不能指向本机或内网地址")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ProxyError("订阅链接端口无效")
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            port or (443 if parsed.scheme.lower() == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        raise ProxyError("无法解析订阅服务器地址")
+    resolved = []
+    for item in addresses:
+        address_text = str(item[4][0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            raise ProxyError("订阅服务器返回了无效地址")
+        if address not in resolved:
+            resolved.append(address)
+    if not resolved or any(not address.is_global for address in resolved):
+        raise ProxyError("订阅链接不能指向本机或内网地址")
+    return value, parsed, tuple(str(address) for address in resolved)
+
+
+def _subscription_url(value):
+    return _subscription_target(value)[0]
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, address, timeout):
+        super().__init__(host, port=port, timeout=timeout)
+        self._resolved_address = address
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._resolved_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, address, timeout):
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._resolved_address = address
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._resolved_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self.host
+        )
+
+
+def _subscription_request(url, timeout):
+    safe_url, parsed, addresses = _subscription_target(url)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    host = parsed.hostname
+    host_header = "[{}]".format(host) if ":" in host else host
+    if port != (443 if scheme == "https" else 80):
+        host_header = "{}:{}".format(host_header, port)
+    target = urllib.parse.urlunsplit(
+        ("", "", parsed.path or "/", parsed.query, "")
+    )
+    headers = {
+        "Host": host_header,
+        "User-Agent": "Aliyun-Guard-Subscription/1",
+        "Accept": "text/plain, application/octet-stream;q=0.9, */*;q=0.1",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
+    last_error = None
+    for address in addresses:
+        connection = None
+        try:
+            connection_type = (
+                _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+            )
+            connection = connection_type(host, port, address, timeout)
+            connection.request("GET", target, headers=headers)
+            response = connection.getresponse()
+            content_length = response.getheader("Content-Length")
+            if content_length and int(content_length) > MAX_SUBSCRIPTION_BYTES:
+                raise ProxyError("订阅内容超过 2 MiB 限制")
+            content = response.read(MAX_SUBSCRIPTION_BYTES + 1)
+            return (
+                response.status,
+                response.getheader("Location"),
+                content,
+                safe_url,
+            )
+        except ProxyError:
+            raise
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            if connection is not None:
+                connection.close()
+    raise ProxyError("订阅下载失败") from last_error
+
+
+def _subscription_nodes_from_text(text):
+    nodes = []
+    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
+        value = raw_line.strip().lstrip("\ufeff")
+        if value.startswith("- "):
+            value = value[2:].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+        if not is_node_link(value):
+            continue
+        try:
+            parse_node_link(value)
+        except ProxyError:
+            continue
+        if value not in nodes:
+            nodes.append(value)
+        if len(nodes) > MAX_SUBSCRIPTION_NODES:
+            raise ProxyError(
+                "订阅节点超过 {} 个限制".format(MAX_SUBSCRIPTION_NODES)
+            )
+    return nodes
+
+
+def parse_subscription_content(content):
+    if isinstance(content, bytes):
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ProxyError("订阅内容不是有效的 UTF-8 文本")
+    else:
+        text = str(content or "").lstrip("\ufeff")
+    nodes = _subscription_nodes_from_text(text)
+    if nodes:
+        return nodes
+    compact = "".join(text.split())
+    if compact:
+        compact += "=" * (-len(compact) % 4)
+        try:
+            decoded = base64.b64decode(
+                compact.encode("ascii"), altchars=b"-_", validate=True
+            ).decode("utf-8-sig")
+        except (ValueError, UnicodeError):
+            decoded = ""
+        nodes = _subscription_nodes_from_text(decoded)
+    if not nodes:
+        raise ProxyError("订阅中没有可用的受支持节点链接")
+    return nodes
+
+
+def fetch_subscription_nodes(subscription_url, timeout=SUBSCRIPTION_TIMEOUT_SECONDS):
+    current_url = _subscription_url(subscription_url)
+    request_timeout = max(3, int(timeout))
+    for _redirect in range(6):
+        status, location, content, final_url = _subscription_request(
+            current_url, request_timeout
+        )
+        if status in (301, 302, 303, 307, 308):
+            if not location:
+                raise ProxyError("订阅重定向缺少目标地址")
+            current_url = _subscription_url(
+                urllib.parse.urljoin(final_url, location)
+            )
+            continue
+        if status < 200 or status >= 300:
+            raise ProxyError("订阅下载返回 HTTP {}".format(status))
+        if len(content) > MAX_SUBSCRIPTION_BYTES:
+            raise ProxyError("订阅内容超过 2 MiB 限制")
+        return parse_subscription_content(content)
+    raise ProxyError("订阅重定向次数过多")
 
 
 def _clean_display_label(value, limit=80):
@@ -2819,7 +3399,7 @@ class TelegramControlService:
             stop_time = self.guard.normalize_schedule_time(parts[1], "关机时间")
             if start_time == stop_time:
                 raise self.guard.GuardError("开机时间和关机时间不能相同")
-            with self.guard.cycle_lock() as locked:
+            with self.guard.cycle_lock() as locked, self.guard.config_lock():
                 if not locked:
                     raise self.guard.GuardError("检测任务正在运行，请稍后重新输入")
                 config = self.guard.load_config()
@@ -2927,7 +3507,7 @@ class TelegramControlService:
     def _set_schedule_enabled(
         self, telegram, chat_id, user_id, index, enabled, message_id=None
     ):
-        with self.guard.cycle_lock() as locked:
+        with self.guard.cycle_lock() as locked, self.guard.config_lock():
             if not locked:
                 raise self.guard.GuardError("检测任务正在运行，请稍后再试")
             config = self.guard.load_config()
@@ -3495,6 +4075,7 @@ __AG_CONTROL_PY_EOF__
 
 import copy
 import base64
+import functools
 import json
 import os
 from pathlib import Path
@@ -3502,6 +4083,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 
 import telegram_proxy
 import backup_manager
@@ -3515,6 +4097,7 @@ DATA_DIR = Path(
 UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
+MAX_SUBSCRIPTION_PROBES = 32
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -3549,6 +4132,15 @@ class ManagementError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+def _config_transaction(function):
+    @functools.wraps(function)
+    def wrapped(guard, *args, **kwargs):
+        with guard.config_lock():
+            return function(guard, *args, **kwargs)
+
+    return wrapped
 
 
 def _copy(value):
@@ -3837,6 +4429,7 @@ def _s3_candidate(guard, data, save=False):
     return candidate
 
 
+@_config_transaction
 def save_s3_backup_settings(guard, data):
     candidate = _s3_candidate(guard, data, save=True)
     return s3_backup_payload(candidate)
@@ -3920,6 +4513,7 @@ def preview_s3_backup(guard, key):
             path.unlink(missing_ok=True)
 
 
+@_config_transaction
 def restore_s3_backup(guard, key, include_logs=True):
     config = guard.load_config()
     backup = s3_backup.normalized_config(config.get("s3_backup", {}))
@@ -4074,6 +4668,7 @@ def discover_instances(guard, data):
     return result
 
 
+@_config_transaction
 def import_discovered_instances(guard, data):
     ak = _required_text(data, "ak", label="AccessKey ID")
     sk = _required_text(data, "sk", label="AccessKey Secret")
@@ -4222,6 +4817,7 @@ def _validate_candidate_config(guard, config):
         raise ManagementError(guard.compact_error(exc))
 
 
+@_config_transaction
 def save_instance(guard, data, index=None):
     config = guard.load_config()
     users = config.setdefault("users", [])
@@ -4282,6 +4878,7 @@ def validate_instance(guard, index):
         )
 
 
+@_config_transaction
 def update_instance_logging(guard, index, enabled):
     if not isinstance(enabled, bool):
         raise ManagementError("enabled 必须是布尔值")
@@ -4297,6 +4894,7 @@ def update_instance_logging(guard, index, enabled):
     }
 
 
+@_config_transaction
 def delete_instance(guard, index, instance_id):
     config = guard.load_config()
     users = config.get("users", [])
@@ -4310,6 +4908,7 @@ def delete_instance(guard, index, instance_id):
     return {"name": deleted.get("name"), "instance_id": current_id}
 
 
+@_config_transaction
 def update_global_settings(guard, data):
     config = guard.load_config()
     mode = str(data.get("notification_mode", config.get("notification_mode", "always")))
@@ -4393,6 +4992,7 @@ def refresh_billing(guard):
     return result
 
 
+@_config_transaction
 def update_web_settings(guard, data):
     import web_panel
 
@@ -4458,6 +5058,7 @@ def update_web_settings(guard, data):
     }
 
 
+@_config_transaction
 def update_telegram_identity(guard, data):
     config = guard.load_config()
     telegram = config.setdefault("telegram", {})
@@ -4491,7 +5092,9 @@ def update_telegram_identity(guard, data):
     return telegram_payload(guard, telegram)
 
 
-def _telegram_test(guard, telegram, force_ipv4=True, install_core=True):
+def _telegram_test(
+    guard, telegram, force_ipv4=True, install_core=True, latency_attempts=3
+):
     try:
         guard.validate_telegram_config(telegram)
         if telegram.get("connection_mode") == "node" and not telegram_proxy.find_sing_box():
@@ -4502,7 +5105,9 @@ def _telegram_test(guard, telegram, force_ipv4=True, install_core=True):
             guard.enable_ipv4_only()
         details = {}
         username = guard.test_telegram(
-            telegram, latency_attempts=3, result_details=details
+            telegram,
+            latency_attempts=max(1, min(5, int(latency_attempts))),
+            result_details=details,
         )
         return {
             "username": username,
@@ -4557,6 +5162,7 @@ def _connection_candidate(guard, data, config):
     return telegram
 
 
+@_config_transaction
 def configure_telegram_connection(guard, data):
     config = guard.load_config()
     candidate = _connection_candidate(guard, data, config)
@@ -4577,10 +5183,14 @@ def configure_telegram_connection(guard, data):
     return result
 
 
+@_config_transaction
 def add_telegram_node(guard, data):
     node_url = str(data.get("node_url", "") or "").strip()
     if not node_url:
-        raise ManagementError("节点链接不能为空")
+        raise ManagementError("节点或订阅链接不能为空")
+    scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+    if scheme in ("http", "https"):
+        return _add_telegram_subscription(guard, data, node_url)
     try:
         description = telegram_proxy.describe_node_link(node_url)
     except telegram_proxy.ProxyError as exc:
@@ -4604,10 +5214,100 @@ def add_telegram_node(guard, data):
     config["telegram"] = current
     _save_config(guard, config)
     telegram_proxy.stop_node_proxy()
-    result.update({"saved": True, "description": description})
+    result.update(
+        {"saved": True, "description": description, "source": "single"}
+    )
     return result
 
 
+def _add_telegram_subscription(guard, data, subscription_url):
+    try:
+        subscription_nodes = telegram_proxy.fetch_subscription_nodes(
+            subscription_url
+        )
+    except telegram_proxy.ProxyError as exc:
+        raise ManagementError("订阅导入失败: {}".format(exc), 400)
+    config = guard.load_config()
+    current = config.setdefault("telegram", {})
+    existing_nodes = guard.telegram_node_urls(current)
+    merged_nodes = list(existing_nodes)
+    for node_url in subscription_nodes:
+        if node_url not in merged_nodes:
+            merged_nodes.append(node_url)
+    failures = []
+    selected_node = None
+    selected_result = None
+    probe_nodes = subscription_nodes[:MAX_SUBSCRIPTION_PROBES]
+    for node_url in probe_nodes:
+        candidate = _copy(current)
+        candidate["node_url"] = node_url
+        candidate["node_urls"] = merged_nodes
+        candidate["connection_mode"] = "node"
+        candidate["timeout_seconds"] = min(
+            8, max(3, int(candidate.get("timeout_seconds", 12)))
+        )
+        candidate["retries"] = 1
+        try:
+            selected_result = _telegram_test(
+                guard,
+                candidate,
+                bool(config.get("force_ipv4", True)),
+                bool(data.get("install_core", True)),
+                latency_attempts=1,
+            )
+            selected_node = node_url
+            break
+        except ManagementError as exc:
+            failures.append(
+                {
+                    "description": _node_description(node_url),
+                    "error": str(exc)[:300],
+                }
+            )
+            telegram_proxy.stop_node_proxy()
+    if selected_node is None:
+        telegram_proxy.stop_node_proxy()
+        tested = len(probe_nodes)
+        suffix = (
+            "；为控制检测时间，本次最多检测前 {} 个节点".format(
+                MAX_SUBSCRIPTION_PROBES
+            )
+            if len(subscription_nodes) > MAX_SUBSCRIPTION_PROBES
+            else ""
+        )
+        raise ManagementError(
+            "订阅解析到 {} 个节点，但检测的 {} 个节点均无法连接 Telegram{}".format(
+                len(subscription_nodes), tested, suffix
+            ),
+            502,
+            details={
+                "subscription_nodes": len(subscription_nodes),
+                "tested_nodes": tested,
+                "failures": failures,
+            },
+        )
+    current["node_urls"] = merged_nodes
+    current["node_url"] = selected_node
+    current["connection_mode"] = "node"
+    config["telegram"] = current
+    _save_config(guard, config)
+    imported_count = len(merged_nodes) - len(existing_nodes)
+    selected_result.update(
+        {
+            "saved": True,
+            "source": "subscription",
+            "subscription_count": len(subscription_nodes),
+            "imported_count": imported_count,
+            "duplicate_count": len(subscription_nodes) - imported_count,
+            "tested_count": len(failures) + 1,
+            "description": _node_description(selected_node),
+            "telegram": telegram_payload(guard, current),
+        }
+    )
+    return selected_result
+
+
+@_config_transaction
 def telegram_node_action(guard, index, action):
     config = guard.load_config()
     telegram = config.setdefault("telegram", {})
@@ -4960,7 +5660,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -4968,6 +5668,8 @@ SUPERVISOR_LOCK_FILE = APP_DIR / "web-panel-supervisor.lock"
 DISABLED_FILE = APP_DIR / "disabled"
 BACKEND_FILE = APP_DIR / "service_backend"
 MAX_BODY_BYTES = 128 * 1024 * 1024
+MAX_REQUEST_THREADS = 32
+REQUEST_SOCKET_TIMEOUT_SECONDS = 15
 SESSION_SECONDS = 12 * 60 * 60
 PASSWORD_ITERATIONS = 260000
 
@@ -5327,6 +6029,7 @@ def save_config(guard, config):
     guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
 
 
+@web_actions._config_transaction
 def update_schedule(guard, index, data):
     config = guard.load_config()
     users = config.get("users", [])
@@ -5353,6 +6056,7 @@ def update_schedule(guard, index, data):
     return users[index]["schedule"]
 
 
+@web_actions._config_transaction
 def update_pause(guard, index, paused):
     if not isinstance(paused, bool):
         raise WebPanelError("paused 必须是布尔值")
@@ -5365,6 +6069,7 @@ def update_pause(guard, index, paused):
     return paused
 
 
+@web_actions._config_transaction
 def update_settings(guard, data):
     config = guard.load_config()
     try:
@@ -5475,9 +6180,29 @@ def control_instance(
                     threshold_overridden = True
                 if before != "Running":
                     if threshold_overridden and pause_on_threshold_override:
+                        with guard.config_lock():
+                            latest_config = guard.load_config()
+                            latest_user = next(
+                                (
+                                    item
+                                    for item in latest_config.get("users", [])
+                                    if str(item.get("instance_id", ""))
+                                    == str(user.get("instance_id", ""))
+                                    and str(item.get("region", ""))
+                                    == str(user.get("region", ""))
+                                ),
+                                None,
+                            )
+                            if latest_user is None:
+                                raise WebPanelError(
+                                    "实例配置已经变化，请重新操作", 409
+                                )
+                            latest_user["paused"] = True
+                            guard.validate_config(latest_config)
+                            guard.atomic_write_json(
+                                guard.CONFIG_FILE, latest_config, mode=0o600
+                            )
                         user["paused"] = True
-                        guard.validate_config(config)
-                        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
                         monitor_paused = True
                     guard.start_instance(user)
                     performed = True
@@ -5629,6 +6354,7 @@ def control_instance(
 class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
     def __init__(self, address, handler, guard, config, html):
         super().__init__(address, handler)
@@ -5639,8 +6365,34 @@ class PanelServer(ThreadingHTTPServer):
         self.session_lock = threading.Lock()
         self.login_attempts = {}
         self.login_attempt_lock = threading.Lock()
+        self.mutation_lock = threading.RLock()
+        self.request_slots = threading.BoundedSemaphore(MAX_REQUEST_THREADS)
         self.job_lock = threading.Lock()
         self.job = {"running": False, "started_at": None, "finished_at": None, "error": None}
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        request.settimeout(REQUEST_SOCKET_TIMEOUT_SECONDS)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
 
     def delayed_restart(self, delay=0.6):
         def restart():
@@ -5943,12 +6695,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             self.server.guard.LOGGER.exception("Web GET error: %s", exc)
 
     def do_POST(self):
+        mutation_acquired = False
         try:
             parts = self._route_parts()
             if parts == ["api", "login"]:
                 self._handle_login()
                 return
             session_id, _session = self._authenticated(require_csrf=True)
+            self.server.mutation_lock.acquire()
+            mutation_acquired = True
             if parts == ["api", "logout"]:
                 self.server.delete_session(session_id)
                 self._json(
@@ -6077,7 +6832,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "backup", "restore"]:
                 self._authenticated(require_csrf=True)
-                result = web_actions.restore_encrypted_backup(self._read_json())
+                with self.server.guard.config_lock():
+                    result = web_actions.restore_encrypted_backup(self._read_json())
                 self.server.delayed_restart()
                 self._json({"ok": True, "result": result}, 202)
                 return
@@ -6167,6 +6923,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web POST error: %s", exc)
+        finally:
+            if mutation_acquired:
+                self.server.mutation_lock.release()
 
     def _handle_login(self):
         address = self.client_address[0]
@@ -7079,10 +7838,10 @@ __AG_WEB_PY_EOF__
           </details>
 
           <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks；测试可达后才会保存</p></div><strong id="nodeCount">0 个节点</strong></summary>
+            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><strong id="nodeCount">0 个节点</strong></summary>
             <form id="nodeAddForm" class="panel-body">
-              <div class="field"><label for="nodeUrl">节点链接</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess:// 或 ss://" required></textarea></div>
-              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>测试并保存节点</button></div>
+              <div class="field"><label for="nodeUrl">节点链接或订阅地址</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://" required></textarea></div>
+              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>导入订阅或测试保存节点</button></div>
               <div id="nodeResult" class="inline-result" hidden></div>
             </form>
             <div id="nodeList" class="node-list"></div>
@@ -8201,11 +8960,15 @@ __AG_WEB_PY_EOF__
       event.preventDefault();
       const submit = event.currentTarget.querySelector('button[type="submit"]');
       submit.disabled = true;
-      setInlineResult($("nodeResult"), "正在测试节点到 Telegram Bot API 的往返延迟...");
+      setInlineResult($("nodeResult"), "正在导入或测试节点到 Telegram Bot API 的连通性...");
       try {
         const data = await api("/api/telegram/nodes", { method: "POST", body: { node_url: $("nodeUrl").value.trim() } });
         $("nodeUrl").value = "";
-        setInlineResult($("nodeResult"), `${telegramTestText(data.result)} · 节点已保存，当前连接方式未切换`);
+        const result = data.result;
+        const message = result.source === "subscription"
+          ? `${telegramTestText(result)} · 已解析 ${result.subscription_count} 个节点，新增 ${result.imported_count} 个，已自动选用 ${result.description}`
+          : `${telegramTestText(result)} · 节点已保存，当前连接方式未切换`;
+        setInlineResult($("nodeResult"), message);
         await loadManagement();
       } catch (error) { setInlineResult($("nodeResult"), error.message, true); }
       finally { submit.disabled = false; }
@@ -8375,6 +9138,7 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -8480,7 +9244,10 @@ LOGGER.addHandler(logging.NullHandler())
 _IPV4_PATCHED = False
 _STOP_EVENT = threading.Event()
 _CYCLE_THREAD_LOCK = threading.Lock()
+_CONFIG_THREAD_LOCK = threading.RLock()
+_JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
+MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
 
 
@@ -8603,16 +9370,41 @@ def load_state():
 
 
 def atomic_write_json(path, value, mode=0o600, durable=True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
-        handle.write("\n")
-        if durable:
-            handle.flush()
-            os.fsync(handle.fileno())
-    os.chmod(str(temporary), mode)
-    os.replace(str(temporary), str(path))
+    path = Path(path)
+    with _JSON_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
+                handle.write("\n")
+                if durable:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            os.chmod(str(temporary), mode)
+            os.replace(str(temporary), str(path))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def config_lock():
+    """Serialize config read-modify-write transactions across threads/processes."""
+    with _CONFIG_THREAD_LOCK:
+        lock_path = CONFIG_FILE.with_name(CONFIG_FILE.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
 
 def save_state(state):
@@ -8840,7 +9632,7 @@ def _instance_log_value(value, user, limit=500):
         if secret:
             text = text.replace(secret, "***")
     text = re.sub(
-        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss)://[^\s；，,]+",
+        r"(?i)\b(?:https?|socks5h?|vless|vmess|ss|trojan|hysteria2|hy2|tuic|anytls)://[^\s；，,]+",
         "[链接已隐藏]",
         text,
     )
@@ -9332,16 +10124,27 @@ def query_instance_statuses(users):
     }
 
 
-def _prefetch_instance_status_batch(batch, results):
+def _prefetch_instance_status_batch(batch, results, budget=None):
+    if budget is None:
+        budget = {"remaining": MAX_ECS_STATUS_BATCH_CALLS, "last_error": None}
+    if budget["remaining"] <= 0:
+        error = budget.get("last_error") or GuardError(
+            "ECS 批量查询失败次数过多，本轮停止继续拆分"
+        )
+        for user in batch:
+            results[ecs_status_cache_key(user)] = (None, error)
+        return
+    budget["remaining"] -= 1
     try:
         statuses = query_instance_statuses(batch)
     except Exception as exc:
+        budget["last_error"] = exc
         if len(batch) == 1:
             results[ecs_status_cache_key(batch[0])] = (None, exc)
             return
         midpoint = len(batch) // 2
-        _prefetch_instance_status_batch(batch[:midpoint], results)
-        _prefetch_instance_status_batch(batch[midpoint:], results)
+        _prefetch_instance_status_batch(batch[:midpoint], results, budget)
+        _prefetch_instance_status_batch(batch[midpoint:], results, budget)
         return
 
     for user in batch:
@@ -9714,7 +10517,27 @@ def telegram_api(config, method, data=None, request_timeout=None):
                     raise GuardError(
                         "Telegram HTTP {}: {}".format(response.status_code, body[:300])
                     )
-                time.sleep(min(2 ** attempt, 8))
+                delay = min(2 ** attempt, 8)
+                if response.status_code == 429:
+                    retry_after = None
+                    try:
+                        retry_after = response.headers.get("Retry-After")
+                    except Exception:
+                        pass
+                    if not retry_after:
+                        try:
+                            retry_after = (
+                                json.loads(body).get("parameters", {}).get(
+                                    "retry_after"
+                                )
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            retry_after = None
+                    try:
+                        delay = max(1, min(60, int(float(retry_after))))
+                    except (TypeError, ValueError):
+                        pass
+                time.sleep(delay)
                 continue
             break
         except GuardError:
@@ -10878,8 +11701,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.2"
-LOCAL_RELEASE_ID = "033fd79640d759c9a34a199147dab5ed5dbe8558218aa74c3ccb2c354fd0a64c"
+APP_VERSION = "1.6.3"
+LOCAL_RELEASE_ID = "134fd0794bcda55ab4592595ac07840fb0e2f01a723a4c3103fd638792ac5d18"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -11031,11 +11854,12 @@ def load_config(allow_missing=False):
 
 
 def save_config(config):
-    telegram = config.get("telegram", {})
-    if isinstance(telegram, dict):
-        telegram["node_urls"] = guard.telegram_node_urls(telegram)
-    guard.validate_config(config)
-    guard.atomic_write_json(CONFIG_FILE, config, mode=0o600)
+    with guard.config_lock():
+        telegram = config.get("telegram", {})
+        if isinstance(telegram, dict):
+            telegram["node_urls"] = guard.telegram_node_urls(telegram)
+        guard.validate_config(config)
+        guard.atomic_write_json(CONFIG_FILE, config, mode=0o600)
 
 
 def mask_key(value):
@@ -11109,7 +11933,7 @@ TELEGRAM_CONNECTION_LABELS = {
     "direct": "直连",
     "socks5": "SOCKS5 代理",
     "http": "HTTP/HTTPS 代理",
-    "node": "节点链接（VLESS / VMess / Shadowsocks）",
+    "node": "节点链接（VLESS / VMess / Shadowsocks / Trojan / Hysteria2 / TUIC / AnyTLS）",
     "api_proxy": "Telegram API 反向代理",
 }
 
@@ -11199,9 +12023,75 @@ def _sync_saved_nodes(telegram):
     return nodes
 
 
-def add_telegram_node(telegram):
+def add_telegram_subscription(telegram, subscription_url, force_ipv4=True):
+    try:
+        subscription_nodes = telegram_proxy.fetch_subscription_nodes(subscription_url)
+    except telegram_proxy.ProxyError as exc:
+        print("订阅导入失败: {}".format(exc))
+        return "cancelled"
+
+    existing_nodes = guard.telegram_node_urls(telegram)
+    merged_nodes = list(existing_nodes)
+    for node_url in subscription_nodes:
+        if node_url not in merged_nodes:
+            merged_nodes.append(node_url)
+
+    max_probes = 32
+    probe_nodes = subscription_nodes[:max_probes]
+    print(
+        "订阅解析到 {} 个节点，正在依次检测并自动选择首个可用节点...".format(
+            len(subscription_nodes)
+        )
+    )
+    for index, node_url in enumerate(probe_nodes, 1):
+        candidate = json.loads(json.dumps(telegram, ensure_ascii=False))
+        candidate["node_urls"] = merged_nodes
+        candidate["node_url"] = node_url
+        candidate["connection_mode"] = "node"
+        candidate["timeout_seconds"] = min(
+            8, max(3, int(candidate.get("timeout_seconds", 12)))
+        )
+        candidate["retries"] = 1
+        print(
+            "检测节点 {}/{}: {}".format(
+                index, len(probe_nodes), _saved_node_description(node_url)
+            )
+        )
+        if test_telegram_connection(
+            candidate, force_ipv4=force_ipv4, latency_attempts=1
+        ):
+            telegram["node_urls"] = merged_nodes
+            telegram["node_url"] = node_url
+            telegram["connection_mode"] = "node"
+            added = len(merged_nodes) - len(existing_nodes)
+            print(
+                "订阅已导入 {} 个新节点，已自动选择: {}".format(
+                    added, _saved_node_description(node_url)
+                )
+            )
+            return "subscription"
+        telegram_proxy.stop_node_proxy()
+
+    telegram_proxy.stop_node_proxy()
+    limit_note = (
+        "（为控制检测时间，本次最多检测前 {} 个节点）".format(max_probes)
+        if len(subscription_nodes) > max_probes
+        else ""
+    )
+    print("订阅节点均无法连接 Telegram，未保存本次导入。{}".format(limit_note))
+    return "cancelled"
+
+
+def add_telegram_node(telegram, force_ipv4=True):
     while True:
-        node_url = prompt_secret("节点链接（vless://、vmess:// 或 ss://）")
+        node_url = prompt_secret(
+            "节点链接或订阅地址（vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://）"
+        )
+        scheme = urllib.parse.urlsplit(node_url).scheme.lower()
+        if scheme in ("http", "https"):
+            return add_telegram_subscription(
+                telegram, node_url, force_ipv4=force_ipv4
+            )
         try:
             description = telegram_proxy.describe_node_link(node_url)
         except telegram_proxy.ProxyError as exc:
@@ -11246,12 +12136,12 @@ def delete_telegram_node(telegram, nodes):
     return True
 
 
-def configure_telegram_nodes(telegram):
+def configure_telegram_nodes(telegram, force_ipv4=True):
     nodes = _sync_saved_nodes(telegram)
     if not nodes:
         title("Telegram 节点")
         print("尚未保存节点，将添加第一个节点。")
-        return add_telegram_node(telegram)
+        return add_telegram_node(telegram, force_ipv4=force_ipv4)
     while True:
         nodes = _sync_saved_nodes(telegram)
         title("Telegram 节点（已保存 {} 个）".format(len(nodes)))
@@ -11279,7 +12169,7 @@ def configure_telegram_nodes(telegram):
             print("已选择: {}".format(_saved_node_description(telegram["node_url"])))
             return "selected"
         if choice == add_choice:
-            return add_telegram_node(telegram)
+            return add_telegram_node(telegram, force_ipv4=force_ipv4)
         if choice == delete_choice:
             delete_telegram_node(telegram, nodes)
             if not _sync_saved_nodes(telegram):
@@ -11296,13 +12186,18 @@ def _telegram_connection_signature(telegram):
     return connection + (tuple(guard.telegram_node_urls(telegram)),)
 
 
-def run_telegram_connection_test(telegram):
+def run_telegram_connection_test(telegram, latency_attempts=3):
+    latency_attempts = max(1, min(5, int(latency_attempts)))
     print("本次测试方式: {}".format(describe_telegram_connection(telegram)))
-    print("正在测试当前连接到 Telegram Bot API 的往返延迟（3 次）并发送消息...")
+    print(
+        "正在测试当前连接到 Telegram Bot API 的往返延迟（{} 次）并发送消息...".format(
+            latency_attempts
+        )
+    )
     details = {}
     username = guard.test_telegram(
         telegram,
-        latency_attempts=3,
+        latency_attempts=latency_attempts,
         result_details=details,
     )
     print(
@@ -11314,7 +12209,7 @@ def run_telegram_connection_test(telegram):
     return username
 
 
-def test_telegram_connection(telegram, force_ipv4=True):
+def test_telegram_connection(telegram, force_ipv4=True, latency_attempts=3):
     try:
         guard.validate_telegram_config(telegram)
     except Exception as exc:
@@ -11336,7 +12231,9 @@ def test_telegram_connection(telegram, force_ipv4=True):
     if force_ipv4:
         guard.enable_ipv4_only()
     try:
-        username = run_telegram_connection_test(telegram)
+        username = run_telegram_connection_test(
+            telegram, latency_attempts=latency_attempts
+        )
         print("Telegram 检测成功，Bot: @{}".format(username))
         return True
     except Exception as exc:
@@ -11439,7 +12336,7 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 2) SOCKS5 代理")
         print(" 3) HTTP/HTTPS 代理")
         print(
-            " 4) 节点链接（VLESS / VMess / Shadowsocks）  [已保存 {} 个]".format(
+            " 4) 节点链接（VLESS / VMess / SS / Trojan / Hysteria2 / TUIC / AnyTLS）  [已保存 {} 个]".format(
                 len(guard.telegram_node_urls(candidate))
             )
         )
@@ -11477,7 +12374,11 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             )
         elif choice == 4:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
-            node_action = configure_telegram_nodes(candidate)
+            node_action = configure_telegram_nodes(
+                candidate, force_ipv4=force_ipv4
+            )
+            if node_action == "subscription":
+                return candidate, True
             if node_action == "added":
                 print("正在检测新节点，检测通过后将自动保存...")
                 if test_telegram_connection(candidate, force_ipv4=force_ipv4):
