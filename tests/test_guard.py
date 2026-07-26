@@ -944,6 +944,40 @@ class GuardPerformanceCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_ipv4_dns_wrapper_preserves_getaddrinfo_keyword_signature(self):
+        ipv6 = (
+            guard.socket.AF_INET6,
+            guard.socket.SOCK_STREAM,
+            6,
+            "",
+            ("2001:4860:4860::8888", 443, 0, 0),
+        )
+        ipv4 = (
+            guard.socket.AF_INET,
+            guard.socket.SOCK_STREAM,
+            6,
+            "",
+            ("8.8.8.8", 443),
+        )
+        original_lookup = guard.socket.getaddrinfo
+        original_patched = guard._IPV4_PATCHED
+        lookup = mock.Mock(return_value=[ipv6, ipv4])
+        try:
+            guard.socket.getaddrinfo = lookup
+            guard._IPV4_PATCHED = False
+            guard.enable_ipv4_only()
+            result = guard.socket.getaddrinfo(
+                "subscription.example", 443, type=guard.socket.SOCK_STREAM
+            )
+        finally:
+            guard.socket.getaddrinfo = original_lookup
+            guard._IPV4_PATCHED = original_patched
+
+        self.assertEqual(result, [ipv4])
+        lookup.assert_called_once_with(
+            "subscription.example", 443, 0, guard.socket.SOCK_STREAM, 0, 0
+        )
+
     def test_atomic_json_writes_are_safe_under_thread_contention(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

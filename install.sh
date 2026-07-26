@@ -5668,7 +5668,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -9594,8 +9594,8 @@ def enable_ipv4_only():
         return
     original = socket.getaddrinfo
 
-    def ipv4_getaddrinfo(host, port, family=0, socktype=0, proto=0, flags=0):
-        results = original(host, port, family, socktype, proto, flags)
+    def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        results = original(host, port, family, type, proto, flags)
         ipv4_results = [item for item in results if item[0] == socket.AF_INET]
         return ipv4_results or results
 
@@ -11709,8 +11709,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.4"
-LOCAL_RELEASE_ID = "2ae0d12786a81337f3d3f33d2bd85483f782cf6cdd72c96c46f28cf8309b3d6a"
+APP_VERSION = "1.6.5"
+LOCAL_RELEASE_ID = "7d599354ca1957436928abf3a49ab9f0c3a3b55af8c96b97b7107dfee84af4c0"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

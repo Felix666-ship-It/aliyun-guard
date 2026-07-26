@@ -463,8 +463,8 @@ def enable_ipv4_only():
         return
     original = socket.getaddrinfo
 
-    def ipv4_getaddrinfo(host, port, family=0, socktype=0, proto=0, flags=0):
-        results = original(host, port, family, socktype, proto, flags)
+    def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        results = original(host, port, family, type, proto, flags)
         ipv4_results = [item for item in results if item[0] == socket.AF_INET]
         return ipv4_results or results
 
