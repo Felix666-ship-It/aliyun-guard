@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.5-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.7-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -626,7 +626,9 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 - 第 4 项会显示已保存节点数量；进入后可选择旧节点、添加新节点或删除节点。
 - 从 `v1.2.3` 及更早版本升级时，`config.json` 中仍存在的 `telegram.node_url` 会自动加入节点列表，并标记为“上次使用”，不需要重新输入。
 - 添加节点时可直接粘贴单个 `vless://`、`vmess://`、`ss://`、`trojan://`、`hysteria2://` / `hy2://`、`tuic://` 或 `anytls://` 链接；重复链接不会重复保存。
-- 也可粘贴 HTTP/HTTPS 订阅地址。支持常见的明文 URI 列表和 Base64 URI 列表；会先解析并去重，再按顺序检测前 32 个节点，自动保存全部解析结果并选用第一个能连接 Telegram 的节点。订阅全部不可用时不修改已有配置。
+- 也可粘贴 HTTP/HTTPS 订阅地址。支持常见的明文 URI 列表和 Base64 URI 列表；不会限制订阅中的节点数量，会先解析并去重，保存全部解析结果，再按顺序检测并选用第一个能连接 Telegram 的节点。
+- 已保存的订阅每 7 天自动刷新一次。刷新会替换该订阅上次导入的节点，同时保留手动添加的节点；下载失败时保留当前节点并在 1 小时后重试。
+- 订阅导入或自动刷新后全部节点均不可用时，仍会保存本次解析到的全部新节点，自动切换为直连，并尝试通过 Telegram Bot 发送降级通知。
 - 存在多个节点时，每个节点都会显示独立序号和脱敏说明；选择序号即可将其设为待使用节点，不会覆盖其他节点。
 - 新增节点会临时通过该节点访问 Telegram Bot API，预热后测量 3 次平均往返延迟并发送测试消息；全部成功才加入节点列表，失败则丢弃本次新增内容。无论成功或失败，当前直连、代理或正在使用的节点都不会被切换。
 - 选择第 1 项直连时会立即检测 Telegram 直连；检测成功后直接切换并保存，检测失败则保留原连接方式。切换直连不会删除已保存节点。

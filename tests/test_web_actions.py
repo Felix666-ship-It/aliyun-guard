@@ -69,6 +69,8 @@ class WebActionTests(unittest.TestCase):
                 "connection_mode": "socks5",
                 "proxy_url": "socks5://proxy-user:proxy-pass@proxy.example:1080",
                 "node_urls": [NODE_URL],
+                "subscription_url": "https://subscription.example/list?token=private",
+                "subscription_node_urls": [NODE_URL],
             }
         )
         config["web_panel"]["password_hash"] = web_panel.hash_password(
@@ -82,11 +84,13 @@ class WebActionTests(unittest.TestCase):
             "private-secret-key",
             "private-bot-token",
             "proxy-pass",
+            "https://subscription.example/list?token=private",
             NODE_URL,
             config["web_panel"]["password_hash"],
         ):
             self.assertNotIn(secret, serialized)
         self.assertTrue(payload["telegram"]["proxy_configured"])
+        self.assertTrue(payload["telegram"]["subscription_configured"])
         self.assertNotIn("proxy_display", payload["telegram"])
         self.assertNotIn("api_base_display", payload["telegram"])
         self.assertNotIn("access_key", payload["instances"][0])
@@ -316,6 +320,11 @@ class WebActionTests(unittest.TestCase):
 
         saved = guard.load_config()["telegram"]
         self.assertEqual(saved["node_urls"], [first, second])
+        self.assertEqual(saved["subscription_node_urls"], [first, second])
+        self.assertEqual(
+            saved["subscription_url"], "https://subscription.example/list"
+        )
+        self.assertGreater(saved["subscription_last_refresh_epoch"], 0)
         self.assertEqual(saved["node_url"], second)
         self.assertEqual(saved["connection_mode"], "node")
         self.assertEqual(result["source"], "subscription")
@@ -324,8 +333,53 @@ class WebActionTests(unittest.TestCase):
         self.assertEqual(test_connection.call_count, 2)
         self.assertEqual(test_connection.call_args.kwargs["latency_attempts"], 1)
 
-    def test_failed_subscription_does_not_change_configuration(self):
-        before = copy.deepcopy(guard.load_config()["telegram"])
+    def test_subscription_probes_nodes_beyond_former_probe_limit(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(33)
+        ]
+        successful_result = {
+            "username": "example_bot",
+            "latency_ms": 88.0,
+            "latency_attempts": 1,
+            "connection": "节点链接",
+        }
+        with mock.patch.object(
+            web_actions.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=nodes,
+        ), mock.patch.object(
+            web_actions,
+            "_telegram_test",
+            side_effect=[
+                web_actions.ManagementError("Telegram 测试失败", 502)
+                for _ in range(32)
+            ]
+            + [successful_result],
+        ) as test_connection, mock.patch.object(
+            web_actions.telegram_proxy, "stop_node_proxy"
+        ):
+            result = web_actions.add_telegram_node(
+                guard, {"node_url": "https://subscription.example/list"}
+            )
+
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["node_urls"], nodes)
+        self.assertEqual(saved["node_url"], nodes[-1])
+        self.assertEqual(result["tested_count"], 33)
+        self.assertEqual(test_connection.call_count, 33)
+
+    def test_failed_subscription_switches_to_direct_and_notifies(self):
+        saved_node = "anytls://saved-password@saved.example:443#Saved"
+        config = guard.load_config()
+        config["telegram"].update(
+            {
+                "connection_mode": "node",
+                "node_url": saved_node,
+                "node_urls": [saved_node],
+            }
+        )
+        guard.atomic_write_json(guard.CONFIG_FILE, config)
         node = "anytls://unreachable-password@unreachable.example:443#Unreachable"
         with mock.patch.object(
             web_actions.telegram_proxy,
@@ -335,12 +389,55 @@ class WebActionTests(unittest.TestCase):
             web_actions,
             "_telegram_test",
             side_effect=web_actions.ManagementError("Telegram 测试失败", 502),
-        ), mock.patch.object(web_actions.telegram_proxy, "stop_node_proxy"):
-            with self.assertRaises(web_actions.ManagementError):
+        ), mock.patch.object(
+            web_actions.telegram_proxy, "stop_node_proxy"
+        ), mock.patch.object(guard, "send_telegram_message") as send:
+            with self.assertRaises(web_actions.ManagementError) as raised:
                 web_actions.add_telegram_node(
                     guard, {"node_url": "https://subscription.example/list"}
                 )
-        self.assertEqual(guard.load_config()["telegram"], before)
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["connection_mode"], "direct")
+        self.assertEqual(saved["node_url"], saved_node)
+        self.assertEqual(saved["node_urls"], [saved_node, node])
+        self.assertEqual(saved["subscription_node_urls"], [node])
+        self.assertEqual(
+            saved["subscription_url"], "https://subscription.example/list"
+        )
+        self.assertTrue(raised.exception.details["fallback_notification_sent"])
+        self.assertEqual(raised.exception.details["fallback_connection_mode"], "direct")
+        self.assertEqual(send.call_args.args[0]["connection_mode"], "direct")
+        self.assertIn("已自动切换为直连", send.call_args.args[1])
+
+    def test_failed_subscription_keeps_error_details_bounded(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(web_actions.MAX_SUBSCRIPTION_FAILURE_DETAILS + 1)
+        ]
+        with mock.patch.object(
+            web_actions.telegram_proxy,
+            "fetch_subscription_nodes",
+            return_value=nodes,
+        ), mock.patch.object(
+            web_actions,
+            "_telegram_test",
+            side_effect=web_actions.ManagementError("Telegram 测试失败", 502),
+        ), mock.patch.object(
+            web_actions.telegram_proxy, "stop_node_proxy"
+        ), mock.patch.object(guard, "send_telegram_message"):
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.add_telegram_node(
+                    guard, {"node_url": "https://subscription.example/list"}
+                )
+
+        self.assertEqual(raised.exception.details["tested_nodes"], len(nodes))
+        self.assertEqual(raised.exception.details["failed_nodes"], len(nodes))
+        self.assertEqual(
+            len(raised.exception.details["failures"]),
+            web_actions.MAX_SUBSCRIPTION_FAILURE_DETAILS,
+        )
+        self.assertEqual(guard.load_config()["telegram"]["connection_mode"], "direct")
+        self.assertEqual(guard.load_config()["telegram"]["node_urls"], nodes)
 
     def test_malformed_subscription_url_is_a_client_error(self):
         before = copy.deepcopy(guard.load_config()["telegram"])

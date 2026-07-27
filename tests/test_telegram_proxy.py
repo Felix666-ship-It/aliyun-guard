@@ -163,6 +163,15 @@ class NodeParserTests(unittest.TestCase):
             telegram_proxy.parse_subscription_content(encoded_subscription), [vless, anytls]
         )
 
+    def test_parses_subscription_with_more_than_former_node_limit(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(301)
+        ]
+        self.assertEqual(
+            telegram_proxy.parse_subscription_content("\n".join(nodes)), nodes
+        )
+
     def test_rejects_private_subscription_address(self):
         with mock.patch.object(
             telegram_proxy.socket,

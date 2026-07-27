@@ -26,7 +26,7 @@ DATA_DIR = Path(
 UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
-MAX_SUBSCRIPTION_PROBES = 32
+MAX_SUBSCRIPTION_FAILURE_DETAILS = 20
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -199,6 +199,13 @@ def telegram_payload(guard, telegram):
         "connection_description": guard.telegram_connection_description(telegram),
         "proxy_configured": bool(str(telegram.get("proxy_url", "")).strip()),
         "api_base_configured": bool(str(telegram.get("api_base_url", "")).strip()),
+        "subscription_configured": bool(
+            str(telegram.get("subscription_url", "") or "").strip()
+        ),
+        "subscription_last_refresh_epoch": float(
+            telegram.get("subscription_last_refresh_epoch", 0) or 0
+        ),
+        "subscription_refresh_seconds": guard.SUBSCRIPTION_REFRESH_SECONDS,
         "nodes": [
             {
                 "index": index,
@@ -1167,15 +1174,19 @@ def _add_telegram_subscription(guard, data, subscription_url):
     config = guard.load_config()
     current = config.setdefault("telegram", {})
     existing_nodes = guard.telegram_node_urls(current)
-    merged_nodes = list(existing_nodes)
-    for node_url in subscription_nodes:
-        if node_url not in merged_nodes:
-            merged_nodes.append(node_url)
+    merged_nodes = guard.set_telegram_subscription_nodes(
+        current, subscription_url, subscription_nodes
+    )
+    refreshed_at = time.time()
+    current["subscription_last_attempt_epoch"] = refreshed_at
+    current["subscription_last_refresh_epoch"] = refreshed_at
+    config["telegram"] = current
+    _save_config(guard, config)
     failures = []
+    failed_count = 0
     selected_node = None
     selected_result = None
-    probe_nodes = subscription_nodes[:MAX_SUBSCRIPTION_PROBES]
-    for node_url in probe_nodes:
+    for node_url in subscription_nodes:
         candidate = _copy(current)
         candidate["node_url"] = node_url
         candidate["node_urls"] = merged_nodes
@@ -1195,32 +1206,60 @@ def _add_telegram_subscription(guard, data, subscription_url):
             selected_node = node_url
             break
         except ManagementError as exc:
-            failures.append(
-                {
-                    "description": _node_description(node_url),
-                    "error": str(exc)[:300],
-                }
-            )
+            failed_count += 1
+            if len(failures) < MAX_SUBSCRIPTION_FAILURE_DETAILS:
+                failures.append(
+                    {
+                        "description": _node_description(node_url),
+                        "error": str(exc)[:300],
+                    }
+                )
             telegram_proxy.stop_node_proxy()
     if selected_node is None:
         telegram_proxy.stop_node_proxy()
-        tested = len(probe_nodes)
-        suffix = (
-            "；为控制检测时间，本次最多检测前 {} 个节点".format(
-                MAX_SUBSCRIPTION_PROBES
+        tested = len(subscription_nodes)
+        current["connection_mode"] = "direct"
+        config["telegram"] = current
+        _save_config(guard, config)
+        notification_sent = False
+        notification_error = None
+        notification_text = (
+            "Telegram 节点订阅降级通知\n"
+            "订阅解析到 {} 个节点，但全部检测均无法连接 Telegram。\n"
+            "已自动切换为直连；已保存节点未删除。"
+        ).format(len(subscription_nodes))
+        try:
+            guard.send_telegram_message(current, notification_text)
+            notification_sent = True
+        except Exception as exc:
+            notification_error = guard.compact_error(
+                exc, secrets=guard.telegram_secrets(current)
             )
-            if len(subscription_nodes) > MAX_SUBSCRIPTION_PROBES
-            else ""
+            guard.LOGGER.warning(
+                "Subscription fallback Telegram notification failed: %s",
+                notification_error,
+            )
+        message = (
+            "订阅解析到 {} 个节点，但全数检测的 {} 个节点均无法连接 Telegram；"
+            "已自动切换为直连{}".format(
+                len(subscription_nodes),
+                tested,
+                "，并已通过 Telegram Bot 发送通知"
+                if notification_sent
+                else "，但 Telegram Bot 通知发送失败",
+            )
         )
         raise ManagementError(
-            "订阅解析到 {} 个节点，但检测的 {} 个节点均无法连接 Telegram{}".format(
-                len(subscription_nodes), tested, suffix
-            ),
+            message,
             502,
             details={
                 "subscription_nodes": len(subscription_nodes),
                 "tested_nodes": tested,
+                "failed_nodes": failed_count,
                 "failures": failures,
+                "fallback_connection_mode": "direct",
+                "fallback_notification_sent": notification_sent,
+                "fallback_notification_error": notification_error,
             },
         )
     current["node_urls"] = merged_nodes
@@ -1236,7 +1275,7 @@ def _add_telegram_subscription(guard, data, subscription_url):
             "subscription_count": len(subscription_nodes),
             "imported_count": imported_count,
             "duplicate_count": len(subscription_nodes) - imported_count,
-            "tested_count": len(failures) + 1,
+            "tested_count": failed_count + 1,
             "description": _node_description(selected_node),
             "telegram": telegram_payload(guard, current),
         }
@@ -1255,6 +1294,16 @@ def telegram_node_action(guard, index, action):
     if action == "delete":
         remaining = [value for value in nodes if value != node_url]
         telegram["node_urls"] = remaining
+        subscription_nodes = [
+            value
+            for value in guard.telegram_subscription_node_urls(telegram)
+            if value != node_url
+        ]
+        telegram["subscription_node_urls"] = subscription_nodes
+        if not subscription_nodes:
+            telegram["subscription_url"] = ""
+            telegram["subscription_last_refresh_epoch"] = 0
+            telegram["subscription_last_attempt_epoch"] = 0
         if str(telegram.get("node_url", "")) == node_url:
             telegram["node_url"] = ""
             telegram["connection_mode"] = "direct"

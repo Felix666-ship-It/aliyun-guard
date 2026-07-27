@@ -796,9 +796,12 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn('<form id="connectionForm">', telegram)
         self.assertIn('<form id="nodeAddForm" class="panel-body">', telegram)
         self.assertIn('id="nodeList"', telegram)
+        self.assertIn('id="subscriptionStatus"', telegram)
         self.assertIn('节点链接或订阅地址', telegram)
         self.assertIn('anytls://', telegram)
         self.assertIn('result.source === "subscription"', html)
+        self.assertIn('订阅每 7 天自动更新', html)
+        self.assertNotIn("subscription_url", html)
 
     def test_settings_forms_keep_existing_ids_inside_collapsible_panels(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")

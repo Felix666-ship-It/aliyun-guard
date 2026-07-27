@@ -1033,6 +1033,187 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded["telegram"]["node_url"], node_url)
         self.assertEqual(loaded["telegram"]["node_urls"], [node_url])
 
+    def test_subscription_merge_replaces_source_nodes_and_preserves_manual_nodes(self):
+        manual = "anytls://manual-password@manual.example:443#Manual"
+        old = "anytls://old-password@old.example:443#Old"
+        new = "anytls://new-password@new.example:443#New"
+        telegram = json.loads(json.dumps(guard.DEFAULT_CONFIG["telegram"]))
+        telegram.update(
+            {
+                "connection_mode": "node",
+                "node_url": old,
+                "node_urls": [manual, old],
+                "subscription_url": "https://old.example/list",
+                "subscription_node_urls": [old],
+            }
+        )
+
+        merged = guard.set_telegram_subscription_nodes(
+            telegram, "https://new.example/list", [new]
+        )
+
+        self.assertEqual(merged, [manual, new])
+        self.assertEqual(telegram["subscription_node_urls"], [new])
+        self.assertEqual(telegram["subscription_url"], "https://new.example/list")
+        self.assertEqual(telegram["node_url"], "")
+        self.assertEqual(telegram["connection_mode"], "direct")
+
+    def test_subscription_refresh_is_due_after_seven_days_with_hourly_retry(self):
+        telegram = json.loads(json.dumps(guard.DEFAULT_CONFIG["telegram"]))
+        telegram["subscription_url"] = "https://subscription.example/list"
+        telegram["subscription_last_refresh_epoch"] = 100.0
+        telegram["subscription_last_attempt_epoch"] = 100.0
+        due_at = 100.0 + guard.SUBSCRIPTION_REFRESH_SECONDS
+
+        self.assertFalse(
+            guard.telegram_subscription_refresh_due(telegram, due_at - 1)
+        )
+        self.assertTrue(guard.telegram_subscription_refresh_due(telegram, due_at))
+        telegram["subscription_last_attempt_epoch"] = due_at
+        self.assertFalse(
+            guard.telegram_subscription_refresh_due(
+                telegram, due_at + guard.SUBSCRIPTION_RETRY_SECONDS - 1
+            )
+        )
+        self.assertTrue(
+            guard.telegram_subscription_refresh_due(
+                telegram, due_at + guard.SUBSCRIPTION_RETRY_SECONDS
+            )
+        )
+
+    def test_automatic_subscription_refresh_replaces_nodes_and_selects_available(self):
+        manual = "anytls://manual-password@manual.example:443#Manual"
+        old = "anytls://old-password@old.example:443#Old"
+        first = "anytls://first-password@first.example:443#First"
+        second = "anytls://second-password@second.example:443#Second"
+        now = 100.0 + guard.SUBSCRIPTION_REFRESH_SECONDS
+        config = json.loads(json.dumps(guard.DEFAULT_CONFIG))
+        config["telegram"].update(
+            {
+                "bot_token": "test-token",
+                "chat_id": "123",
+                "connection_mode": "node",
+                "node_url": old,
+                "node_urls": [manual, old],
+                "subscription_url": "https://subscription.example/list",
+                "subscription_node_urls": [old],
+                "subscription_last_refresh_epoch": 100.0,
+                "subscription_last_attempt_epoch": 100.0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            guard.atomic_write_json(config_path, config)
+            with mock.patch.object(
+                guard, "CONFIG_FILE", config_path
+            ), mock.patch.object(
+                guard.telegram_proxy,
+                "fetch_subscription_nodes",
+                return_value=[first, second],
+            ), mock.patch.object(
+                guard,
+                "_subscription_node_reachable",
+                side_effect=[False, True],
+            ) as reachable:
+                result = guard.refresh_telegram_subscription_if_due(now)
+                saved = guard.load_config()["telegram"]
+
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["selected"])
+        self.assertEqual(saved["node_urls"], [manual, first, second])
+        self.assertEqual(saved["subscription_node_urls"], [first, second])
+        self.assertEqual(saved["node_url"], second)
+        self.assertEqual(saved["connection_mode"], "node")
+        self.assertEqual(saved["subscription_last_refresh_epoch"], now)
+        self.assertEqual(reachable.call_count, 2)
+
+    def test_automatic_subscription_refresh_saves_all_before_direct_fallback(self):
+        manual = "anytls://manual-password@manual.example:443#Manual"
+        old = "anytls://old-password@old.example:443#Old"
+        first = "anytls://first-password@first.example:443#First"
+        second = "anytls://second-password@second.example:443#Second"
+        now = 100.0 + guard.SUBSCRIPTION_REFRESH_SECONDS
+        config = json.loads(json.dumps(guard.DEFAULT_CONFIG))
+        config["telegram"].update(
+            {
+                "bot_token": "test-token",
+                "chat_id": "123",
+                "connection_mode": "node",
+                "node_url": old,
+                "node_urls": [manual, old],
+                "subscription_url": "https://subscription.example/list",
+                "subscription_node_urls": [old],
+                "subscription_last_refresh_epoch": 100.0,
+                "subscription_last_attempt_epoch": 100.0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            guard.atomic_write_json(config_path, config)
+            with mock.patch.object(
+                guard, "CONFIG_FILE", config_path
+            ), mock.patch.object(
+                guard.telegram_proxy,
+                "fetch_subscription_nodes",
+                return_value=[first, second],
+            ), mock.patch.object(
+                guard, "_subscription_node_reachable", return_value=False
+            ), mock.patch.object(
+                guard.telegram_proxy, "stop_node_proxy"
+            ), mock.patch.object(guard, "send_telegram_message") as send:
+                result = guard.refresh_telegram_subscription_if_due(now)
+                saved = guard.load_config()["telegram"]
+
+        self.assertTrue(result["updated"])
+        self.assertFalse(result["selected"])
+        self.assertTrue(result["fallback_notification_sent"])
+        self.assertEqual(saved["node_urls"], [manual, first, second])
+        self.assertEqual(saved["subscription_node_urls"], [first, second])
+        self.assertEqual(saved["node_url"], "")
+        self.assertEqual(saved["connection_mode"], "direct")
+        self.assertEqual(send.call_args.args[0]["connection_mode"], "direct")
+        self.assertIn("已自动切换为直连", send.call_args.args[1])
+
+    def test_automatic_subscription_refresh_bounds_individual_failure_logs(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(25)
+        ]
+        now = 100.0 + guard.SUBSCRIPTION_REFRESH_SECONDS
+        config = json.loads(json.dumps(guard.DEFAULT_CONFIG))
+        config["telegram"].update(
+            {
+                "bot_token": "test-token",
+                "chat_id": "123",
+                "subscription_url": "https://subscription.example/list",
+                "subscription_last_refresh_epoch": 100.0,
+                "subscription_last_attempt_epoch": 100.0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            guard.atomic_write_json(config_path, config)
+            with mock.patch.object(
+                guard, "CONFIG_FILE", config_path
+            ), mock.patch.object(
+                guard.telegram_proxy,
+                "fetch_subscription_nodes",
+                return_value=nodes,
+            ), mock.patch.object(
+                guard, "_subscription_node_reachable", return_value=False
+            ) as reachable, mock.patch.object(
+                guard, "send_telegram_message"
+            ), self.assertLogs(guard.LOGGER, level="INFO") as logs:
+                result = guard.refresh_telegram_subscription_if_due(now)
+
+        self.assertTrue(result["updated"])
+        self.assertEqual(reachable.call_count, len(nodes))
+        self.assertTrue(all(
+            call.kwargs["log_failure"] is (index < 20)
+            for index, call in enumerate(reachable.call_args_list)
+        ))
+        self.assertTrue(any("5 additional nodes" in line for line in logs.output))
+
     def test_rejects_invalid_telegram_proxy(self):
         config = make_config()
         config["telegram"].update(
@@ -1630,21 +1811,49 @@ class FirstSetupFlowTests(unittest.TestCase):
             selected = manager.add_telegram_node(telegram, force_ipv4=False)
         self.assertEqual(selected, "subscription")
         self.assertEqual(telegram["node_urls"], [first, second])
+        self.assertEqual(telegram["subscription_node_urls"], [first, second])
+        self.assertEqual(
+            telegram["subscription_url"], "https://subscription.example/list"
+        )
         self.assertEqual(telegram["node_url"], second)
         self.assertEqual(telegram["connection_mode"], "node")
         self.assertEqual(test_connection.call_count, 2)
         self.assertEqual(test_connection.call_args.kwargs["latency_attempts"], 1)
 
-    def test_failed_subscription_leaves_cli_configuration_unchanged(self):
+    def test_subscription_probes_nodes_beyond_former_probe_limit(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(33)
+        ]
+        telegram = dict(guard.DEFAULT_CONFIG["telegram"])
+        telegram.update({"connection_mode": "direct", "node_urls": []})
+        with mock.patch.object(
+            manager, "prompt_secret", return_value="https://subscription.example/list"
+        ), mock.patch.object(
+            manager.telegram_proxy, "fetch_subscription_nodes", return_value=nodes
+        ), mock.patch.object(
+            manager,
+            "test_telegram_connection",
+            side_effect=[False] * 32 + [True],
+        ) as test_connection, mock.patch.object(
+            manager.telegram_proxy, "stop_node_proxy"
+        ):
+            selected = manager.add_telegram_node(telegram, force_ipv4=False)
+        self.assertEqual(selected, "subscription")
+        self.assertEqual(telegram["node_urls"], nodes)
+        self.assertEqual(telegram["node_url"], nodes[-1])
+        self.assertEqual(test_connection.call_count, 33)
+
+    def test_failed_subscription_switches_cli_to_direct_and_notifies(self):
+        saved_node = "anytls://saved-password@saved.example:443#Saved"
         telegram = dict(guard.DEFAULT_CONFIG["telegram"])
         telegram.update(
             {
-                "connection_mode": "direct",
-                "node_url": "",
-                "node_urls": [],
+                "connection_mode": "node",
+                "node_url": saved_node,
+                "node_urls": [saved_node],
             }
         )
-        before = json.loads(json.dumps(telegram, ensure_ascii=False))
         node = "anytls://unreachable-password@unreachable.example:443#Unreachable"
         with mock.patch.object(
             manager, "prompt_secret", return_value="https://subscription.example/list"
@@ -1654,10 +1863,17 @@ class FirstSetupFlowTests(unittest.TestCase):
             return_value=[node],
         ), mock.patch.object(
             manager, "test_telegram_connection", return_value=False
-        ), mock.patch.object(manager.telegram_proxy, "stop_node_proxy"):
+        ), mock.patch.object(
+            manager.telegram_proxy, "stop_node_proxy"
+        ), mock.patch.object(guard, "send_telegram_message") as send:
             selected = manager.add_telegram_node(telegram, force_ipv4=False)
-        self.assertEqual(selected, "cancelled")
-        self.assertEqual(telegram, before)
+        self.assertEqual(selected, "fallback_direct")
+        self.assertEqual(telegram["connection_mode"], "direct")
+        self.assertEqual(telegram["node_url"], saved_node)
+        self.assertEqual(telegram["node_urls"], [saved_node, node])
+        self.assertEqual(telegram["subscription_node_urls"], [node])
+        self.assertEqual(send.call_args.args[0]["connection_mode"], "direct")
+        self.assertIn("已自动切换为直连", send.call_args.args[1])
 
     def test_multi_node_menu_selects_requested_node(self):
         first = (

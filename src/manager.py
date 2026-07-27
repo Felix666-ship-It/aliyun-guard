@@ -30,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.7"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -360,19 +360,19 @@ def add_telegram_subscription(telegram, subscription_url, force_ipv4=True):
         return "cancelled"
 
     existing_nodes = guard.telegram_node_urls(telegram)
-    merged_nodes = list(existing_nodes)
-    for node_url in subscription_nodes:
-        if node_url not in merged_nodes:
-            merged_nodes.append(node_url)
+    merged_nodes = guard.set_telegram_subscription_nodes(
+        telegram, subscription_url, subscription_nodes
+    )
+    refreshed_at = time.time()
+    telegram["subscription_last_attempt_epoch"] = refreshed_at
+    telegram["subscription_last_refresh_epoch"] = refreshed_at
 
-    max_probes = 32
-    probe_nodes = subscription_nodes[:max_probes]
     print(
         "订阅解析到 {} 个节点，正在依次检测并自动选择首个可用节点...".format(
             len(subscription_nodes)
         )
     )
-    for index, node_url in enumerate(probe_nodes, 1):
+    for index, node_url in enumerate(subscription_nodes, 1):
         candidate = json.loads(json.dumps(telegram, ensure_ascii=False))
         candidate["node_urls"] = merged_nodes
         candidate["node_url"] = node_url
@@ -383,7 +383,7 @@ def add_telegram_subscription(telegram, subscription_url, force_ipv4=True):
         candidate["retries"] = 1
         print(
             "检测节点 {}/{}: {}".format(
-                index, len(probe_nodes), _saved_node_description(node_url)
+                index, len(subscription_nodes), _saved_node_description(node_url)
             )
         )
         if test_telegram_connection(
@@ -402,13 +402,22 @@ def add_telegram_subscription(telegram, subscription_url, force_ipv4=True):
         telegram_proxy.stop_node_proxy()
 
     telegram_proxy.stop_node_proxy()
-    limit_note = (
-        "（为控制检测时间，本次最多检测前 {} 个节点）".format(max_probes)
-        if len(subscription_nodes) > max_probes
-        else ""
-    )
-    print("订阅节点均无法连接 Telegram，未保存本次导入。{}".format(limit_note))
-    return "cancelled"
+    telegram["connection_mode"] = "direct"
+    notification_text = (
+        "Telegram 节点订阅降级通知\n"
+        "订阅解析到 {} 个节点，但全部检测均无法连接 Telegram。\n"
+        "已自动切换为直连；已保存节点未删除。"
+    ).format(len(subscription_nodes))
+    try:
+        guard.send_telegram_message(telegram, notification_text)
+        print("订阅节点均无法连接 Telegram，已自动切换为直连并发送 Bot 通知。")
+    except Exception as exc:
+        print(
+            "订阅节点均无法连接 Telegram，已自动切换为直连；Bot 通知发送失败: {}".format(
+                guard.compact_error(exc, secrets=guard.telegram_secrets(telegram))
+            )
+        )
+    return "fallback_direct"
 
 
 def add_telegram_node(telegram, force_ipv4=True):
@@ -455,6 +464,16 @@ def delete_telegram_node(telegram, nodes):
         return False
     remaining = [value for value in nodes if value != node_url]
     telegram["node_urls"] = remaining
+    subscription_nodes = [
+        value
+        for value in guard.telegram_subscription_node_urls(telegram)
+        if value != node_url
+    ]
+    telegram["subscription_node_urls"] = subscription_nodes
+    if not subscription_nodes:
+        telegram["subscription_url"] = ""
+        telegram["subscription_last_refresh_epoch"] = 0
+        telegram["subscription_last_attempt_epoch"] = 0
     if str(telegram.get("node_url", "") or "").strip() == node_url:
         telegram["node_url"] = remaining[0] if remaining else ""
         if not remaining and telegram.get("connection_mode") == "node":
@@ -706,7 +725,7 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
             node_action = configure_telegram_nodes(
                 candidate, force_ipv4=force_ipv4
             )
-            if node_action == "subscription":
+            if node_action in ("subscription", "fallback_direct"):
                 return candidate, True
             if node_action == "added":
                 print("正在检测新节点，检测通过后将自动保存...")

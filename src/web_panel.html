@@ -396,6 +396,9 @@
     .panel-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .panel-head h2 { margin: 0; font-size: 15px; }
     .panel-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+    .panel-head-meta { display: grid; justify-items: end; gap: 2px; margin-left: auto; text-align: right; }
+    .panel-head-meta strong { font-size: 13px; }
+    .panel-head-meta span { color: var(--muted); font-size: 11px; }
     .collapsible-panel { overflow: hidden; }
     .collapsible-panel > summary { cursor: pointer; list-style: none; }
     .collapsible-panel > summary::-webkit-details-marker { display: none; }
@@ -668,7 +671,7 @@
           </details>
 
           <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><strong id="nodeCount">0 个节点</strong></summary>
+            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><div class="panel-head-meta"><strong id="nodeCount">0 个节点</strong><span id="subscriptionStatus">未配置订阅</span></div></summary>
             <form id="nodeAddForm" class="panel-body">
               <div class="field"><label for="nodeUrl">节点链接或订阅地址</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://" required></textarea></div>
               <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>导入订阅或测试保存节点</button></div>
@@ -1108,6 +1111,9 @@
       $("apiBaseUrl").placeholder = telegram.api_base_configured ? "已保存，留空不修改" : "https://example.com";
       $("nodeSelect").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<option value="${node.index}" ${node.active ? "selected" : ""}>${esc(node.description)}${node.active ? "（当前）" : ""}</option>`).join("") : '<option value="">尚未保存节点</option>';
       $("nodeCount").textContent = `${telegram.nodes.length} 个节点`;
+      $("subscriptionStatus").textContent = telegram.subscription_configured
+        ? `订阅每 7 天自动更新 · 上次更新：${telegram.subscription_last_refresh_epoch ? fmtDate(telegram.subscription_last_refresh_epoch * 1000) : "等待首次更新"}`
+        : "未配置订阅";
       $("nodeList").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<div class="node-row" data-node-index="${node.index}"><div><div class="node-name">${esc(node.description)}</div><div class="muted small">节点 #${node.index + 1} ${node.active ? '<span class="active-mark">· 当前使用</span>' : ""}</div></div><div class="node-actions"><button class="button secondary" type="button" data-node-action="test">${icon("gauge")}测试</button><button class="button primary" type="button" data-node-action="select">${icon("shield-check")}选用</button><button class="button danger" type="button" data-node-action="delete">${icon("trash-2")}删除</button></div></div>`).join("") : '<div class="node-row muted">尚未保存节点</div>';
       updateConnectionFields();
 

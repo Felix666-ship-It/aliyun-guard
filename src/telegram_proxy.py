@@ -58,7 +58,6 @@ SUPPORTED_NODE_SCHEMES = (
     "anytls",
 )
 MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024
-MAX_SUBSCRIPTION_NODES = 300
 SUBSCRIPTION_TIMEOUT_SECONDS = 20
 
 _PROCESS = None
@@ -560,6 +559,7 @@ def _subscription_request(url, timeout):
 
 def _subscription_nodes_from_text(text):
     nodes = []
+    seen_nodes = set()
     for raw_line in str(text or "").replace("\r", "\n").split("\n"):
         value = raw_line.strip().lstrip("\ufeff")
         if value.startswith("- "):
@@ -572,12 +572,9 @@ def _subscription_nodes_from_text(text):
             parse_node_link(value)
         except ProxyError:
             continue
-        if value not in nodes:
+        if value not in seen_nodes:
+            seen_nodes.add(value)
             nodes.append(value)
-        if len(nodes) > MAX_SUBSCRIPTION_NODES:
-            raise ProxyError(
-                "订阅节点超过 {} 个限制".format(MAX_SUBSCRIPTION_NODES)
-            )
     return nodes
 
 
