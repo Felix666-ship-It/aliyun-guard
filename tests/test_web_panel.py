@@ -205,6 +205,72 @@ class PayloadTests(unittest.TestCase):
             r"^\d{4}-\d{2}-01T00:00:00\+08:00$",
         )
 
+    def test_dashboard_groups_same_account_traffic_once(self):
+        config = make_config()
+        second = copy.deepcopy(config["users"][0])
+        second.update(
+            {
+                "name": "Singapore",
+                "region": "ap-southeast-1",
+                "instance_id": "i-webtest456",
+            }
+        )
+        config["users"].append(second)
+        state = {
+            "instances": {
+                "i-webtest123": {
+                    "traffic_gb": 42.5,
+                    "checked_at": "2026-07-16T12:00:00+08:00",
+                },
+                "i-webtest456": {
+                    "traffic_gb": 42.5,
+                    "checked_at": "2026-07-16T12:00:00+08:00",
+                },
+            }
+        }
+        payload = web_panel.dashboard_payload(guard, config, state)
+        self.assertEqual(len(payload["accounts"]), 1)
+        self.assertEqual(payload["accounts"][0]["traffic_gb"], 42.5)
+        self.assertEqual(payload["accounts"][0]["instance_count"], 2)
+        self.assertEqual(
+            {item["account_index"] for item in payload["users"]}, {0}
+        )
+
+    def test_dashboard_keeps_different_account_traffic_separate(self):
+        config = make_config()
+        second = copy.deepcopy(config["users"][0])
+        second.update(
+            {
+                "name": "Singapore",
+                "ak": "another-access-key-private",
+                "sk": "another-secret-key-private",
+                "region": "ap-southeast-1",
+                "instance_id": "i-webtest456",
+            }
+        )
+        config["users"].append(second)
+        state = {
+            "instances": {
+                "i-webtest123": {
+                    "traffic_gb": 42.5,
+                    "checked_at": "2026-07-16T12:00:00+08:00",
+                },
+                "i-webtest456": {
+                    "traffic_gb": 18.25,
+                    "checked_at": "2026-07-16T12:00:00+08:00",
+                },
+            }
+        }
+        payload = web_panel.dashboard_payload(guard, config, state)
+        self.assertEqual(len(payload["accounts"]), 2)
+        self.assertEqual(
+            [item["traffic_gb"] for item in payload["accounts"]],
+            [42.5, 18.25],
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(second["ak"], serialized)
+        self.assertNotIn(second["sk"], serialized)
+
     def test_dashboard_history_returns_action_details(self):
         config = make_config()
         state = {

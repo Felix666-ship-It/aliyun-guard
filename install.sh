@@ -5714,7 +5714,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5909,6 +5909,7 @@ def dashboard_payload(guard, config=None, state=None, job=None):
     states = _safe_instances(state)
     history = _safe_history(state)
     users = []
+    accounts = {}
     for index, user in enumerate(config.get("users", [])):
         instance_id = str(user.get("instance_id", ""))
         current = states.get(instance_id, {})
@@ -5939,6 +5940,27 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                     }
                 )
         traffic = current.get("traffic_gb")
+        account_key = guard.cdt_account_cache_key(user)
+        account = accounts.get(account_key)
+        checked_at = str(current.get("checked_at") or "")
+        if account is None:
+            account = {
+                "index": len(accounts),
+                "traffic_gb": traffic,
+                "checked_at": checked_at,
+                "instances": [],
+            }
+            accounts[account_key] = account
+        elif traffic is not None and checked_at >= account["checked_at"]:
+            account["traffic_gb"] = traffic
+            account["checked_at"] = checked_at
+        account["instances"].append(
+            {
+                "name": str(user.get("name") or instance_id),
+                "instance_id": instance_id,
+                "region": str(user.get("region", "")),
+            }
+        )
         limit = float(user.get("traffic_limit_gb", 0) or 0)
         percent = None
         if traffic is not None and limit > 0:
@@ -5946,6 +5968,7 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         users.append(
             {
                 "index": index,
+                "account_index": account["index"],
                 "name": str(user.get("name") or instance_id),
                 "instance_id": instance_id,
                 "region": str(user.get("region", "")),
@@ -5992,6 +6015,17 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         except (TypeError, ValueError):
             pass
     web = get_web_config(config)
+    account_payload = [
+        {
+            "index": account["index"],
+            "name": "账号 {}".format(account["index"] + 1),
+            "traffic_gb": account["traffic_gb"],
+            "checked_at": account["checked_at"] or None,
+            "instance_count": len(account["instances"]),
+            "instances": account["instances"],
+        }
+        for account in accounts.values()
+    ]
     next_cdt_reset = guard.next_cdt_reset_at(now)
     return {
         "version": APP_VERSION,
@@ -6000,6 +6034,7 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             "next_at": next_cdt_reset.isoformat(timespec="seconds"),
             "timezone": "UTC+8",
         },
+        "accounts": account_payload,
         "users": users,
         "service": {
             "cycle_count": int(state.get("cycle_count", 0) or 0),
@@ -6532,6 +6567,7 @@ class PanelServer(ThreadingHTTPServer):
                 "error": None,
                 "dry_run": dry_run,
             }
+            started_job = dict(self.job)
 
         def worker():
             error = None
@@ -6550,7 +6586,7 @@ class PanelServer(ThreadingHTTPServer):
                 self.job["error"] = error
 
         threading.Thread(target=worker, name="aliyun-guard-web-cycle", daemon=True).start()
-        return dict(self.job)
+        return started_job
 
     def start_billing_job(self):
         with self.job_lock:
@@ -7460,6 +7496,15 @@ __AG_WEB_PY_EOF__
     .summary-item:last-child { border-right: 0; }
     .summary-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
     .summary-value { margin-top: 5px; font-size: 20px; font-weight: 750; overflow-wrap: anywhere; }
+    .account-traffic { margin-bottom: 18px; }
+    .account-traffic-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .account-traffic-head h2 { margin: 0; font-size: 15px; }
+    .account-traffic-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+    .account-traffic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+    .account-traffic-card { padding: 14px 15px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+    .account-traffic-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .account-traffic-value { margin-top: 8px; font-size: 24px; font-weight: 760; }
+    .account-traffic-meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     .notice {
       display: flex;
       align-items: flex-start;
@@ -7849,6 +7894,10 @@ __AG_WEB_PY_EOF__
           <div class="summary-item"><div class="summary-label"><span data-icon="triangle-alert"></span>异常</div><div class="summary-value" id="summaryErrors">0</div></div>
           <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
         </div>
+        <section class="account-traffic">
+          <div class="account-traffic-head"><div><h2>账号 CDT 总流量</h2><p>CDT 是账号级流量；同一账号下多台 ECS 只读取并展示一次，不跨账号合并。</p></div></div>
+          <div id="accountTraffic" class="account-traffic-grid"></div>
+        </section>
         <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
         <div id="instances" class="instances"></div>
       </section>
@@ -8276,7 +8325,7 @@ __AG_WEB_PY_EOF__
         </div>
         <div class="card-body">
           <div class="metric-grid">
-            <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">账号 ${item.account_index + 1} CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
@@ -8295,6 +8344,10 @@ __AG_WEB_PY_EOF__
       state.dashboard = data;
       $("appVersion").textContent = `Web Console v${data.version}`;
       $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
+      $("accountTraffic").innerHTML = data.accounts && data.accounts.length ? data.accounts.map(account => {
+        const instances = account.instances.map(item => `${esc(item.name)}（${esc(item.region)}）`).join("、");
+        return `<article class="account-traffic-card"><div class="account-traffic-top"><strong>${esc(account.name)}</strong><span class="status-badge">${account.instance_count} 台 ECS</span></div><div class="account-traffic-value">${account.traffic_gb === null ? "--" : fmtNum(account.traffic_gb) + " GB"}</div><div class="account-traffic-meta">所属实例：${instances || "无"}${account.checked_at ? ` · 检测于 ${fmtDate(account.checked_at)}` : " · 等待首次检测"}</div></article>`;
+      }).join("") : '<div class="empty"><div><p>暂无账号流量数据</p></div></div>';
       $("summaryInstances").textContent = data.users.length;
       $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
       $("summaryErrors").textContent = data.users.filter(x => x.level === "error").length;
@@ -12085,8 +12138,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.8"
-LOCAL_RELEASE_ID = "d1d0e7b9ebfd86c9037b7443148164d10e8a59e9fbcf82b74b68dfac6f111500"
+APP_VERSION = "1.6.9"
+LOCAL_RELEASE_ID = "09242a74101fbe8fc096aaf73fa4164efef90de3d13bc490eb21562cd8a42df3"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
