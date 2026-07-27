@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.10-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.9-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -14,7 +14,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 ## 核心能力
 
 - **CDT 流量止损**：流量达到设定阈值后停止 ECS，防止继续产生公网流量。
-- **账号级 CDT 流量**：网页按 AccessKey 凭据分别展示每个账号的“总流量”和“已使用流量”；总流量取同账号实例阈值最大值，已使用流量取账号级 CDT 查询结果。同一账号只读取一次，也不与其他账号相加。
+- **账号级 CDT 总流量**：网页按 AccessKey 凭据分别展示每个账号的 CDT 月度流量；同一账号配置多台 ECS 时只读取一次，不按单机拆分，也不与其他账号相加。
 - **自动保活恢复**：流量低于阈值而实例处于 `Stopped` 时自动启动；次月 CDT 重置后可自动恢复。
 - **月度额度重置检测**：网页显示下次 CDT 自然月重置倒计时；进入北京时间每月 1 日后额外检测一次，同月去重且与常规检测、计划动作合并执行。
 - **每日定时开关机**：每个实例可独立设置 `HH:MM` 开机和关机时间，支持跨午夜时段、下一动作预览和服务离线后的补偿执行。
@@ -68,7 +68,7 @@ flowchart LR
 | 功能区域 | 网页 | 终端 | Telegram Bot | 自动执行 |
 |---|:---:|:---:|:---:|:---:|
 | CDT 流量、阈值与趋势 | ✅ | ✅ | ✅ | ✅ |
-| 各账号 CDT 总流量与已使用流量独立展示 | ✅ | — | — | ✅ |
+| 各账号 CDT 总流量独立展示 | ✅ | — | — | ✅ |
 | 月度额度重置倒计时 | ✅ | — | — | ✅ 月初补检 |
 | ECS 开关机与每日计划 | ✅ | ✅ | ✅ | ✅ |
 | BSS 账单与缓存刷新 | ✅ | ✅ | 状态查看 | ✅ |

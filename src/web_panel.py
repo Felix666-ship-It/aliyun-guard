@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -263,7 +263,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             account = {
                 "index": len(accounts),
                 "traffic_gb": traffic,
-                "traffic_limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
                 "checked_at": checked_at,
                 "instances": [],
             }
@@ -271,10 +270,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         elif traffic is not None and checked_at >= account["checked_at"]:
             account["traffic_gb"] = traffic
             account["checked_at"] = checked_at
-        account["traffic_limit_gb"] = max(
-            account["traffic_limit_gb"],
-            float(user.get("traffic_limit_gb", 0) or 0),
-        )
         account["instances"].append(
             {
                 "name": str(user.get("name") or instance_id),
@@ -341,7 +336,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             "index": account["index"],
             "name": "账号 {}".format(account["index"] + 1),
             "traffic_gb": account["traffic_gb"],
-            "traffic_limit_gb": account["traffic_limit_gb"],
             "checked_at": account["checked_at"] or None,
             "instance_count": len(account["instances"]),
             "instances": account["instances"],

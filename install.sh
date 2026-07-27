@@ -5714,7 +5714,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5947,7 +5947,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             account = {
                 "index": len(accounts),
                 "traffic_gb": traffic,
-                "traffic_limit_gb": float(user.get("traffic_limit_gb", 0) or 0),
                 "checked_at": checked_at,
                 "instances": [],
             }
@@ -5955,10 +5954,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         elif traffic is not None and checked_at >= account["checked_at"]:
             account["traffic_gb"] = traffic
             account["checked_at"] = checked_at
-        account["traffic_limit_gb"] = max(
-            account["traffic_limit_gb"],
-            float(user.get("traffic_limit_gb", 0) or 0),
-        )
         account["instances"].append(
             {
                 "name": str(user.get("name") or instance_id),
@@ -6025,7 +6020,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             "index": account["index"],
             "name": "账号 {}".format(account["index"] + 1),
             "traffic_gb": account["traffic_gb"],
-            "traffic_limit_gb": account["traffic_limit_gb"],
             "checked_at": account["checked_at"] or None,
             "instance_count": len(account["instances"]),
             "instances": account["instances"],
@@ -7509,9 +7503,7 @@ __AG_WEB_PY_EOF__
     .account-traffic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
     .account-traffic-card { padding: 14px 15px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
     .account-traffic-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .account-traffic-values { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
-    .account-traffic-value { font-size: 20px; font-weight: 760; }
-    .account-traffic-label { color: var(--muted); font-size: 11px; }
+    .account-traffic-value { margin-top: 8px; font-size: 24px; font-weight: 760; }
     .account-traffic-meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     .notice {
       display: flex;
@@ -7903,7 +7895,7 @@ __AG_WEB_PY_EOF__
           <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
         </div>
         <section class="account-traffic">
-          <div class="account-traffic-head"><div><h2>账号 CDT 流量</h2><p>总流量取同账号实例阈值的最大值；已使用流量取账号级 CDT 查询结果。同一账号只读取一次，不跨账号合并。</p></div></div>
+          <div class="account-traffic-head"><div><h2>账号 CDT 总流量</h2><p>CDT 是账号级流量；同一账号下多台 ECS 只读取并展示一次，不跨账号合并。</p></div></div>
           <div id="accountTraffic" class="account-traffic-grid"></div>
         </section>
         <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
@@ -8354,7 +8346,7 @@ __AG_WEB_PY_EOF__
       $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
       $("accountTraffic").innerHTML = data.accounts && data.accounts.length ? data.accounts.map(account => {
         const instances = account.instances.map(item => `${esc(item.name)}（${esc(item.region)}）`).join("、");
-        return `<article class="account-traffic-card"><div class="account-traffic-top"><strong>${esc(account.name)}</strong><span class="status-badge">${account.instance_count} 台 ECS</span></div><div class="account-traffic-values"><div><div class="account-traffic-label">总流量</div><div class="account-traffic-value">${fmtNum(account.traffic_limit_gb)} GB</div></div><div><div class="account-traffic-label">已使用流量</div><div class="account-traffic-value">${account.traffic_gb === null ? "--" : fmtNum(account.traffic_gb) + " GB"}</div></div></div><div class="account-traffic-meta">所属实例：${instances || "无"}${account.checked_at ? ` · 检测于 ${fmtDate(account.checked_at)}` : " · 等待首次检测"}</div></article>`;
+        return `<article class="account-traffic-card"><div class="account-traffic-top"><strong>${esc(account.name)}</strong><span class="status-badge">${account.instance_count} 台 ECS</span></div><div class="account-traffic-value">${account.traffic_gb === null ? "--" : fmtNum(account.traffic_gb) + " GB"}</div><div class="account-traffic-meta">所属实例：${instances || "无"}${account.checked_at ? ` · 检测于 ${fmtDate(account.checked_at)}` : " · 等待首次检测"}</div></article>`;
       }).join("") : '<div class="empty"><div><p>暂无账号流量数据</p></div></div>';
       $("summaryInstances").textContent = data.users.length;
       $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
@@ -12146,8 +12138,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.10"
-LOCAL_RELEASE_ID = "7070c9897e8f1e10cb47f0b30e6baf920ab3e182054866704d1bc976b45ca9c6"
+APP_VERSION = "1.6.9"
+LOCAL_RELEASE_ID = "09242a74101fbe8fc096aaf73fa4164efef90de3d13bc490eb21562cd8a42df3"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
