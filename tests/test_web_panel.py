@@ -213,6 +213,7 @@ class PayloadTests(unittest.TestCase):
                 "name": "Singapore",
                 "region": "ap-southeast-1",
                 "instance_id": "i-webtest456",
+                "traffic_limit_gb": 300,
             }
         )
         config["users"].append(second)
@@ -231,6 +232,7 @@ class PayloadTests(unittest.TestCase):
         payload = web_panel.dashboard_payload(guard, config, state)
         self.assertEqual(len(payload["accounts"]), 1)
         self.assertEqual(payload["accounts"][0]["traffic_gb"], 42.5)
+        self.assertEqual(payload["accounts"][0]["traffic_limit_gb"], 300.0)
         self.assertEqual(payload["accounts"][0]["instance_count"], 2)
         self.assertEqual(
             {item["account_index"] for item in payload["users"]}, {0}
@@ -266,6 +268,10 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(
             [item["traffic_gb"] for item in payload["accounts"]],
             [42.5, 18.25],
+        )
+        self.assertEqual(
+            [item["traffic_limit_gb"] for item in payload["accounts"]],
+            [180.0, 180.0],
         )
         serialized = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn(second["ak"], serialized)
