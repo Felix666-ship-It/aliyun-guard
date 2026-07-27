@@ -231,15 +231,6 @@
     .summary-item:last-child { border-right: 0; }
     .summary-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
     .summary-value { margin-top: 5px; font-size: 20px; font-weight: 750; overflow-wrap: anywhere; }
-    .account-traffic { margin-bottom: 18px; }
-    .account-traffic-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-    .account-traffic-head h2 { margin: 0; font-size: 15px; }
-    .account-traffic-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
-    .account-traffic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
-    .account-traffic-card { padding: 14px 15px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
-    .account-traffic-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .account-traffic-value { margin-top: 8px; font-size: 24px; font-weight: 760; }
-    .account-traffic-meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
     .notice {
       display: flex;
       align-items: flex-start;
@@ -629,10 +620,6 @@
           <div class="summary-item"><div class="summary-label"><span data-icon="triangle-alert"></span>异常</div><div class="summary-value" id="summaryErrors">0</div></div>
           <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
         </div>
-        <section class="account-traffic">
-          <div class="account-traffic-head"><div><h2>账号 CDT 总流量</h2><p>CDT 是账号级流量；同一账号下多台 ECS 只读取并展示一次，不跨账号合并。</p></div></div>
-          <div id="accountTraffic" class="account-traffic-grid"></div>
-        </section>
         <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
         <div id="instances" class="instances"></div>
       </section>
@@ -1060,7 +1047,7 @@
         </div>
         <div class="card-body">
           <div class="metric-grid">
-            <div class="metric"><div class="metric-label">账号 ${item.account_index + 1} CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
+            <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
@@ -1079,10 +1066,6 @@
       state.dashboard = data;
       $("appVersion").textContent = `Web Console v${data.version}`;
       $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
-      $("accountTraffic").innerHTML = data.accounts && data.accounts.length ? data.accounts.map(account => {
-        const instances = account.instances.map(item => `${esc(item.name)}（${esc(item.region)}）`).join("、");
-        return `<article class="account-traffic-card"><div class="account-traffic-top"><strong>${esc(account.name)}</strong><span class="status-badge">${account.instance_count} 台 ECS</span></div><div class="account-traffic-value">${account.traffic_gb === null ? "--" : fmtNum(account.traffic_gb) + " GB"}</div><div class="account-traffic-meta">所属实例：${instances || "无"}${account.checked_at ? ` · 检测于 ${fmtDate(account.checked_at)}` : " · 等待首次检测"}</div></article>`;
-      }).join("") : '<div class="empty"><div><p>暂无账号流量数据</p></div></div>';
       $("summaryInstances").textContent = data.users.length;
       $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
       $("summaryErrors").textContent = data.users.filter(x => x.level === "error").length;

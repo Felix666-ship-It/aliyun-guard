@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.8"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -225,7 +225,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
     states = _safe_instances(state)
     history = _safe_history(state)
     users = []
-    accounts = {}
     for index, user in enumerate(config.get("users", [])):
         instance_id = str(user.get("instance_id", ""))
         current = states.get(instance_id, {})
@@ -256,27 +255,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                     }
                 )
         traffic = current.get("traffic_gb")
-        account_key = guard.cdt_account_cache_key(user)
-        account = accounts.get(account_key)
-        checked_at = str(current.get("checked_at") or "")
-        if account is None:
-            account = {
-                "index": len(accounts),
-                "traffic_gb": traffic,
-                "checked_at": checked_at,
-                "instances": [],
-            }
-            accounts[account_key] = account
-        elif traffic is not None and checked_at >= account["checked_at"]:
-            account["traffic_gb"] = traffic
-            account["checked_at"] = checked_at
-        account["instances"].append(
-            {
-                "name": str(user.get("name") or instance_id),
-                "instance_id": instance_id,
-                "region": str(user.get("region", "")),
-            }
-        )
         limit = float(user.get("traffic_limit_gb", 0) or 0)
         percent = None
         if traffic is not None and limit > 0:
@@ -284,7 +262,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         users.append(
             {
                 "index": index,
-                "account_index": account["index"],
                 "name": str(user.get("name") or instance_id),
                 "instance_id": instance_id,
                 "region": str(user.get("region", "")),
@@ -331,17 +308,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         except (TypeError, ValueError):
             pass
     web = get_web_config(config)
-    account_payload = [
-        {
-            "index": account["index"],
-            "name": "账号 {}".format(account["index"] + 1),
-            "traffic_gb": account["traffic_gb"],
-            "checked_at": account["checked_at"] or None,
-            "instance_count": len(account["instances"]),
-            "instances": account["instances"],
-        }
-        for account in accounts.values()
-    ]
     next_cdt_reset = guard.next_cdt_reset_at(now)
     return {
         "version": APP_VERSION,
@@ -350,7 +316,6 @@ def dashboard_payload(guard, config=None, state=None, job=None):
             "next_at": next_cdt_reset.isoformat(timespec="seconds"),
             "timezone": "UTC+8",
         },
-        "accounts": account_payload,
         "users": users,
         "service": {
             "cycle_count": int(state.get("cycle_count", 0) or 0),
@@ -883,7 +848,6 @@ class PanelServer(ThreadingHTTPServer):
                 "error": None,
                 "dry_run": dry_run,
             }
-            started_job = dict(self.job)
 
         def worker():
             error = None
@@ -902,7 +866,7 @@ class PanelServer(ThreadingHTTPServer):
                 self.job["error"] = error
 
         threading.Thread(target=worker, name="aliyun-guard-web-cycle", daemon=True).start()
-        return started_job
+        return dict(self.job)
 
     def start_billing_job(self):
         with self.job_lock:
