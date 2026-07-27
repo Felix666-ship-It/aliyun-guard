@@ -1018,6 +1018,12 @@
       const billTitle = item.bill_checked_at ? ` title="账单数据时间：${esc(fmtDate(item.bill_checked_at))}${item.bill_from_cache ? "（缓存）" : ""}${item.bill_error ? `；${esc(item.bill_error)}` : ""}"` : "";
       const sched = item.schedule.enabled ? `${esc(item.schedule.start_time)} - ${esc(item.schedule.stop_time)}` : "已关闭";
       const next = item.schedule.next_at ? `${item.schedule.next_action === "start" ? "开机" : "关机"} ${fmtDate(item.schedule.next_at)}` : "无计划";
+      const resetAt = state.dashboard?.cdt_reset?.next_at;
+      const resetMs = resetAt ? new Date(resetAt).getTime() - Date.now() : NaN;
+      const resetDays = Number.isFinite(resetMs) ? Math.max(0, Math.floor(resetMs / 86400000)) : null;
+      const resetHours = Number.isFinite(resetMs) ? Math.max(0, Math.floor((resetMs % 86400000) / 3600000)) : null;
+      const resetText = resetDays === null ? "--" : `${resetDays}天${String(resetHours).padStart(2, "0")}小时`;
+      const resetTitle = resetAt ? ` title="北京时间 ${esc(fmtDate(resetAt))} 自动额外检测一次"` : "";
       const powerAction = item.status === "Running" ? "stop" : "start";
       const powerLabel = powerAction === "start" ? "开机" : "关机";
       return `<article class="instance-card" data-index="${item.index}">
@@ -1045,6 +1051,7 @@
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
+            <div class="metric"${resetTitle}><div class="metric-label">额度重置</div><div class="metric-value">${resetText}</div></div>
           </div>
           <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
           <div class="progress"><span class="${barClass}" style="width:${percent}%"></span></div>

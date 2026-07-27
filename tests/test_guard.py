@@ -424,6 +424,73 @@ class ScheduleTests(unittest.TestCase):
         saved = old["instances"]["i-test123"]
         self.assertEqual(saved["schedule_target"], "stopped")
 
+    def test_cdt_reset_due_only_after_beijing_month_changes(self):
+        before_reset = dt.datetime(
+            2026, 7, 31, 23, 59, tzinfo=guard.CDT_TIMEZONE
+        )
+        after_reset = dt.datetime(
+            2026, 8, 1, 0, 0, tzinfo=guard.CDT_TIMEZONE
+        )
+        state = {"cdt_month_checked": "2026-07"}
+        self.assertFalse(guard.cdt_monthly_reset_due(state, before_reset))
+        self.assertTrue(guard.cdt_monthly_reset_due(state, after_reset))
+
+    def test_cdt_reset_due_uses_previous_cycle_for_legacy_state(self):
+        state = {"last_cycle_started_at": "2026-07-31T23:59:00+08:00"}
+        now = dt.datetime(2026, 8, 1, 0, 0, tzinfo=guard.CDT_TIMEZONE)
+        self.assertTrue(guard.cdt_monthly_reset_due(state, now))
+
+    def test_cdt_reset_due_does_not_trigger_without_previous_cycle(self):
+        now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=guard.CDT_TIMEZONE)
+        self.assertFalse(guard.cdt_monthly_reset_due({}, now))
+
+    def test_update_state_marks_current_cdt_month_once(self):
+        state = {}
+        guard.update_state(
+            state,
+            [],
+            dt.datetime(2026, 8, 1, 0, 0, tzinfo=guard.CDT_TIMEZONE),
+            0.1,
+            "完成",
+            0,
+        )
+        self.assertEqual(state["cdt_month_checked"], "2026-08")
+        self.assertFalse(
+            guard.cdt_monthly_reset_due(
+                state,
+                dt.datetime(2026, 8, 1, 0, 1, tzinfo=guard.CDT_TIMEZONE),
+            )
+        )
+
+    def test_scheduled_runner_bypasses_interval_for_cdt_month_reset(self):
+        user = self.scheduled_user()
+        config = make_config(user)
+        state = {"cdt_month_checked": "2026-07", "instances": {}}
+        lock = mock.MagicMock()
+        lock.__enter__.return_value = True
+        lock.__exit__.return_value = False
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            guard, "APP_DIR", Path(directory)
+        ), mock.patch.object(
+            guard, "cycle_lock", return_value=lock
+        ), mock.patch.object(
+            guard, "load_config", return_value=config
+        ), mock.patch.object(
+            guard, "load_state", return_value=state
+        ), mock.patch.object(
+            guard, "is_due", return_value=False
+        ), mock.patch.object(
+            guard, "has_due_schedule", return_value=False
+        ), mock.patch.object(
+            guard, "cdt_monthly_reset_due", return_value=True
+        ), mock.patch.object(
+            guard, "run_cycle", return_value=0
+        ) as run:
+            code = guard.run_scheduled()
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertIn("started_at", run.call_args.kwargs)
+
     def test_scheduled_runner_bypasses_interval_for_schedule_transition(self):
         user = self.scheduled_user()
         config = make_config(user)

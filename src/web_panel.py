@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -308,9 +308,14 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         except (TypeError, ValueError):
             pass
     web = get_web_config(config)
+    next_cdt_reset = guard.next_cdt_reset_at(now)
     return {
         "version": APP_VERSION,
         "now": now.isoformat(timespec="seconds"),
+        "cdt_reset": {
+            "next_at": next_cdt_reset.isoformat(timespec="seconds"),
+            "timezone": "UTC+8",
+        },
         "users": users,
         "service": {
             "cycle_count": int(state.get("cycle_count", 0) or 0),

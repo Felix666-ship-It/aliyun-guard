@@ -63,6 +63,7 @@ LOG_FILE = LOG_DIR / "guard.log"
 SUBSCRIPTION_REFRESH_SECONDS = 7 * 24 * 60 * 60
 SUBSCRIPTION_RETRY_SECONDS = 60 * 60
 SUBSCRIPTION_NODE_FAILURE_LOG_LIMIT = 20
+CDT_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
 
 DEFAULT_CONFIG = {
     "version": 2,
@@ -2192,6 +2193,7 @@ def update_state(
     state["telegram_error"] = notify_error
     if not dry_run:
         state["last_cycle_epoch"] = started_at.timestamp()
+        state["cdt_month_checked"] = cdt_month_key(started_at)
     if not isinstance(state.get("instances"), dict):
         state["instances"] = {}
     for item in results:
@@ -2444,6 +2446,49 @@ def is_due(config, state, now=None):
     return now - float(last) >= int(config["interval_seconds"])
 
 
+def cdt_month_key(now=None):
+    now = now or dt.datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CDT_TIMEZONE)
+    return now.astimezone(CDT_TIMEZONE).strftime("%Y-%m")
+
+
+def next_cdt_reset_at(now=None):
+    now = now or dt.datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CDT_TIMEZONE)
+    now = now.astimezone(CDT_TIMEZONE)
+    if now.month == 12:
+        return dt.datetime(now.year + 1, 1, 1, tzinfo=CDT_TIMEZONE)
+    return dt.datetime(now.year, now.month + 1, 1, tzinfo=CDT_TIMEZONE)
+
+
+def cdt_monthly_reset_due(state, now=None):
+    now = now or dt.datetime.now().astimezone()
+    current_month = cdt_month_key(now)
+    checked_month = str(state.get("cdt_month_checked", "") or "")
+    if checked_month:
+        return checked_month != current_month
+
+    previous = state.get("last_cycle_started_at") or state.get(
+        "last_cycle_finished_at"
+    )
+    if previous:
+        try:
+            return cdt_month_key(dt.datetime.fromisoformat(str(previous))) != current_month
+        except (TypeError, ValueError):
+            pass
+
+    last_epoch = state.get("last_cycle_epoch")
+    if last_epoch is not None:
+        try:
+            previous = dt.datetime.fromtimestamp(float(last_epoch), tz=dt.timezone.utc)
+            return cdt_month_key(previous) != current_month
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return False
+
+
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
@@ -2469,8 +2514,10 @@ def run_scheduled():
                     ),
                 )
             state = load_state()
-            if is_due(config, state, now.timestamp()) or has_due_schedule(
-                config, state, now
+            if (
+                is_due(config, state, now.timestamp())
+                or has_due_schedule(config, state, now)
+                or cdt_monthly_reset_due(state, now)
             ):
                 result = run_cycle(started_at=now)
     run_s3_backup_if_due(config, now)
@@ -2640,6 +2687,7 @@ def run_daemon():
                         first_cycle
                         or is_due(config, state, now.timestamp())
                         or has_due_schedule(config, state, now)
+                        or cdt_monthly_reset_due(state, now)
                     ):
                         run_cycle(started_at=now)
                 except Exception as exc:

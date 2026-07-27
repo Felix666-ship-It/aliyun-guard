@@ -5714,7 +5714,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5992,9 +5992,14 @@ def dashboard_payload(guard, config=None, state=None, job=None):
         except (TypeError, ValueError):
             pass
     web = get_web_config(config)
+    next_cdt_reset = guard.next_cdt_reset_at(now)
     return {
         "version": APP_VERSION,
         "now": now.isoformat(timespec="seconds"),
+        "cdt_reset": {
+            "next_at": next_cdt_reset.isoformat(timespec="seconds"),
+            "timezone": "UTC+8",
+        },
         "users": users,
         "service": {
             "cycle_count": int(state.get("cycle_count", 0) or 0),
@@ -8242,6 +8247,12 @@ __AG_WEB_PY_EOF__
       const billTitle = item.bill_checked_at ? ` title="账单数据时间：${esc(fmtDate(item.bill_checked_at))}${item.bill_from_cache ? "（缓存）" : ""}${item.bill_error ? `；${esc(item.bill_error)}` : ""}"` : "";
       const sched = item.schedule.enabled ? `${esc(item.schedule.start_time)} - ${esc(item.schedule.stop_time)}` : "已关闭";
       const next = item.schedule.next_at ? `${item.schedule.next_action === "start" ? "开机" : "关机"} ${fmtDate(item.schedule.next_at)}` : "无计划";
+      const resetAt = state.dashboard?.cdt_reset?.next_at;
+      const resetMs = resetAt ? new Date(resetAt).getTime() - Date.now() : NaN;
+      const resetDays = Number.isFinite(resetMs) ? Math.max(0, Math.floor(resetMs / 86400000)) : null;
+      const resetHours = Number.isFinite(resetMs) ? Math.max(0, Math.floor((resetMs % 86400000) / 3600000)) : null;
+      const resetText = resetDays === null ? "--" : `${resetDays}天${String(resetHours).padStart(2, "0")}小时`;
+      const resetTitle = resetAt ? ` title="北京时间 ${esc(fmtDate(resetAt))} 自动额外检测一次"` : "";
       const powerAction = item.status === "Running" ? "stop" : "start";
       const powerLabel = powerAction === "start" ? "开机" : "关机";
       return `<article class="instance-card" data-index="${item.index}">
@@ -8269,6 +8280,7 @@ __AG_WEB_PY_EOF__
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
+            <div class="metric"${resetTitle}><div class="metric-label">额度重置</div><div class="metric-value">${resetText}</div></div>
           </div>
           <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
           <div class="progress"><span class="${barClass}" style="width:${percent}%"></span></div>
@@ -9246,6 +9258,7 @@ LOG_FILE = LOG_DIR / "guard.log"
 SUBSCRIPTION_REFRESH_SECONDS = 7 * 24 * 60 * 60
 SUBSCRIPTION_RETRY_SECONDS = 60 * 60
 SUBSCRIPTION_NODE_FAILURE_LOG_LIMIT = 20
+CDT_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
 
 DEFAULT_CONFIG = {
     "version": 2,
@@ -11375,6 +11388,7 @@ def update_state(
     state["telegram_error"] = notify_error
     if not dry_run:
         state["last_cycle_epoch"] = started_at.timestamp()
+        state["cdt_month_checked"] = cdt_month_key(started_at)
     if not isinstance(state.get("instances"), dict):
         state["instances"] = {}
     for item in results:
@@ -11627,6 +11641,49 @@ def is_due(config, state, now=None):
     return now - float(last) >= int(config["interval_seconds"])
 
 
+def cdt_month_key(now=None):
+    now = now or dt.datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CDT_TIMEZONE)
+    return now.astimezone(CDT_TIMEZONE).strftime("%Y-%m")
+
+
+def next_cdt_reset_at(now=None):
+    now = now or dt.datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CDT_TIMEZONE)
+    now = now.astimezone(CDT_TIMEZONE)
+    if now.month == 12:
+        return dt.datetime(now.year + 1, 1, 1, tzinfo=CDT_TIMEZONE)
+    return dt.datetime(now.year, now.month + 1, 1, tzinfo=CDT_TIMEZONE)
+
+
+def cdt_monthly_reset_due(state, now=None):
+    now = now or dt.datetime.now().astimezone()
+    current_month = cdt_month_key(now)
+    checked_month = str(state.get("cdt_month_checked", "") or "")
+    if checked_month:
+        return checked_month != current_month
+
+    previous = state.get("last_cycle_started_at") or state.get(
+        "last_cycle_finished_at"
+    )
+    if previous:
+        try:
+            return cdt_month_key(dt.datetime.fromisoformat(str(previous))) != current_month
+        except (TypeError, ValueError):
+            pass
+
+    last_epoch = state.get("last_cycle_epoch")
+    if last_epoch is not None:
+        try:
+            previous = dt.datetime.fromtimestamp(float(last_epoch), tz=dt.timezone.utc)
+            return cdt_month_key(previous) != current_month
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return False
+
+
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
@@ -11652,8 +11709,10 @@ def run_scheduled():
                     ),
                 )
             state = load_state()
-            if is_due(config, state, now.timestamp()) or has_due_schedule(
-                config, state, now
+            if (
+                is_due(config, state, now.timestamp())
+                or has_due_schedule(config, state, now)
+                or cdt_monthly_reset_due(state, now)
             ):
                 result = run_cycle(started_at=now)
     run_s3_backup_if_due(config, now)
@@ -11823,6 +11882,7 @@ def run_daemon():
                         first_cycle
                         or is_due(config, state, now.timestamp())
                         or has_due_schedule(config, state, now)
+                        or cdt_monthly_reset_due(state, now)
                     ):
                         run_cycle(started_at=now)
                 except Exception as exc:
@@ -12025,8 +12085,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.7"
-LOCAL_RELEASE_ID = "974f0a0f7e2e4983480ab9107fa521d95c7c47f73f7119e1d9261aabaf8a020e"
+APP_VERSION = "1.6.8"
+LOCAL_RELEASE_ID = "d1d0e7b9ebfd86c9037b7443148164d10e8a59e9fbcf82b74b68dfac6f111500"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

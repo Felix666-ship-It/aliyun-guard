@@ -199,6 +199,11 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["users"][0]["history"]), 2)
         self.assertEqual(payload["users"][0]["history"][0]["action"], "none")
         self.assertFalse(payload["users"][0]["history"][0]["action_performed"])
+        self.assertEqual(payload["cdt_reset"]["timezone"], "UTC+8")
+        self.assertRegex(
+            payload["cdt_reset"]["next_at"],
+            r"^\d{4}-\d{2}-01T00:00:00\+08:00$",
+        )
 
     def test_dashboard_history_returns_action_details(self):
         config = make_config()

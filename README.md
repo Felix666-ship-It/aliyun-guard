@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.7-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.8-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -15,6 +15,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 
 - **CDT 流量止损**：流量达到设定阈值后停止 ECS，防止继续产生公网流量。
 - **自动保活恢复**：流量低于阈值而实例处于 `Stopped` 时自动启动；次月 CDT 重置后可自动恢复。
+- **月度额度重置检测**：网页显示下次 CDT 自然月重置倒计时；进入北京时间每月 1 日后额外检测一次，同月去重且与常规检测、计划动作合并执行。
 - **每日定时开关机**：每个实例可独立设置 `HH:MM` 开机和关机时间，支持跨午夜时段、下一动作预览和服务离线后的补偿执行。
 - **完整网页控制台**：终端管理面板的检测、演练、实例增删改查、Telegram 与节点、全局设置、服务重启和 GitHub 更新均可在网页完成；更新过程显示真实阶段进度并自动跨服务重启续接。
 - **可解释流量趋势**：悬停、键盘聚焦或触摸折线检测点，可查看检测时间、当时流量、ECS 状态变化、执行动作和检测结果。
@@ -42,6 +43,37 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 - **低开销长期运行**：同账号同 Region 的 ECS 状态按批查询，Telegram 复用 HTTP 连接，S3/加密重依赖按需加载，频繁心跳写入不再每次强制磁盘同步。
 - **凭据保护**：Token、AccessKey 不写入日志，配置文件权限固定为 `600`。
 
+## 系统架构
+
+```mermaid
+flowchart LR
+    Scheduler[systemd / OpenRC / cron] --> Guard[Aliyun Guard 调度器]
+    Web[网页控制台] --> Guard
+    CLI[终端管理面板] --> Guard
+    Bot[Telegram Bot 控制] --> Guard
+    Guard --> CDT[阿里云 CDT API]
+    Guard --> ECS[阿里云 ECS API]
+    Guard --> BSS[阿里云 BSS API]
+    Guard --> Decision{流量、计划与实例状态决策}
+    Decision --> Action[启动 / 停止 / 保持 ECS]
+    Decision --> State[(状态、历史与独立日志)]
+    State --> Web
+    Decision --> Notify[Telegram 汇总通知]
+    Guard --> Backup[本地加密备份 / AWS S3]
+```
+
+### 功能矩阵
+
+| 功能区域 | 网页 | 终端 | Telegram Bot | 自动执行 |
+|---|:---:|:---:|:---:|:---:|
+| CDT 流量、阈值与趋势 | ✅ | ✅ | ✅ | ✅ |
+| 月度额度重置倒计时 | ✅ | — | — | ✅ 月初补检 |
+| ECS 开关机与每日计划 | ✅ | ✅ | ✅ | ✅ |
+| BSS 账单与缓存刷新 | ✅ | ✅ | 状态查看 | ✅ |
+| 多节点 Telegram 连接 | ✅ | ✅ | — | ✅ 自动刷新 |
+| 加密备份、恢复与回滚 | ✅ | ✅ | — | ✅ 可选 S3 |
+| GitHub 检查更新 | ✅ | ✅ | — | ✅ 启动检查 |
+
 ## 保活逻辑
 
 每个未暂停的实例会依次执行以下只读查询：
@@ -66,6 +98,32 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 - 进入计划运行时段时，只有 CDT 流量低于阈值才允许开机；流量达到阈值时保持关机。
 - 后台每分钟轻量检查一次计划边界，完整 CDT、ECS、BSS 查询仍按“检测间隔”执行。
 - 服务在计划边界暂时离线时，恢复后会比较当前目标时段并补偿执行，不要求刚好在整分钟在线。
+
+### CDT 月度额度重置
+
+CDT 公网流量按北京时间自然月累计。网页实例卡片会显示距离下月 1 日 `00:00 (UTC+8)` 的剩余时间；跨入新月份后，调度器会额外执行一次完整检测，以便尽快读取归零后的流量并恢复符合条件的实例。
+
+```mermaid
+sequenceDiagram
+    participant S as 调度器
+    participant T as 月度状态
+    participant A as 阿里云 API
+    participant E as ECS
+    S->>T: 比较当前 UTC+8 月份与 cdt_month_checked
+    alt 已进入新月份
+        S->>A: 执行一次 CDT / ECS / BSS 检测
+        A-->>S: 返回新自然月流量与实例状态
+        S->>E: 按阈值与每日计划决定启动、停止或保持
+        S->>T: 写入本月月份键，防止重复触发
+    else 仍在同一月份
+        S-->>S: 保持原检测间隔，不增加 API 请求
+    end
+```
+
+- 月初补检与恰好到期的常规检测或计划动作合并为同一轮，不会重复调用 API。
+- 服务在月初离线时，恢复后的首次调度会识别跨月并补检，不要求在 `00:00` 在线。
+- 老版本状态仅在能确认上次有效检测属于上个月时补检，避免升级后在月中误触发。
+- 检测成功后持久化当前月份，服务重启不会导致同月重复补检。
 
 > CDT 返回的是账号级总流量，不是单台 ECS 的独立流量。同一 AccessKey 下配置多台实例时，它们读取到相同流量，但可以设置不同关机阈值。同一轮检测中，使用相同 AccessKey ID 和 AccessKey Secret 的实例只会请求一次 CDT API，查询结果或错误会在该账号的实例间复用；不同凭据不会合并。
 
