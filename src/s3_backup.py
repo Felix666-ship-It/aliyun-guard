@@ -51,10 +51,15 @@ STATE_NAME = "s3-backup-state.json"
 LOCK_NAME = "s3-backup.lock"
 MAX_REMOTE_ITEMS = 5000
 RETRY_SECONDS = 15 * 60
+MAX_STATE_FILE_BYTES = 1024 * 1024
 
 
 class S3BackupError(RuntimeError):
     pass
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _load_boto3():
@@ -105,9 +110,21 @@ def validate_config(value, require_ready=None):
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(config.get("time", ""))):
         raise S3BackupError("S3 备份时间必须是 HH:MM")
     try:
-        config["weekday"] = int(config.get("weekday", 0))
-        config["retention"] = int(config.get("retention", 30))
-    except (TypeError, ValueError) as exc:
+        raw_weekday = config.get("weekday", 0)
+        raw_retention = config.get("retention", 30)
+        if isinstance(raw_weekday, bool) or isinstance(raw_retention, bool):
+            raise ValueError("boolean is not an integer setting")
+        config["weekday"] = int(raw_weekday)
+        config["retention"] = int(raw_retention)
+        if (
+            isinstance(raw_weekday, float)
+            and raw_weekday != config["weekday"]
+        ) or (
+            isinstance(raw_retention, float)
+            and raw_retention != config["retention"]
+        ):
+            raise ValueError("non-integral setting")
+    except (TypeError, ValueError, OverflowError) as exc:
         raise S3BackupError("S3 星期和保留份数必须是整数") from exc
     if config["weekday"] < 0 or config["weekday"] > 6:
         raise S3BackupError("S3 每周备份日期必须在 0 到 6 之间")
@@ -430,9 +447,15 @@ def schedule_slot(value, now=None):
 
 def _read_state(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_STATE_FILE_BYTES + 1)
+        if len(raw) > MAX_STATE_FILE_BYTES:
+            return {}
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -443,10 +466,26 @@ def read_status(app_dir):
 def _write_state(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(str(temporary), 0o600)
-    os.replace(str(temporary), str(path))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                value,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -487,7 +526,12 @@ def run_if_due(value, app_dir, now=None):
         if state.get("last_attempt_slot") == slot:
             try:
                 last_attempt = dt.datetime.fromisoformat(state["last_attempt_at"])
-                if (now - last_attempt).total_seconds() < RETRY_SECONDS:
+                if now.tzinfo is not None and last_attempt.tzinfo is None:
+                    last_attempt = last_attempt.replace(tzinfo=now.tzinfo)
+                elif now.tzinfo is None and last_attempt.tzinfo is not None:
+                    last_attempt = last_attempt.replace(tzinfo=None)
+                elapsed = (now - last_attempt).total_seconds()
+                if 0 <= elapsed < RETRY_SECONDS:
                     return None
             except (KeyError, TypeError, ValueError):
                 pass

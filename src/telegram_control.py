@@ -16,6 +16,8 @@ POLL_TIMEOUT_SECONDS = 20
 RETRY_WAIT_SECONDS = 5
 CONFIRM_TTL_SECONDS = 90
 SCHEDULE_INPUT_TTL_SECONDS = 300
+MAX_UPDATES_PER_POLL = 100
+MAX_TELEGRAM_UPDATE_ID = (1 << 63) - 2
 
 BOT_COMMANDS = [
     {"command": "status", "description": "查看最近检测状态"},
@@ -57,6 +59,29 @@ def _save_offset(guard, fingerprint, offset):
         {"token_fingerprint": fingerprint, "offset": max(0, int(offset))},
         mode=0o600,
     )
+
+
+def _normalize_updates(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("Telegram getUpdates result must be a list")
+    if len(value) > MAX_UPDATES_PER_POLL:
+        raise ValueError("Telegram getUpdates result exceeds the requested limit")
+    updates = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        update_id = item.get("update_id")
+        if (
+            isinstance(update_id, bool)
+            or not isinstance(update_id, int)
+            or update_id < 0
+            or update_id > MAX_TELEGRAM_UPDATE_ID
+        ):
+            continue
+        updates.append(item)
+    return updates
 
 
 def _format_traffic(value):
@@ -1242,6 +1267,8 @@ class TelegramControlService:
         self._answer_callback(telegram, callback_id, "按钮无效", alert=True)
 
     def _handle_update(self, config, telegram, admins, update):
+        if not isinstance(update, dict):
+            return
         if isinstance(update.get("message"), dict):
             self._handle_message(config, telegram, admins, update["message"])
         elif isinstance(update.get("callback_query"), dict):
@@ -1261,16 +1288,18 @@ class TelegramControlService:
         self.fingerprint = fingerprint
         self.offset = None if self.drain_pending else _load_offset(self.guard, fingerprint)
         if self.offset is None:
-            updates = self._telegram_api(
-                telegram,
-                "getUpdates",
-                {
-                    "offset": -1,
-                    "limit": 1,
-                    "timeout": 0,
-                    "allowed_updates": json.dumps(["message", "callback_query"]),
-                },
-            ) or []
+            updates = _normalize_updates(
+                self._telegram_api(
+                    telegram,
+                    "getUpdates",
+                    {
+                        "offset": -1,
+                        "limit": 1,
+                        "timeout": 0,
+                        "allowed_updates": json.dumps(["message", "callback_query"]),
+                    },
+                )
+            )
             self.offset = (
                 max(int(item.get("update_id", -1)) for item in updates) + 1
                 if updates
@@ -1305,17 +1334,21 @@ class TelegramControlService:
                         self.stop_event.wait(RETRY_WAIT_SECONDS)
                         continue
                     self._prepare_token(telegram)
-                    updates = self._telegram_api(
-                        telegram,
-                        "getUpdates",
-                        {
-                            "offset": self.offset,
-                            "limit": 100,
-                            "timeout": POLL_TIMEOUT_SECONDS,
-                            "allowed_updates": json.dumps(["message", "callback_query"]),
-                        },
-                        long_poll=True,
-                    ) or []
+                    updates = _normalize_updates(
+                        self._telegram_api(
+                            telegram,
+                            "getUpdates",
+                            {
+                                "offset": self.offset,
+                                "limit": 100,
+                                "timeout": POLL_TIMEOUT_SECONDS,
+                                "allowed_updates": json.dumps(
+                                    ["message", "callback_query"]
+                                ),
+                            },
+                            long_poll=True,
+                        )
+                    )
                     if updates:
                         self.offset = max(
                             int(item.get("update_id", -1)) for item in updates

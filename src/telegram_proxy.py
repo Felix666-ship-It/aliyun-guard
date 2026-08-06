@@ -58,6 +58,10 @@ SUPPORTED_NODE_SCHEMES = (
     "anytls",
 )
 MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024
+MAX_NODE_LINK_LENGTH = 16 * 1024
+MAX_SUBSCRIPTION_NODES = 512
+MAX_SAVED_NODES = 512
+MAX_SING_BOX_ARCHIVE_BYTES = 64 * 1024 * 1024
 SUBSCRIPTION_TIMEOUT_SECONDS = 20
 
 _PROCESS = None
@@ -400,6 +404,8 @@ def parse_anytls_link(link):
 
 def parse_node_link(link):
     link = str(link or "").strip()
+    if len(link) > MAX_NODE_LINK_LENGTH:
+        raise ProxyError("节点链接超过长度限制")
     try:
         scheme = urllib.parse.urlsplit(link).scheme.lower()
         if scheme == "vless":
@@ -575,6 +581,12 @@ def _subscription_nodes_from_text(text):
         if value not in seen_nodes:
             seen_nodes.add(value)
             nodes.append(value)
+            if len(nodes) > MAX_SUBSCRIPTION_NODES:
+                raise ProxyError(
+                    "订阅节点数量超过 {} 个限制".format(
+                        MAX_SUBSCRIPTION_NODES
+                    )
+                )
     return nodes
 
 
@@ -743,12 +755,24 @@ def install_sing_box(progress=None):
         request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Installer"})
         try:
             with urllib.request.urlopen(request, timeout=90) as response, archive_path.open("wb") as handle:
+                content_length = response.getheader("Content-Length")
+                if (
+                    content_length
+                    and int(content_length) > MAX_SING_BOX_ARCHIVE_BYTES
+                ):
+                    raise ProxyError("sing-box 压缩包超过大小限制")
+                downloaded = 0
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
+                    downloaded += len(chunk)
+                    if downloaded > MAX_SING_BOX_ARCHIVE_BYTES:
+                        raise ProxyError("sing-box 压缩包超过大小限制")
                     digest.update(chunk)
                     handle.write(chunk)
+        except ProxyError:
+            raise
         except Exception as exc:
             raise ProxyError("sing-box 下载失败: {}".format(exc))
         if digest.hexdigest() != expected_sha256:
@@ -764,13 +788,19 @@ def install_sing_box(progress=None):
                 source = archive.extractfile(members[0])
                 if source is None:
                     raise ProxyError("无法读取 sing-box 可执行文件")
-                temporary_binary = bin_dir / "sing-box.tmp"
-                with temporary_binary.open("wb") as target:
-                    shutil.copyfileobj(source, target)
-                    target.flush()
-                    os.fsync(target.fileno())
-                os.chmod(str(temporary_binary), 0o700)
-                os.replace(str(temporary_binary), str(SING_BOX_BINARY))
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".sing-box-", suffix=".tmp", dir=str(bin_dir)
+                )
+                temporary_binary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    os.chmod(str(temporary_binary), 0o700)
+                    os.replace(str(temporary_binary), str(SING_BOX_BINARY))
+                finally:
+                    temporary_binary.unlink(missing_ok=True)
         except ProxyError:
             raise
         except Exception as exc:

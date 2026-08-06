@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import math
 import os
 from pathlib import Path
 import re
@@ -133,11 +134,47 @@ _CONFIG_THREAD_LOCK = threading.RLock()
 _JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
+MAX_MONITORED_INSTANCES = 256
+MAX_DISCOVERED_INSTANCES = 5000
+MAX_HISTORY_ENTRIES = 96
+MAX_TELEGRAM_RESPONSE_BYTES = 1024 * 1024
+MAX_ALIYUN_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_JSON_FILE_BYTES = 8 * 1024 * 1024
+USER_TEXT_LIMITS = {
+    "name": 200,
+    "ak": 256,
+    "sk": 512,
+    "region": 128,
+    "instance_id": 256,
+}
 _TELEGRAM_LOCAL = threading.local()
 
 
 class GuardError(RuntimeError):
     pass
+
+
+def _decode_json_object(payload, label="API"):
+    """Decode one bounded SDK response and require a JSON object envelope."""
+    if isinstance(payload, str):
+        try:
+            raw = payload.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise GuardError("{} response is not valid UTF-8".format(label)) from exc
+    elif isinstance(payload, (bytes, bytearray, memoryview)):
+        raw = bytes(payload)
+    else:
+        raise GuardError("{} response body is invalid".format(label))
+    if len(raw) > MAX_ALIYUN_RESPONSE_BYTES:
+        raise GuardError("{} response exceeds 8 MiB".format(label))
+    try:
+        text = raw.decode("utf-8")
+        data = json.loads(text)
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise GuardError("{} returned invalid JSON".format(label)) from exc
+    if not isinstance(data, dict):
+        raise GuardError("{} response root must be an object".format(label))
+    return data
 
 
 def configure_logging(console=True):
@@ -279,13 +316,27 @@ def telegram_control_admin_ids(telegram):
     return [chat_id] if chat_id > 0 else []
 
 
+def _reject_json_constant(constant):
+    raise ValueError("不支持的 JSON 数值: {}".format(constant))
+
+
 def load_json(path, default):
+    path = Path(path)
     if not path.exists():
         return json.loads(json.dumps(default))
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (OSError, ValueError) as exc:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_JSON_FILE_BYTES + 1)
+        if len(raw) > MAX_JSON_FILE_BYTES:
+            raise GuardError("{} 超过 {} MiB 限制".format(
+                path, MAX_JSON_FILE_BYTES // (1024 * 1024)
+            ))
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
+    except GuardError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise GuardError("无法读取 {}: {}".format(path, exc))
     if not isinstance(value, dict):
         raise GuardError("{} 的顶层必须是 JSON 对象".format(path))
@@ -317,7 +368,14 @@ def atomic_write_json(path, value, mode=0o600, durable=True):
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
+                json.dump(
+                    value,
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=False,
+                    allow_nan=False,
+                )
                 handle.write("\n")
                 if durable:
                     handle.flush()
@@ -364,27 +422,30 @@ def write_heartbeat(status="running", detail=None, now=None):
 
 
 def validate_config(config):
-    try:
-        interval = int(config.get("interval_seconds", 0))
-    except (TypeError, ValueError):
-        raise GuardError("interval_seconds 必须是整数")
-    if interval < 60:
-        raise GuardError("interval_seconds 不能小于 60 秒")
-    try:
-        billing_cache_seconds = int(
-            config.get("billing_cache_seconds", DEFAULT_CONFIG["billing_cache_seconds"])
-        )
-    except (TypeError, ValueError):
-        raise GuardError("billing_cache_seconds 必须是整数")
-    if not 300 <= billing_cache_seconds <= 86400:
-        raise GuardError("billing_cache_seconds 必须在 300 到 86400 秒之间")
-    for field, minimum in (("start_wait_seconds", 0), ("stop_wait_seconds", 0), ("start_poll_seconds", 1)):
-        try:
-            value = int(config.get(field, DEFAULT_CONFIG[field]))
-        except (TypeError, ValueError):
+    integer_fields = (
+        ("interval_seconds", 60, 86400),
+        ("billing_cache_seconds", 300, 86400),
+        ("start_wait_seconds", 0, 600),
+        ("stop_wait_seconds", 0, 600),
+        ("start_poll_seconds", 1, 60),
+    )
+    for field, minimum, maximum in integer_fields:
+        raw = config.get(field, DEFAULT_CONFIG[field])
+        if isinstance(raw, bool):
             raise GuardError("{} 必须是整数".format(field))
-        if value < minimum:
-            raise GuardError("{} 不能小于 {}".format(field, minimum))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise GuardError("{} 必须是整数".format(field))
+        if isinstance(raw, float) and raw != value:
+            raise GuardError("{} 必须是整数".format(field))
+        if value < minimum or value > maximum:
+            raise GuardError(
+                "{} 必须在 {} 到 {} 之间".format(field, minimum, maximum)
+            )
+    for field in ("notify_on_daemon_start", "force_ipv4"):
+        if not isinstance(config.get(field, DEFAULT_CONFIG[field]), bool):
+            raise GuardError("{} 必须是布尔值".format(field))
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
@@ -393,11 +454,30 @@ def validate_config(config):
         raise GuardError("watchdog 必须是对象")
     if "enabled" in watchdog and not isinstance(watchdog.get("enabled"), bool):
         raise GuardError("watchdog.enabled 必须是布尔值")
-    try:
-        watchdog_timeout = int(watchdog.get("timeout_seconds", 600))
-        watchdog_failures = int(watchdog.get("failure_threshold", 2))
-    except (TypeError, ValueError):
-        raise GuardError("看门狗超时和连续失败次数必须是整数")
+    watchdog_numbers = (
+        ("timeout_seconds", 600, 120, 86400),
+        ("failure_threshold", 2, 1, 10),
+    )
+    parsed_watchdog = {}
+    for field, default, minimum, maximum in watchdog_numbers:
+        raw = watchdog.get(field, default)
+        if isinstance(raw, bool):
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        if isinstance(raw, float) and raw != value:
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        if value < minimum or value > maximum:
+            raise GuardError(
+                "watchdog.{} 必须在 {} 到 {} 之间".format(
+                    field, minimum, maximum
+                )
+            )
+        parsed_watchdog[field] = value
+    watchdog_timeout = parsed_watchdog["timeout_seconds"]
+    watchdog_failures = parsed_watchdog["failure_threshold"]
     if watchdog_timeout < 120 or watchdog_timeout > 86400:
         raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
     if watchdog_failures < 1 or watchdog_failures > 10:
@@ -420,6 +500,10 @@ def validate_config(config):
     users = config.get("users")
     if not isinstance(users, list):
         raise GuardError("users 必须是数组")
+    if len(users) > MAX_MONITORED_INSTANCES:
+        raise GuardError(
+            "监控实例不能超过 {} 个".format(MAX_MONITORED_INSTANCES)
+        )
     seen = set()
     for index, user in enumerate(users, 1):
         if not isinstance(user, dict):
@@ -428,18 +512,30 @@ def validate_config(config):
             user["instance_log_enabled"], bool
         ):
             raise GuardError("第 {} 个实例的独立日志开关必须是布尔值".format(index))
-        for field in ("name", "ak", "sk", "region", "instance_id"):
-            if not str(user.get(field, "")).strip():
+        for field in ("actions_enabled", "paused"):
+            if field in user and not isinstance(user[field], bool):
+                raise GuardError(
+                    "第 {} 个实例的 {} 必须是布尔值".format(index, field)
+                )
+        for field, maximum in USER_TEXT_LIMITS.items():
+            raw_text = user.get(field, "")
+            if not isinstance(raw_text, str) or not raw_text.strip():
                 raise GuardError("第 {} 个实例缺少 {}".format(index, field))
+            if len(raw_text.strip()) > maximum:
+                raise GuardError(
+                    "第 {} 个实例的 {} 不能超过 {} 个字符".format(
+                        index, field, maximum
+                    )
+                )
         identity = (str(user["ak"]).strip(), str(user["region"]).strip(), str(user["instance_id"]).strip())
         if identity in seen:
             raise GuardError("第 {} 个实例重复配置".format(index))
         seen.add(identity)
         try:
             limit = float(user.get("traffic_limit_gb", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise GuardError("第 {} 个实例的流量阈值无效".format(index))
-        if limit <= 0:
+        if not math.isfinite(limit) or limit <= 0:
             raise GuardError("第 {} 个实例的流量阈值必须大于 0".format(index))
         configured_schedule = user.get("schedule")
         if configured_schedule is not None and not isinstance(configured_schedule, dict):
@@ -453,11 +549,34 @@ def validate_config(config):
             stop_time = normalize_schedule_time(schedule["stop_time"], "关机时间")
             if start_time == stop_time:
                 raise GuardError("第 {} 个实例的开机时间和关机时间不能相同".format(index))
+        configured_billing = user.get("billing")
+        if configured_billing is not None and not isinstance(
+            configured_billing, dict
+        ):
+            raise GuardError("第 {} 个实例的账单配置必须是对象".format(index))
+        if isinstance(configured_billing, dict):
+            raw_billing_enabled = configured_billing.get("enabled", True)
+        else:
+            raw_billing_enabled = user.get("billing_enabled", True)
+        if not isinstance(raw_billing_enabled, bool):
+            raise GuardError("第 {} 个实例的账单开关必须是布尔值".format(index))
         billing = get_billing_config(user)
+        if not isinstance(billing.get("enabled", True), bool):
+            raise GuardError("第 {} 个实例的账单开关必须是布尔值".format(index))
         if billing.get("enabled", True):
-            for field in ("endpoint", "region", "currency_code", "currency_symbol"):
-                if not str(billing.get(field, "")).strip():
+            for field, maximum in (
+                ("endpoint", 512),
+                ("region", 128),
+                ("currency_code", 16),
+                ("currency_symbol", 16),
+            ):
+                value = billing.get(field, "")
+                if not isinstance(value, str) or not value.strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+                if len(value.strip()) > maximum:
+                    raise GuardError(
+                        "第 {} 个实例的账单配置 {} 过长".format(index, field)
+                    )
 
 
 def validate_telegram_config(telegram):
@@ -466,12 +585,19 @@ def validate_telegram_config(telegram):
     try:
         timeout = int(telegram.get("timeout_seconds", 12))
         retries = int(telegram.get("retries", 3))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        raise GuardError("Telegram 超时和重试次数必须是整数")
+    if isinstance(telegram.get("timeout_seconds", 12), bool) or isinstance(
+        telegram.get("retries", 3), bool
+    ):
         raise GuardError("Telegram 超时和重试次数必须是整数")
     if timeout < 3 or timeout > 60:
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    for field, maximum in (("bot_token", 512), ("chat_id", 128)):
+        if len(str(telegram.get(field, "") or "")) > maximum:
+            raise GuardError("Telegram {} 过长".format(field))
     if "control_enabled" in telegram and not isinstance(
         telegram.get("control_enabled"), bool
     ):
@@ -483,10 +609,18 @@ def validate_telegram_config(telegram):
     saved_nodes = telegram.get("node_urls", [])
     if not isinstance(saved_nodes, list):
         raise GuardError("Telegram 已保存节点必须是数组")
+    if len(saved_nodes) > telegram_proxy.MAX_SAVED_NODES:
+        raise GuardError(
+            "Telegram 已保存节点不能超过 {} 个".format(
+                telegram_proxy.MAX_SAVED_NODES
+            )
+        )
     saved_node_values = set()
     for index, node_url in enumerate(saved_nodes, 1):
         if not isinstance(node_url, str) or not node_url.strip():
             raise GuardError("Telegram 第 {} 个已保存节点无效".format(index))
+        if len(node_url.strip()) > telegram_proxy.MAX_NODE_LINK_LENGTH:
+            raise GuardError("Telegram 第 {} 个已保存节点过长".format(index))
         saved_node_values.add(node_url.strip())
     subscription_url = str(telegram.get("subscription_url", "") or "").strip()
     if len(subscription_url) > 4096:
@@ -505,6 +639,12 @@ def validate_telegram_config(telegram):
     subscription_nodes = telegram.get("subscription_node_urls", [])
     if not isinstance(subscription_nodes, list):
         raise GuardError("Telegram 订阅节点必须是数组")
+    if len(subscription_nodes) > telegram_proxy.MAX_SUBSCRIPTION_NODES:
+        raise GuardError(
+            "Telegram 订阅节点不能超过 {} 个".format(
+                telegram_proxy.MAX_SUBSCRIPTION_NODES
+            )
+        )
     for index, node_url in enumerate(subscription_nodes, 1):
         if not isinstance(node_url, str) or not node_url.strip():
             raise GuardError("Telegram 第 {} 个订阅节点无效".format(index))
@@ -513,12 +653,14 @@ def validate_telegram_config(telegram):
     for field in ("subscription_last_refresh_epoch", "subscription_last_attempt_epoch"):
         try:
             timestamp = float(telegram.get(field, 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise GuardError("Telegram 订阅刷新时间无效")
-        if timestamp < 0:
+        if not math.isfinite(timestamp) or timestamp < 0:
             raise GuardError("Telegram 订阅刷新时间无效")
     if mode in ("socks5", "http"):
         proxy_url = str(telegram.get("proxy_url", "")).strip()
+        if len(proxy_url) > 4096:
+            raise GuardError("Telegram 代理地址过长")
         parsed = urllib.parse.urlsplit(proxy_url)
         allowed = ("socks5", "socks5h") if mode == "socks5" else ("http", "https")
         try:
@@ -534,6 +676,8 @@ def validate_telegram_config(telegram):
             raise GuardError("Telegram 节点链接无效: {}".format(exc))
     if mode == "api_proxy":
         base_url = str(telegram.get("api_base_url", "")).strip().rstrip("/")
+        if len(base_url) > 4096:
+            raise GuardError("Telegram API 反向代理地址过长")
         parsed = urllib.parse.urlsplit(base_url)
         try:
             parsed.port
@@ -845,14 +989,33 @@ def next_schedule_event(user, now=None):
 
 
 def normalize_bill_items(data):
-    items = data.get("Data", {}).get("Items", []) if isinstance(data, dict) else []
+    section = data.get("Data", {}) if isinstance(data, dict) else {}
+    if not isinstance(section, dict):
+        raise GuardError("BSS 返回的 Data 格式无法识别")
+    items = section.get("Items", [])
     if isinstance(items, dict):
         items = items.get("Item", [])
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
         raise GuardError("BSS 返回的 Data.Items 格式无法识别")
-    return [item for item in items if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in items):
+        raise GuardError("BSS 返回的账单项目格式无法识别")
+    return items
+
+
+def _nested_api_items(data, container_key, item_key, label):
+    container = data.get(container_key, {})
+    if not isinstance(container, dict):
+        raise GuardError("{} 返回的 {} 格式无法识别".format(label, container_key))
+    items = container.get(item_key, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or any(
+        not isinstance(item, dict) for item in items
+    ):
+        raise GuardError("{} 返回的 {} 列表格式无法识别".format(label, item_key))
+    return items
 
 
 def query_instance_bill(user):
@@ -875,7 +1038,7 @@ def query_instance_bill(user):
     request.add_query_param("PageNum", "1")
     request.add_query_param("PageSize", "300")
     response = make_client(user, str(billing["region"]).strip()).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
+    data = _decode_json_object(response, "BSS")
     if data.get("Success") is False:
         raise GuardError(
             "{}: {}".format(data.get("Code", "BSSRequestFailed"), data.get("Message", "请求失败"))
@@ -883,8 +1046,13 @@ def query_instance_bill(user):
     if "Data" not in data:
         raise GuardError("BSS 返回缺少 Data 字段")
     items = normalize_bill_items(data)
-    amount = sum(float(item.get("PretaxAmount", 0) or 0) for item in items)
-    currency = str(data.get("Data", {}).get("Currency", "") or "")
+    try:
+        amount = sum(float(item.get("PretaxAmount", 0) or 0) for item in items)
+    except (TypeError, ValueError, OverflowError):
+        raise GuardError("BSS 返回的账单金额无效")
+    if not math.isfinite(amount):
+        raise GuardError("BSS 返回的账单金额无效")
+    currency = str(data["Data"].get("Currency", "") or "")
     if not currency:
         for item in items:
             if item.get("Currency"):
@@ -919,6 +1087,21 @@ def billing_cache_entries(state):
     return cache
 
 
+def _state_datetime(value, reference):
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if reference.tzinfo is None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+    elif parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=reference.tzinfo)
+    else:
+        parsed = parsed.astimezone(reference.tzinfo)
+    return parsed
+
+
 def query_instance_bill_cached(
     user,
     state,
@@ -927,15 +1110,36 @@ def query_instance_bill_cached(
     force_refresh=False,
 ):
     now = now or dt.datetime.now().astimezone()
+    try:
+        cache_window = max(0, min(int(cache_seconds), 86400))
+    except (TypeError, ValueError, OverflowError):
+        cache_window = 0
     cache = billing_cache_entries(state)
     key = billing_cache_key(user, now)
     cached = cache.get(key)
-    if isinstance(cached, dict) and not force_refresh and int(cache_seconds) > 0:
+    if isinstance(cached, dict):
         try:
-            next_refresh_at = dt.datetime.fromisoformat(
-                str(cached.get("next_refresh_at") or cached["checked_at"])
-            )
-        except (KeyError, TypeError, ValueError):
+            cached_amount = float(cached.get("amount"))
+        except (TypeError, ValueError, OverflowError):
+            cached_amount = None
+        checked_at = _state_datetime(cached.get("checked_at"), now)
+        if (
+            cached_amount is None
+            or not math.isfinite(cached_amount)
+            or checked_at is None
+            or checked_at > now + dt.timedelta(minutes=5)
+        ):
+            cache.pop(key, None)
+            cached = None
+        else:
+            cached["amount"] = cached_amount
+    if isinstance(cached, dict) and not force_refresh and cache_window > 0:
+        next_refresh_at = _state_datetime(
+            cached.get("next_refresh_at") or cached.get("checked_at"), now
+        )
+        if next_refresh_at is not None and next_refresh_at > now + dt.timedelta(
+            seconds=cache_window + 300
+        ):
             next_refresh_at = None
         if next_refresh_at is not None and now < next_refresh_at:
             return (
@@ -950,7 +1154,7 @@ def query_instance_bill_cached(
     except Exception as exc:
         if isinstance(cached, dict) and cached.get("checked_at"):
             cached["next_refresh_at"] = (
-                now + dt.timedelta(seconds=min(int(cache_seconds), 900))
+                now + dt.timedelta(seconds=min(cache_window, 900))
             ).isoformat(timespec="seconds")
             return (
                 cached.get("amount"),
@@ -966,7 +1170,7 @@ def query_instance_bill_cached(
         "currency": currency,
         "checked_at": checked_at,
         "next_refresh_at": (
-            now + dt.timedelta(seconds=int(cache_seconds))
+            now + dt.timedelta(seconds=cache_window)
         ).isoformat(timespec="seconds"),
         "instance_id": str(user.get("instance_id", "") or ""),
         "billing_cycle": now.strftime("%Y-%m"),
@@ -1002,9 +1206,21 @@ def query_cdt_traffic_gb(user):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
+    data = _decode_json_object(response, "CDT")
     details = data.get("TrafficDetails", [])
-    total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
+    if not isinstance(details, list):
+        raise GuardError("CDT 返回的 TrafficDetails 格式无法识别")
+    try:
+        traffic_values = [
+            float(item.get("Traffic", 0) or 0) for item in details
+        ]
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise GuardError("CDT 返回的流量数值无效")
+    if any(not math.isfinite(value) or value < 0 for value in traffic_values):
+        raise GuardError("CDT 返回的流量数值无效")
+    total_bytes = sum(traffic_values)
+    if not math.isfinite(total_bytes):
+        raise GuardError("CDT 返回的流量数值无效")
     return total_bytes / (1024.0 ** 3)
 
 
@@ -1044,8 +1260,8 @@ def query_instance_status(user):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(user).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    instances = data.get("Instances", {}).get("Instance", [])
+    data = _decode_json_object(response, "ECS")
+    instances = _nested_api_items(data, "Instances", "Instance", "ECS")
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
@@ -1082,10 +1298,8 @@ def query_instance_statuses(users):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(users[0]).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    instances = data.get("Instances", {}).get("Instance", [])
-    if not isinstance(instances, list):
-        raise GuardError("ECS 返回实例列表格式无法识别")
+    data = _decode_json_object(response, "ECS")
+    instances = _nested_api_items(data, "Instances", "Instance", "ECS")
     return {
         str(item.get("InstanceId", "")): str(item.get("Status", "Unknown"))
         for item in instances
@@ -1154,7 +1368,10 @@ def prefetch_instance_statuses(users):
 
 
 def _instance_tags(instance):
-    raw = instance.get("Tags", {}).get("Tag", []) if isinstance(instance, dict) else []
+    tags = instance.get("Tags", {}) if isinstance(instance, dict) else {}
+    if not isinstance(tags, dict):
+        return {}
+    raw = tags.get("Tag", [])
     if isinstance(raw, dict):
         raw = [raw]
     if not isinstance(raw, list):
@@ -1164,6 +1381,18 @@ def _instance_tags(instance):
         for item in raw
         if isinstance(item, dict) and str(item.get("TagKey", ""))
     }
+
+
+def _instance_public_ip(instance):
+    container = instance.get("PublicIpAddress", {})
+    if not isinstance(container, dict):
+        return ""
+    addresses = container.get("IpAddress", [])
+    if not isinstance(addresses, list):
+        return ""
+    return next(
+        (str(value).strip() for value in addresses if str(value).strip()), ""
+    )
 
 
 def discover_ecs_regions(ak, sk):
@@ -1183,12 +1412,8 @@ def discover_ecs_regions(ak, sk):
     request.set_read_timeout(15000)
     credentials = {"ak": access_key, "sk": secret_key}
     response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    regions = data.get("Regions", {}).get("Region", [])
-    if isinstance(regions, dict):
-        regions = [regions]
-    if not isinstance(regions, list):
-        raise GuardError("ECS 返回 Region 列表格式无法识别")
+    data = _decode_json_object(response, "ECS")
+    regions = _nested_api_items(data, "Regions", "Region", "ECS")
     result = []
     for item in regions:
         region = str(item.get("RegionId", "") if isinstance(item, dict) else "").strip()
@@ -1216,6 +1441,7 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
     tag_value = str(tag_value or "").strip()
     results = []
     errors = []
+    truncated = False
     credentials = {"ak": access_key, "sk": secret_key}
     for region in region_values:
         try:
@@ -1229,12 +1455,10 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                 request.set_connect_timeout(5000)
                 request.set_read_timeout(20000)
                 response = make_client(credentials, region).do_action_with_exception(request)
-                data = json.loads(response.decode("utf-8"))
-                instances = data.get("Instances", {}).get("Instance", [])
-                if isinstance(instances, dict):
-                    instances = [instances]
-                if not isinstance(instances, list):
-                    raise GuardError("ECS 返回实例列表格式无法识别")
+                data = _decode_json_object(response, "ECS")
+                instances = _nested_api_items(
+                    data, "Instances", "Instance", "ECS"
+                )
                 for instance in instances:
                     if not isinstance(instance, dict):
                         continue
@@ -1254,12 +1478,15 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                             "status": str(instance.get("Status", "Unknown")),
                             "zone_id": str(instance.get("ZoneId", "")),
                             "instance_type": str(instance.get("InstanceType", "")),
-                            "public_ip": str(
-                                (instance.get("PublicIpAddress", {}).get("IpAddress", []) or [""])[0]
-                            ),
+                            "public_ip": _instance_public_ip(instance),
                             "tags": tags,
                         }
                     )
+                    if len(results) >= MAX_DISCOVERED_INSTANCES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
                 total = int(data.get("TotalCount", len(instances)) or 0)
                 if page * 100 >= total or not instances:
                     break
@@ -1271,7 +1498,14 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                     "error": compact_error(exc, secrets=(access_key, secret_key)),
                 }
             )
-    return {"instances": results, "errors": errors, "regions": region_values}
+        if truncated:
+            break
+    return {
+        "instances": results,
+        "errors": errors,
+        "regions": region_values,
+        "truncated": truncated,
+    }
 
 
 def start_instance(user):
@@ -1446,7 +1680,62 @@ def _telegram_post(url, data, timeout, proxies):
         session.trust_env = False
         _TELEGRAM_LOCAL.session = session
         _TELEGRAM_LOCAL.connection_key = connection_key
-    return session.post(url, data=data, timeout=timeout, proxies=proxies)
+    return session.post(
+        url,
+        data=data,
+        timeout=timeout,
+        proxies=proxies,
+        stream=True,
+    )
+
+
+def _read_telegram_response(response):
+    chunks = []
+    total = 0
+    saw_chunk = False
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        try:
+            for chunk in iterator(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                saw_chunk = True
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                elif isinstance(chunk, (bytearray, memoryview)):
+                    chunk = bytes(chunk)
+                elif not isinstance(chunk, bytes):
+                    raise GuardError("Telegram response contains invalid data")
+                total += len(chunk)
+                if total > MAX_TELEGRAM_RESPONSE_BYTES:
+                    raise GuardError("Telegram response exceeds 1 MiB")
+                chunks.append(chunk)
+        except GuardError:
+            raise
+        except (AttributeError, TypeError):
+            saw_chunk = False
+            chunks = []
+
+    if saw_chunk:
+        raw = b"".join(chunks)
+    else:
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            raw = bytes(content)
+        else:
+            text = getattr(response, "text", "")
+            if isinstance(text, bytes):
+                raw = text
+            elif isinstance(text, str):
+                raw = text.encode("utf-8")
+            else:
+                raise GuardError("Telegram response body is invalid")
+        if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
+            raise GuardError("Telegram response exceeds 1 MiB")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GuardError("Telegram response is not valid UTF-8") from exc
 
 
 def close_telegram_session():
@@ -1480,7 +1769,13 @@ def telegram_api(config, method, data=None, request_timeout=None):
     for attempt in range(1, retries + 1):
         try:
             response = _telegram_post(url, data or {}, timeout, proxies)
-            body = response.text
+            try:
+                body = _read_telegram_response(response)
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             if response.status_code >= 400:
                 if response.status_code not in (429, 500, 502, 503, 504) or attempt >= retries:
                     raise GuardError(
@@ -1520,10 +1815,12 @@ def telegram_api(config, method, data=None, request_timeout=None):
                 )
             time.sleep(min(2 ** attempt, 8))
     try:
-        result = json.loads(body)
+        result = json.loads(body, parse_constant=_reject_json_constant)
     except ValueError:
         raise GuardError("Telegram 返回了无效 JSON")
-    if not result.get("ok"):
+    if not isinstance(result, dict):
+        raise GuardError("Telegram response root must be an object")
+    if result.get("ok") is not True:
         raise GuardError("Telegram API 拒绝请求: {}".format(result.get("description", body[:300])))
     return result.get("result")
 
@@ -1563,19 +1860,27 @@ def send_telegram_message(telegram, text):
     return results
 
 
-def _subscription_timestamp(telegram, field):
+def _subscription_timestamp(telegram, field, now=None):
+    now = time.time() if now is None else float(now)
     try:
-        return max(0.0, float(telegram.get(field, 0) or 0))
-    except (TypeError, ValueError):
+        timestamp = float(telegram.get(field, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    if not math.isfinite(timestamp) or timestamp < 0 or timestamp > now + 300:
+        return 0.0
+    return timestamp
 
 
 def telegram_subscription_refresh_due(telegram, now=None):
     now = time.time() if now is None else float(now)
     if not str(telegram.get("subscription_url", "") or "").strip():
         return False
-    last_refresh = _subscription_timestamp(telegram, "subscription_last_refresh_epoch")
-    last_attempt = _subscription_timestamp(telegram, "subscription_last_attempt_epoch")
+    last_refresh = _subscription_timestamp(
+        telegram, "subscription_last_refresh_epoch", now
+    )
+    last_attempt = _subscription_timestamp(
+        telegram, "subscription_last_attempt_epoch", now
+    )
     return (
         now - last_refresh >= SUBSCRIPTION_REFRESH_SECONDS
         and now - last_attempt >= SUBSCRIPTION_RETRY_SECONDS
@@ -2168,6 +2473,8 @@ def should_notify(config, results, previous_state):
         previous = {}
     for item in results:
         old = previous.get(item["instance_id"], {})
+        if not isinstance(old, dict):
+            old = {}
         if old.get("status_after") and old.get("status_after") != item.get("status_after"):
             return True
     return False
@@ -2189,15 +2496,23 @@ def update_state(
     state["last_cycle_error_count"] = error_count
     state["last_cycle_ok"] = error_count == 0
     state["last_summary"] = summary
-    state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
+    try:
+        cycle_count = int(state.get("cycle_count", 0))
+    except (TypeError, ValueError, OverflowError):
+        cycle_count = 0
+    state["cycle_count"] = max(0, cycle_count) + 1
     state["telegram_error"] = notify_error
     if not dry_run:
         state["last_cycle_epoch"] = started_at.timestamp()
         state["cdt_month_checked"] = cdt_month_key(started_at)
-    if not isinstance(state.get("instances"), dict):
-        state["instances"] = {}
+    previous_instances = state.get("instances")
+    if not isinstance(previous_instances, dict):
+        previous_instances = {}
+    current_instances = {}
     for item in results:
-        previous_instance = state["instances"].get(item["instance_id"], {})
+        previous_instance = previous_instances.get(item["instance_id"], {})
+        if not isinstance(previous_instance, dict):
+            previous_instance = {}
         instance_state = {
             "name": item["name"],
             "traffic_gb": item["traffic_gb"],
@@ -2225,7 +2540,8 @@ def update_state(
             for field in ("schedule_signature", "schedule_target"):
                 if field in previous_instance:
                     instance_state[field] = previous_instance[field]
-        state["instances"][item["instance_id"]] = instance_state
+        current_instances[item["instance_id"]] = instance_state
+    state["instances"] = current_instances
     if not dry_run:
         history = state.get("history")
         if not isinstance(history, list):
@@ -2249,7 +2565,7 @@ def update_state(
                 },
             }
         )
-        state["history"] = history[-576:]
+        state["history"] = history[-MAX_HISTORY_ENTRIES:]
 
 
 @contextlib.contextmanager
@@ -2431,19 +2747,33 @@ def refresh_billing_cache(started_at=None):
     }
 
 
+def _valid_state_epoch(value):
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(epoch) or epoch < 0:
+        return None
+    return epoch
+
+
 def is_due(config, state, now=None):
-    now = now or time.time()
-    last = state.get("last_cycle_epoch")
+    now = time.time() if now is None else float(now)
+    last = _valid_state_epoch(state.get("last_cycle_epoch"))
     if last is None:
         finished = state.get("last_cycle_finished_at")
         if finished:
             try:
-                last = dt.datetime.fromisoformat(finished).timestamp()
-            except (TypeError, ValueError):
+                last = _valid_state_epoch(
+                    dt.datetime.fromisoformat(str(finished)).timestamp()
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
                 last = None
     if last is None:
         return True
-    return now - float(last) >= int(config["interval_seconds"])
+    if last > now:
+        return True
+    return now - last >= int(config["interval_seconds"])
 
 
 def cdt_month_key(now=None):
@@ -2526,11 +2856,11 @@ def run_scheduled():
 
 def scheduler_wait_seconds(config, state, now=None):
     now = time.time() if now is None else float(now)
-    last = state.get("last_cycle_epoch")
-    if last is None:
+    last = _valid_state_epoch(state.get("last_cycle_epoch"))
+    if last is None or last > now:
         regular_wait = 60.0
     else:
-        regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
+        regular_wait = max(1.0, int(config["interval_seconds"]) - (now - last))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
 

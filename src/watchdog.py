@@ -5,10 +5,12 @@
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -22,26 +24,43 @@ WATCHDOG_STATE_FILE = Path(
 BACKEND_FILE = APP_DIR / "service_backend"
 DISABLED_FILE = APP_DIR / "disabled"
 SERVICE_NAME = "aliyun-guard"
+MAX_STATE_FILE_BYTES = 1024 * 1024
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _atomic_write(path, value):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(str(temporary), 0o600)
-    os.replace(str(temporary), str(path))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path):
     try:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_STATE_FILE_BYTES + 1)
+        if len(raw) > MAX_STATE_FILE_BYTES:
+            return {}
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -50,7 +69,9 @@ def heartbeat_age(now=None):
     heartbeat = read_json(HEARTBEAT_FILE)
     try:
         epoch = float(heartbeat.get("epoch"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return None, heartbeat
+    if not math.isfinite(epoch) or epoch < 0 or epoch > now + 300:
         return None, heartbeat
     return max(0.0, now - epoch), heartbeat
 
@@ -143,8 +164,11 @@ def check_once(now=None, restart=True, notify=True):
     age, heartbeat = heartbeat_age(now)
     state = read_json(WATCHDOG_STATE_FILE)
     stale = age is None or age > timeout_seconds
-    failed = int(state.get("failed_checks", 0) or 0)
-    outage_notified = bool(state.get("outage_notified", False))
+    try:
+        failed = max(0, int(state.get("failed_checks", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        failed = 0
+    outage_notified = state.get("outage_notified") is True
     result = {
         "status": "healthy",
         "heartbeat_age_seconds": age,
@@ -179,8 +203,11 @@ def check_once(now=None, restart=True, notify=True):
                         )
                     )
                 except Exception as exc:
-                    result["notification_error"] = guard.compact_error(exc)
-                outage_notified = True
+                    result["notification_error"] = guard.compact_error(
+                        exc,
+                        secrets=guard.telegram_secrets(config.get("telegram", {})),
+                    )
+                outage_notified = result["notification_error"] is None
     else:
         if outage_notified and notify:
             try:
@@ -193,10 +220,16 @@ def check_once(now=None, restart=True, notify=True):
                     )
                 )
             except Exception as exc:
-                result["notification_error"] = guard.compact_error(exc)
+                result["notification_error"] = guard.compact_error(
+                    exc,
+                    secrets=guard.telegram_secrets(config.get("telegram", {})),
+                )
             result["status"] = "recovered"
+            if result["notification_error"] is None:
+                outage_notified = False
+        else:
+            outage_notified = False
         failed = 0
-        outage_notified = False
     state.update(
         {
             "checked_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),

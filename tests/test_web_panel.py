@@ -82,6 +82,28 @@ class PasswordTests(unittest.TestCase):
         with self.assertRaises(web_panel.WebPanelError):
             web_panel.validate_web_config(config)
 
+    def test_password_verification_rejects_excessive_work_factor(self):
+        encoded = web_panel.hash_password("a-long-password", iterations=1000)
+        algorithm, _iterations, salt, digest = encoded.split("$", 3)
+        excessive = "{}${}${}${}".format(
+            algorithm, web_panel.MAX_PASSWORD_ITERATIONS + 1, salt, digest
+        )
+        self.assertFalse(web_panel.verify_password("a-long-password", excessive))
+
+    def test_web_config_requires_boolean_switches_and_integer_port(self):
+        for field, value in (
+            ("enabled", "false"),
+            ("cookie_secure", 0),
+            ("port", 8765.5),
+            ("port", True),
+        ):
+            config = make_config()
+            config["web_panel"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(
+                web_panel.WebPanelError
+            ):
+                web_panel.validate_web_config(config)
+
 
 class WebAddressTests(unittest.TestCase):
     def test_public_listener_uses_detected_local_ipv4(self):
@@ -163,6 +185,28 @@ class WebAddressTests(unittest.TestCase):
 
 
 class PayloadTests(unittest.TestCase):
+    def test_json_safe_replaces_nested_non_finite_values(self):
+        payload = {
+            "traffic": float("nan"),
+            "history": [float("inf"), {"bill": float("-inf")}],
+        }
+        safe = web_panel._json_safe(payload)
+        serialized = json.dumps(safe, allow_nan=False)
+        self.assertEqual(safe, {"traffic": None, "history": [None, {"bill": None}]})
+        self.assertNotIn("NaN", serialized)
+        self.assertNotIn("Infinity", serialized)
+
+    def test_log_tail_reads_only_bounded_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.log"
+            path.write_text(
+                "".join("line-{:03d}\n".format(index) for index in range(100)),
+                encoding="utf-8",
+            )
+            with mock.patch.object(web_panel, "MAX_LOG_TAIL_BYTES", 64):
+                lines = web_panel._read_recent_log_path(path, 3)
+        self.assertEqual(lines, ["line-097", "line-098", "line-099"])
+
     def test_dashboard_never_returns_raw_credentials(self):
         config = make_config()
         state = {
@@ -322,6 +366,15 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
 
+    def test_request_json_rejects_non_standard_numeric_constants(self):
+        status, data, _headers = self.request(
+            "POST",
+            "/api/login",
+            {"username": "admin", "password": float("nan")},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("JSON", data["error"])
+
     def test_session_reports_current_http_transport(self):
         status, data, _headers = self.request("GET", "/api/session")
         self.assertEqual(status, 200)
@@ -330,6 +383,72 @@ class WebApiTests(unittest.TestCase):
     def test_server_limits_worker_threads_and_sets_socket_timeout(self):
         self.assertEqual(self.server.request_queue_size, 64)
         self.assertEqual(self.server.request_slots._value, web_panel.MAX_REQUEST_THREADS)
+
+    def test_login_attempt_tracking_is_bounded_and_expiring(self):
+        with mock.patch.object(web_panel.time, "time", return_value=100), mock.patch.object(
+            web_panel, "MAX_LOGIN_TRACKED_ADDRESSES", 2
+        ):
+            self.assertTrue(self.server.begin_login_attempt("new-address"))
+            self.server.begin_login_attempt("address-1")
+            self.server.begin_login_attempt("address-2")
+            self.server.begin_login_attempt("address-3")
+            self.assertEqual(
+                set(self.server.login_attempts), {"address-2", "address-3"}
+            )
+        with mock.patch.object(web_panel.time, "time", return_value=401), mock.patch.object(
+            web_panel, "MAX_LOGIN_TRACKED_ADDRESSES", 2
+        ):
+            self.server.begin_login_attempt("address-4")
+        self.assertEqual(set(self.server.login_attempts), {"address-4"})
+
+    def test_login_rate_limit_resets_after_window(self):
+        with mock.patch.object(web_panel.time, "time", return_value=100):
+            for _value in range(web_panel.MAX_LOGIN_FAILURES):
+                self.assertTrue(
+                    self.server.begin_login_attempt("limited-address")
+                )
+            self.assertFalse(
+                self.server.begin_login_attempt("limited-address")
+            )
+        with mock.patch.object(
+            web_panel.time,
+            "time",
+            return_value=100 + web_panel.LOGIN_WINDOW_SECONDS,
+        ):
+            self.assertTrue(
+                self.server.begin_login_attempt("limited-address")
+            )
+        self.assertEqual(len(self.server.login_attempts["limited-address"]), 1)
+
+    def test_concurrent_login_attempts_share_one_rate_limit(self):
+        results = []
+        result_lock = threading.Lock()
+
+        def attempt():
+            allowed = self.server.begin_login_attempt("concurrent-address")
+            with result_lock:
+                results.append(allowed)
+
+        with mock.patch.object(web_panel.time, "time", return_value=100):
+            threads = [threading.Thread(target=attempt) for _value in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertEqual(results.count(True), web_panel.MAX_LOGIN_FAILURES)
+        self.assertEqual(results.count(False), 16 - web_panel.MAX_LOGIN_FAILURES)
+
+    def test_session_tracking_evicts_the_earliest_expiring_session(self):
+        with mock.patch.object(web_panel, "MAX_SESSIONS", 2), mock.patch.object(
+            web_panel.time, "time", side_effect=(100, 101, 102)
+        ):
+            first, _data = self.server.create_session()
+            second, _data = self.server.create_session()
+            third, _data = self.server.create_session()
+        self.assertNotIn(first, self.server.sessions)
+        self.assertIn(second, self.server.sessions)
+        self.assertIn(third, self.server.sessions)
+        self.assertEqual(len(self.server.sessions), 2)
 
     def test_update_progress_is_available_during_service_restart(self):
         progress_dir = Path(self.temp.name) / "app"
@@ -678,6 +797,15 @@ class WebApiTests(unittest.TestCase):
 
 
 class ManualControlTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.original_config_file = guard.CONFIG_FILE
+        guard.CONFIG_FILE = Path(self.temp.name) / "config.json"
+
+    def tearDown(self):
+        guard.CONFIG_FILE = self.original_config_file
+        self.temp.cleanup()
+
     def test_manual_start_is_blocked_when_traffic_reaches_limit(self):
         config = make_config()
         config["users"][0]["paused"] = True

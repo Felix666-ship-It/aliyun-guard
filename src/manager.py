@@ -7,6 +7,7 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -30,10 +31,12 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
+MAX_UPDATE_DOWNLOAD_BYTES = 8 * 1024 * 1024
+MAX_LOG_TAIL_BYTES = 256 * 1024
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
 
@@ -152,8 +155,11 @@ def prompt_float(text, default, minimum=None):
         value = prompt(text, default)
         try:
             number = float(value)
-        except ValueError:
+        except (ValueError, OverflowError):
             print("请输入数字。")
+            continue
+        if not math.isfinite(number):
+            print("请输入有限数字。")
             continue
         if minimum is not None and number < minimum:
             print("不能小于 {}。".format(minimum))
@@ -1289,18 +1295,50 @@ def show_logs(config, lines=80):
     if not path.exists():
         print("日志尚未生成: {}".format(path))
         return
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        content = handle.readlines()[-lines:]
-    print("".join(content), end="")
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        chunks = []
+        bytes_read = 0
+        newline_count = 0
+        while position > 0 and bytes_read < MAX_LOG_TAIL_BYTES:
+            chunk_size = min(
+                64 * 1024,
+                position,
+                MAX_LOG_TAIL_BYTES - bytes_read,
+            )
+            position -= chunk_size
+            handle.seek(position)
+            chunk = handle.read(chunk_size)
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+            newline_count += chunk.count(b"\n")
+            if newline_count > lines:
+                break
+    content = b"".join(reversed(chunks)).decode("utf-8", "replace").splitlines(True)
+    print("".join(content[-lines:]), end="")
 
 
-def download_update_file(url, timeout=30, retries=3):
+def download_update_file(
+    url, timeout=30, retries=3, max_bytes=MAX_UPDATE_DOWNLOAD_BYTES
+):
+    maximum = max(1, int(max_bytes))
     last_error = None
     for attempt in range(1, retries + 1):
         request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Updater"})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+                content_length = response.getheader("Content-Length")
+                if content_length and int(content_length) > maximum:
+                    raise guard.GuardError("下载内容超过大小限制")
+                content = bytearray()
+                while True:
+                    chunk = response.read(min(64 * 1024, maximum - len(content) + 1))
+                    if not chunk:
+                        return bytes(content)
+                    content.extend(chunk)
+                    if len(content) > maximum:
+                        raise guard.GuardError("下载内容超过大小限制")
         except Exception as exc:
             last_error = exc
             if attempt < retries:
@@ -1315,6 +1353,29 @@ def parse_release_id(value):
     return release_id
 
 
+def parse_version_key(value):
+    text = str(value or "").strip().lstrip("v")
+    release_text = text.split("+", 1)[0]
+    core, separator, prerelease = release_text.partition("-")
+    parts = core.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise guard.GuardError("版本号必须使用 major.minor.patch 格式")
+    core_key = tuple(int(part) for part in parts)
+    if not separator:
+        return core_key + (1, ())
+    if not prerelease:
+        raise guard.GuardError("版本预发布标识无效")
+    prerelease_key = []
+    for identifier in prerelease.split("."):
+        if not identifier:
+            raise guard.GuardError("版本预发布标识无效")
+        if identifier.isdigit():
+            prerelease_key.append((0, int(identifier)))
+        else:
+            prerelease_key.append((1, identifier.lower()))
+    return core_key + (0, tuple(prerelease_key))
+
+
 def parse_version_manifest(payload):
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8", "strict")
@@ -1327,6 +1388,7 @@ def parse_version_manifest(payload):
         raise guard.GuardError("GitHub 版本号格式无效")
     return {
         "version": version,
+        "version_key": parse_version_key(version),
         "release_id": parse_release_id(data.get("release_id")),
     }
 
@@ -1361,7 +1423,12 @@ def check_for_github_update():
         remote = parse_version_manifest(payload)
     except Exception:
         return None
-    remote["available"] = remote["release_id"] != current_release_id
+    local_version_key = parse_version_key(APP_VERSION)
+    remote_version_key = remote.pop("version_key")
+    remote["available"] = remote_version_key > local_version_key or (
+        remote_version_key == local_version_key
+        and remote["release_id"] != current_release_id
+    )
     return remote
 
 
@@ -1381,6 +1448,11 @@ def update_from_github(confirm_update=True, release_info=None):
     if release_info is None:
         release_info = check_for_github_update()
     target_version = release_info.get("version") if release_info else None
+    if target_version and parse_version_key(target_version) < parse_version_key(
+        APP_VERSION
+    ):
+        print("远端版本 v{} 低于当前版本，已拒绝降级。".format(target_version))
+        return None
     if target_version and not release_info.get("available"):
         print("当前版本已经是最新版本了。")
         return None

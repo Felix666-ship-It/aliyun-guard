@@ -225,7 +225,7 @@ def decrypt_payload(envelope, passphrase):
         raise BackupError("不是受支持的 Aliyun Guard 备份")
     try:
         iterations = int(envelope.get("iterations"))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise BackupError("备份 KDF 参数无效") from exc
     if iterations < 100000 or iterations > 2000000:
         raise BackupError("备份 KDF 参数超出安全范围")
@@ -286,7 +286,7 @@ def _load_backup_streaming(path, passphrase):
             raise BackupError("不是受支持的 Aliyun Guard 备份")
         try:
             iterations = int(envelope.get("iterations"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise BackupError("备份 KDF 参数无效") from exc
         if iterations < 100000 or iterations > 2000000:
             raise BackupError("备份 KDF 参数超出安全范围")
@@ -344,16 +344,25 @@ def _load_backup_streaming(path, passphrase):
 
         try:
             encoded = header[marker_index + len(marker):]
+            trailing = b""
             with os.fdopen(descriptor, "wb") as plaintext:
                 while True:
                     closing_quote = encoded.find(b'"')
                     if closing_quote >= 0:
                         write_decoded(encoded[:closing_quote], plaintext)
+                        trailing = encoded[closing_quote + 1:]
                         break
                     write_decoded(encoded, plaintext)
                     encoded = source.read(64 * 1024)
                     if not encoded:
                         raise BackupError("备份中的 ciphertext 不完整")
+                while len(trailing) <= 4096:
+                    chunk = source.read(4097 - len(trailing))
+                    if not chunk:
+                        break
+                    trailing += chunk
+                if len(trailing) > 4096 or trailing.strip() != b"}":
+                    raise BackupError("备份文件尾无效")
                 if remainder:
                     try:
                         decoded = base64.b64decode(remainder, validate=True)
@@ -398,11 +407,76 @@ def _safe_relative_path(value):
     return text
 
 
+def _contained_path(root, name):
+    root = Path(root).resolve()
+    destination = root / name
+    try:
+        destination.parent.resolve().relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise BackupError("备份恢复目标超出应用目录") from exc
+    if destination.is_symlink():
+        raise BackupError("备份恢复目标不能是符号链接: {}".format(name))
+    return destination
+
+
+def _atomic_write_bytes(destination, data, mode=0o600, suffix=".restore.tmp"):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=suffix,
+        dir=str(destination.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), mode)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_copy_file(source, destination, mode):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=".rollback.tmp",
+        dir=str(destination.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with Path(source).open("rb") as source_handle, os.fdopen(
+            descriptor, "wb"
+        ) as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.chmod(str(temporary), mode)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _read_file(path):
     size = path.stat().st_size
     if size > MAX_FILE_BYTES:
         raise BackupError("文件过大，未加入备份: {}".format(path.name))
     return path.read_bytes()
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
@@ -412,6 +486,8 @@ def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
 
     def add_file(name, path):
         nonlocal total_size
+        if path.is_symlink():
+            raise BackupError("备份源文件不能是符号链接: {}".format(name))
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
             raise BackupError("文件过大，未加入备份: {}".format(path.name))
@@ -509,18 +585,28 @@ def _preview_payload(payload, app_dir=APP_DIR):
     root = Path(app_dir)
     changes = []
     config_summary = None
+    total_size = 0
     for raw_name, metadata in sorted(payload["files"].items()):
         name = _safe_relative_path(raw_name)
         if not isinstance(metadata, dict):
             raise BackupError("备份文件元数据无效")
         data = _b64decode(metadata.get("content", ""), name)
+        if len(data) > MAX_FILE_BYTES:
+            raise BackupError("备份文件超过 {} MiB 限制: {}".format(
+                MAX_FILE_BYTES // 1048576, name
+            ))
+        total_size += len(data)
+        if total_size > MAX_BACKUP_SOURCE_BYTES:
+            raise BackupError("备份源文件超过 {} MiB 限制".format(
+                MAX_BACKUP_SOURCE_BYTES // 1048576
+            ))
         expected = str(metadata.get("sha256", "")).lower()
         if hashlib.sha256(data).hexdigest() != expected:
             raise BackupError("备份内部校验失败: {}".format(name))
-        current = root / name
+        current = _contained_path(root, name)
         if not current.exists():
             action = "add"
-        elif hashlib.sha256(current.read_bytes()).hexdigest() == expected:
+        elif _file_sha256(current) == expected:
             action = "unchanged"
         else:
             action = "replace"
@@ -571,13 +657,8 @@ def restore_backup(path, passphrase, app_dir=APP_DIR, include_logs=True):
         if name.startswith("logs/") and not include_logs:
             continue
         data = _b64decode(metadata.get("content", ""), name)
-        destination = root / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".restore.tmp")
-        temporary.write_bytes(data)
-        mode = int(metadata.get("mode", 0o600)) & 0o777
-        os.chmod(str(temporary), mode or 0o600)
-        os.replace(str(temporary), str(destination))
+        destination = _contained_path(root, name)
+        _atomic_write_bytes(destination, data)
         restored.append(name)
     return {"preview": preview, "restored": restored, "safety_backup": str(safety)}
 
@@ -597,18 +678,33 @@ def create_program_snapshot(app_dir=APP_DIR, version="unknown"):
         "version": str(version or "unknown"),
         "files": existing,
     }
-    with tarfile.open(str(destination), "w:gz") as archive:
-        for name in existing:
-            archive.add(str(root / name), arcname=name, recursive=False)
-        encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-        with tempfile.NamedTemporaryFile(delete=False) as handle:
-            handle.write(encoded)
-            manifest_path = Path(handle.name)
-        try:
-            archive.add(str(manifest_path), arcname="snapshot-manifest.json", recursive=False)
-        finally:
-            manifest_path.unlink(missing_ok=True)
-    os.chmod(str(destination), 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=".snapshot.tmp",
+        dir=str(destination.parent),
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with tarfile.open(str(temporary), "w:gz") as archive:
+            for name in existing:
+                archive.add(str(root / name), arcname=name, recursive=False)
+            encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            with tempfile.NamedTemporaryFile(delete=False) as handle:
+                handle.write(encoded)
+                manifest_path = Path(handle.name)
+            try:
+                archive.add(
+                    str(manifest_path),
+                    arcname="snapshot-manifest.json",
+                    recursive=False,
+                )
+            finally:
+                manifest_path.unlink(missing_ok=True)
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination
 
 
@@ -679,11 +775,12 @@ def restore_program_snapshot(snapshot_path=None, app_dir=APP_DIR):
         current_snapshot = create_program_snapshot(root, "before-rollback")
         restored = []
         for name in manifest_files:
-            destination = root / name
-            temporary = destination.with_name(destination.name + ".rollback.tmp")
-            shutil.copy2(str(staging / name), str(temporary))
-            os.chmod(str(temporary), 0o755 if name.endswith(".sh") else 0o600)
-            os.replace(str(temporary), str(destination))
+            destination = _contained_path(root, name)
+            _atomic_copy_file(
+                staging / name,
+                destination,
+                0o755 if name.endswith(".sh") else 0o600,
+            )
             restored.append(name)
     return {
         "snapshot": str(snapshot_source),

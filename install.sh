@@ -556,7 +556,7 @@ def decrypt_payload(envelope, passphrase):
         raise BackupError("不是受支持的 Aliyun Guard 备份")
     try:
         iterations = int(envelope.get("iterations"))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise BackupError("备份 KDF 参数无效") from exc
     if iterations < 100000 or iterations > 2000000:
         raise BackupError("备份 KDF 参数超出安全范围")
@@ -617,7 +617,7 @@ def _load_backup_streaming(path, passphrase):
             raise BackupError("不是受支持的 Aliyun Guard 备份")
         try:
             iterations = int(envelope.get("iterations"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise BackupError("备份 KDF 参数无效") from exc
         if iterations < 100000 or iterations > 2000000:
             raise BackupError("备份 KDF 参数超出安全范围")
@@ -675,16 +675,25 @@ def _load_backup_streaming(path, passphrase):
 
         try:
             encoded = header[marker_index + len(marker):]
+            trailing = b""
             with os.fdopen(descriptor, "wb") as plaintext:
                 while True:
                     closing_quote = encoded.find(b'"')
                     if closing_quote >= 0:
                         write_decoded(encoded[:closing_quote], plaintext)
+                        trailing = encoded[closing_quote + 1:]
                         break
                     write_decoded(encoded, plaintext)
                     encoded = source.read(64 * 1024)
                     if not encoded:
                         raise BackupError("备份中的 ciphertext 不完整")
+                while len(trailing) <= 4096:
+                    chunk = source.read(4097 - len(trailing))
+                    if not chunk:
+                        break
+                    trailing += chunk
+                if len(trailing) > 4096 or trailing.strip() != b"}":
+                    raise BackupError("备份文件尾无效")
                 if remainder:
                     try:
                         decoded = base64.b64decode(remainder, validate=True)
@@ -729,11 +738,76 @@ def _safe_relative_path(value):
     return text
 
 
+def _contained_path(root, name):
+    root = Path(root).resolve()
+    destination = root / name
+    try:
+        destination.parent.resolve().relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise BackupError("备份恢复目标超出应用目录") from exc
+    if destination.is_symlink():
+        raise BackupError("备份恢复目标不能是符号链接: {}".format(name))
+    return destination
+
+
+def _atomic_write_bytes(destination, data, mode=0o600, suffix=".restore.tmp"):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=suffix,
+        dir=str(destination.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), mode)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_copy_file(source, destination, mode):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=".rollback.tmp",
+        dir=str(destination.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with Path(source).open("rb") as source_handle, os.fdopen(
+            descriptor, "wb"
+        ) as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.chmod(str(temporary), mode)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _read_file(path):
     size = path.stat().st_size
     if size > MAX_FILE_BYTES:
         raise BackupError("文件过大，未加入备份: {}".format(path.name))
     return path.read_bytes()
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
@@ -743,6 +817,8 @@ def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
 
     def add_file(name, path):
         nonlocal total_size
+        if path.is_symlink():
+            raise BackupError("备份源文件不能是符号链接: {}".format(name))
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
             raise BackupError("文件过大，未加入备份: {}".format(path.name))
@@ -840,18 +916,28 @@ def _preview_payload(payload, app_dir=APP_DIR):
     root = Path(app_dir)
     changes = []
     config_summary = None
+    total_size = 0
     for raw_name, metadata in sorted(payload["files"].items()):
         name = _safe_relative_path(raw_name)
         if not isinstance(metadata, dict):
             raise BackupError("备份文件元数据无效")
         data = _b64decode(metadata.get("content", ""), name)
+        if len(data) > MAX_FILE_BYTES:
+            raise BackupError("备份文件超过 {} MiB 限制: {}".format(
+                MAX_FILE_BYTES // 1048576, name
+            ))
+        total_size += len(data)
+        if total_size > MAX_BACKUP_SOURCE_BYTES:
+            raise BackupError("备份源文件超过 {} MiB 限制".format(
+                MAX_BACKUP_SOURCE_BYTES // 1048576
+            ))
         expected = str(metadata.get("sha256", "")).lower()
         if hashlib.sha256(data).hexdigest() != expected:
             raise BackupError("备份内部校验失败: {}".format(name))
-        current = root / name
+        current = _contained_path(root, name)
         if not current.exists():
             action = "add"
-        elif hashlib.sha256(current.read_bytes()).hexdigest() == expected:
+        elif _file_sha256(current) == expected:
             action = "unchanged"
         else:
             action = "replace"
@@ -902,13 +988,8 @@ def restore_backup(path, passphrase, app_dir=APP_DIR, include_logs=True):
         if name.startswith("logs/") and not include_logs:
             continue
         data = _b64decode(metadata.get("content", ""), name)
-        destination = root / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".restore.tmp")
-        temporary.write_bytes(data)
-        mode = int(metadata.get("mode", 0o600)) & 0o777
-        os.chmod(str(temporary), mode or 0o600)
-        os.replace(str(temporary), str(destination))
+        destination = _contained_path(root, name)
+        _atomic_write_bytes(destination, data)
         restored.append(name)
     return {"preview": preview, "restored": restored, "safety_backup": str(safety)}
 
@@ -928,18 +1009,33 @@ def create_program_snapshot(app_dir=APP_DIR, version="unknown"):
         "version": str(version or "unknown"),
         "files": existing,
     }
-    with tarfile.open(str(destination), "w:gz") as archive:
-        for name in existing:
-            archive.add(str(root / name), arcname=name, recursive=False)
-        encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-        with tempfile.NamedTemporaryFile(delete=False) as handle:
-            handle.write(encoded)
-            manifest_path = Path(handle.name)
-        try:
-            archive.add(str(manifest_path), arcname="snapshot-manifest.json", recursive=False)
-        finally:
-            manifest_path.unlink(missing_ok=True)
-    os.chmod(str(destination), 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(destination.name),
+        suffix=".snapshot.tmp",
+        dir=str(destination.parent),
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with tarfile.open(str(temporary), "w:gz") as archive:
+            for name in existing:
+                archive.add(str(root / name), arcname=name, recursive=False)
+            encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            with tempfile.NamedTemporaryFile(delete=False) as handle:
+                handle.write(encoded)
+                manifest_path = Path(handle.name)
+            try:
+                archive.add(
+                    str(manifest_path),
+                    arcname="snapshot-manifest.json",
+                    recursive=False,
+                )
+            finally:
+                manifest_path.unlink(missing_ok=True)
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(destination))
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination
 
 
@@ -1010,11 +1106,12 @@ def restore_program_snapshot(snapshot_path=None, app_dir=APP_DIR):
         current_snapshot = create_program_snapshot(root, "before-rollback")
         restored = []
         for name in manifest_files:
-            destination = root / name
-            temporary = destination.with_name(destination.name + ".rollback.tmp")
-            shutil.copy2(str(staging / name), str(temporary))
-            os.chmod(str(temporary), 0o755 if name.endswith(".sh") else 0o600)
-            os.replace(str(temporary), str(destination))
+            destination = _contained_path(root, name)
+            _atomic_copy_file(
+                staging / name,
+                destination,
+                0o755 if name.endswith(".sh") else 0o600,
+            )
             restored.append(name)
     return {
         "snapshot": str(snapshot_source),
@@ -1077,10 +1174,15 @@ STATE_NAME = "s3-backup-state.json"
 LOCK_NAME = "s3-backup.lock"
 MAX_REMOTE_ITEMS = 5000
 RETRY_SECONDS = 15 * 60
+MAX_STATE_FILE_BYTES = 1024 * 1024
 
 
 class S3BackupError(RuntimeError):
     pass
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _load_boto3():
@@ -1131,9 +1233,21 @@ def validate_config(value, require_ready=None):
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(config.get("time", ""))):
         raise S3BackupError("S3 备份时间必须是 HH:MM")
     try:
-        config["weekday"] = int(config.get("weekday", 0))
-        config["retention"] = int(config.get("retention", 30))
-    except (TypeError, ValueError) as exc:
+        raw_weekday = config.get("weekday", 0)
+        raw_retention = config.get("retention", 30)
+        if isinstance(raw_weekday, bool) or isinstance(raw_retention, bool):
+            raise ValueError("boolean is not an integer setting")
+        config["weekday"] = int(raw_weekday)
+        config["retention"] = int(raw_retention)
+        if (
+            isinstance(raw_weekday, float)
+            and raw_weekday != config["weekday"]
+        ) or (
+            isinstance(raw_retention, float)
+            and raw_retention != config["retention"]
+        ):
+            raise ValueError("non-integral setting")
+    except (TypeError, ValueError, OverflowError) as exc:
         raise S3BackupError("S3 星期和保留份数必须是整数") from exc
     if config["weekday"] < 0 or config["weekday"] > 6:
         raise S3BackupError("S3 每周备份日期必须在 0 到 6 之间")
@@ -1456,9 +1570,15 @@ def schedule_slot(value, now=None):
 
 def _read_state(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_STATE_FILE_BYTES + 1)
+        if len(raw) > MAX_STATE_FILE_BYTES:
+            return {}
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -1469,10 +1589,26 @@ def read_status(app_dir):
 def _write_state(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(str(temporary), 0o600)
-    os.replace(str(temporary), str(path))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                value,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -1513,7 +1649,12 @@ def run_if_due(value, app_dir, now=None):
         if state.get("last_attempt_slot") == slot:
             try:
                 last_attempt = dt.datetime.fromisoformat(state["last_attempt_at"])
-                if (now - last_attempt).total_seconds() < RETRY_SECONDS:
+                if now.tzinfo is not None and last_attempt.tzinfo is None:
+                    last_attempt = last_attempt.replace(tzinfo=now.tzinfo)
+                elif now.tzinfo is None and last_attempt.tzinfo is not None:
+                    last_attempt = last_attempt.replace(tzinfo=None)
+                elapsed = (now - last_attempt).total_seconds()
+                if 0 <= elapsed < RETRY_SECONDS:
                     return None
             except (KeyError, TypeError, ValueError):
                 pass
@@ -1558,10 +1699,12 @@ __AG_S3_BACKUP_PY_EOF__
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -1575,26 +1718,43 @@ WATCHDOG_STATE_FILE = Path(
 BACKEND_FILE = APP_DIR / "service_backend"
 DISABLED_FILE = APP_DIR / "disabled"
 SERVICE_NAME = "aliyun-guard"
+MAX_STATE_FILE_BYTES = 1024 * 1024
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _atomic_write(path, value):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(str(temporary), 0o600)
-    os.replace(str(temporary), str(path))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(path.name), suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path):
     try:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_STATE_FILE_BYTES + 1)
+        if len(raw) > MAX_STATE_FILE_BYTES:
+            return {}
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -1603,7 +1763,9 @@ def heartbeat_age(now=None):
     heartbeat = read_json(HEARTBEAT_FILE)
     try:
         epoch = float(heartbeat.get("epoch"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return None, heartbeat
+    if not math.isfinite(epoch) or epoch < 0 or epoch > now + 300:
         return None, heartbeat
     return max(0.0, now - epoch), heartbeat
 
@@ -1696,8 +1858,11 @@ def check_once(now=None, restart=True, notify=True):
     age, heartbeat = heartbeat_age(now)
     state = read_json(WATCHDOG_STATE_FILE)
     stale = age is None or age > timeout_seconds
-    failed = int(state.get("failed_checks", 0) or 0)
-    outage_notified = bool(state.get("outage_notified", False))
+    try:
+        failed = max(0, int(state.get("failed_checks", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        failed = 0
+    outage_notified = state.get("outage_notified") is True
     result = {
         "status": "healthy",
         "heartbeat_age_seconds": age,
@@ -1732,8 +1897,11 @@ def check_once(now=None, restart=True, notify=True):
                         )
                     )
                 except Exception as exc:
-                    result["notification_error"] = guard.compact_error(exc)
-                outage_notified = True
+                    result["notification_error"] = guard.compact_error(
+                        exc,
+                        secrets=guard.telegram_secrets(config.get("telegram", {})),
+                    )
+                outage_notified = result["notification_error"] is None
     else:
         if outage_notified and notify:
             try:
@@ -1746,10 +1914,16 @@ def check_once(now=None, restart=True, notify=True):
                     )
                 )
             except Exception as exc:
-                result["notification_error"] = guard.compact_error(exc)
+                result["notification_error"] = guard.compact_error(
+                    exc,
+                    secrets=guard.telegram_secrets(config.get("telegram", {})),
+                )
             result["status"] = "recovered"
+            if result["notification_error"] is None:
+                outage_notified = False
+        else:
+            outage_notified = False
         failed = 0
-        outage_notified = False
     state.update(
         {
             "checked_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1843,6 +2017,10 @@ SUPPORTED_NODE_SCHEMES = (
     "anytls",
 )
 MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024
+MAX_NODE_LINK_LENGTH = 16 * 1024
+MAX_SUBSCRIPTION_NODES = 512
+MAX_SAVED_NODES = 512
+MAX_SING_BOX_ARCHIVE_BYTES = 64 * 1024 * 1024
 SUBSCRIPTION_TIMEOUT_SECONDS = 20
 
 _PROCESS = None
@@ -2185,6 +2363,8 @@ def parse_anytls_link(link):
 
 def parse_node_link(link):
     link = str(link or "").strip()
+    if len(link) > MAX_NODE_LINK_LENGTH:
+        raise ProxyError("节点链接超过长度限制")
     try:
         scheme = urllib.parse.urlsplit(link).scheme.lower()
         if scheme == "vless":
@@ -2360,6 +2540,12 @@ def _subscription_nodes_from_text(text):
         if value not in seen_nodes:
             seen_nodes.add(value)
             nodes.append(value)
+            if len(nodes) > MAX_SUBSCRIPTION_NODES:
+                raise ProxyError(
+                    "订阅节点数量超过 {} 个限制".format(
+                        MAX_SUBSCRIPTION_NODES
+                    )
+                )
     return nodes
 
 
@@ -2528,12 +2714,24 @@ def install_sing_box(progress=None):
         request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Installer"})
         try:
             with urllib.request.urlopen(request, timeout=90) as response, archive_path.open("wb") as handle:
+                content_length = response.getheader("Content-Length")
+                if (
+                    content_length
+                    and int(content_length) > MAX_SING_BOX_ARCHIVE_BYTES
+                ):
+                    raise ProxyError("sing-box 压缩包超过大小限制")
+                downloaded = 0
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
+                    downloaded += len(chunk)
+                    if downloaded > MAX_SING_BOX_ARCHIVE_BYTES:
+                        raise ProxyError("sing-box 压缩包超过大小限制")
                     digest.update(chunk)
                     handle.write(chunk)
+        except ProxyError:
+            raise
         except Exception as exc:
             raise ProxyError("sing-box 下载失败: {}".format(exc))
         if digest.hexdigest() != expected_sha256:
@@ -2549,13 +2747,19 @@ def install_sing_box(progress=None):
                 source = archive.extractfile(members[0])
                 if source is None:
                     raise ProxyError("无法读取 sing-box 可执行文件")
-                temporary_binary = bin_dir / "sing-box.tmp"
-                with temporary_binary.open("wb") as target:
-                    shutil.copyfileobj(source, target)
-                    target.flush()
-                    os.fsync(target.fileno())
-                os.chmod(str(temporary_binary), 0o700)
-                os.replace(str(temporary_binary), str(SING_BOX_BINARY))
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".sing-box-", suffix=".tmp", dir=str(bin_dir)
+                )
+                temporary_binary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    os.chmod(str(temporary_binary), 0o700)
+                    os.replace(str(temporary_binary), str(SING_BOX_BINARY))
+                finally:
+                    temporary_binary.unlink(missing_ok=True)
         except ProxyError:
             raise
         except Exception as exc:
@@ -2722,6 +2926,8 @@ POLL_TIMEOUT_SECONDS = 20
 RETRY_WAIT_SECONDS = 5
 CONFIRM_TTL_SECONDS = 90
 SCHEDULE_INPUT_TTL_SECONDS = 300
+MAX_UPDATES_PER_POLL = 100
+MAX_TELEGRAM_UPDATE_ID = (1 << 63) - 2
 
 BOT_COMMANDS = [
     {"command": "status", "description": "查看最近检测状态"},
@@ -2763,6 +2969,29 @@ def _save_offset(guard, fingerprint, offset):
         {"token_fingerprint": fingerprint, "offset": max(0, int(offset))},
         mode=0o600,
     )
+
+
+def _normalize_updates(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("Telegram getUpdates result must be a list")
+    if len(value) > MAX_UPDATES_PER_POLL:
+        raise ValueError("Telegram getUpdates result exceeds the requested limit")
+    updates = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        update_id = item.get("update_id")
+        if (
+            isinstance(update_id, bool)
+            or not isinstance(update_id, int)
+            or update_id < 0
+            or update_id > MAX_TELEGRAM_UPDATE_ID
+        ):
+            continue
+        updates.append(item)
+    return updates
 
 
 def _format_traffic(value):
@@ -3948,6 +4177,8 @@ class TelegramControlService:
         self._answer_callback(telegram, callback_id, "按钮无效", alert=True)
 
     def _handle_update(self, config, telegram, admins, update):
+        if not isinstance(update, dict):
+            return
         if isinstance(update.get("message"), dict):
             self._handle_message(config, telegram, admins, update["message"])
         elif isinstance(update.get("callback_query"), dict):
@@ -3967,16 +4198,18 @@ class TelegramControlService:
         self.fingerprint = fingerprint
         self.offset = None if self.drain_pending else _load_offset(self.guard, fingerprint)
         if self.offset is None:
-            updates = self._telegram_api(
-                telegram,
-                "getUpdates",
-                {
-                    "offset": -1,
-                    "limit": 1,
-                    "timeout": 0,
-                    "allowed_updates": json.dumps(["message", "callback_query"]),
-                },
-            ) or []
+            updates = _normalize_updates(
+                self._telegram_api(
+                    telegram,
+                    "getUpdates",
+                    {
+                        "offset": -1,
+                        "limit": 1,
+                        "timeout": 0,
+                        "allowed_updates": json.dumps(["message", "callback_query"]),
+                    },
+                )
+            )
             self.offset = (
                 max(int(item.get("update_id", -1)) for item in updates) + 1
                 if updates
@@ -4011,17 +4244,21 @@ class TelegramControlService:
                         self.stop_event.wait(RETRY_WAIT_SECONDS)
                         continue
                     self._prepare_token(telegram)
-                    updates = self._telegram_api(
-                        telegram,
-                        "getUpdates",
-                        {
-                            "offset": self.offset,
-                            "limit": 100,
-                            "timeout": POLL_TIMEOUT_SECONDS,
-                            "allowed_updates": json.dumps(["message", "callback_query"]),
-                        },
-                        long_poll=True,
-                    ) or []
+                    updates = _normalize_updates(
+                        self._telegram_api(
+                            telegram,
+                            "getUpdates",
+                            {
+                                "offset": self.offset,
+                                "limit": 100,
+                                "timeout": POLL_TIMEOUT_SECONDS,
+                                "allowed_updates": json.dumps(
+                                    ["message", "callback_query"]
+                                ),
+                            },
+                            long_poll=True,
+                        )
+                    )
                     if updates:
                         self.offset = max(
                             int(item.get("update_id", -1)) for item in updates
@@ -4074,11 +4311,13 @@ import copy
 import base64
 import functools
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -4095,6 +4334,7 @@ UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 MAX_SUBSCRIPTION_FAILURE_DETAILS = 20
+MAX_UPDATE_STATE_BYTES = 1024 * 1024
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -4129,6 +4369,10 @@ class ManagementError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _config_transaction(function):
@@ -4170,9 +4414,14 @@ def _boolean(data, name, current=False):
 
 
 def _integer(data, name, current, minimum, maximum):
+    raw = data.get(name, current)
+    if isinstance(raw, bool):
+        raise ManagementError("{}必须是整数".format(name))
     try:
-        value = int(data.get(name, current))
-    except (TypeError, ValueError):
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise ManagementError("{}必须是整数".format(name))
+    if isinstance(raw, float) and raw != value:
         raise ManagementError("{}必须是整数".format(name))
     if value < minimum or value > maximum:
         raise ManagementError(
@@ -4184,8 +4433,10 @@ def _integer(data, name, current, minimum, maximum):
 def _number(data, name, current, minimum):
     try:
         value = float(data.get(name, current))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ManagementError("{}必须是数字".format(name))
+    if not math.isfinite(value):
+        raise ManagementError("{}必须是有限数字".format(name))
     if value < minimum:
         raise ManagementError("{}不能小于 {}".format(name, minimum))
     return value
@@ -5421,21 +5672,42 @@ def _update_paths():
 def _write_update_state(data):
     _log_path, state_path = _update_paths()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = state_path.with_name(state_path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(state_path.name),
+        suffix=".tmp",
+        dir=str(state_path.parent),
     )
-    os.chmod(temporary, 0o600)
-    os.replace(str(temporary), str(state_path))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                data,
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(state_path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_update_state():
     _log_path, state_path = _update_paths()
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
+        with state_path.open("rb") as handle:
+            raw = handle.read(MAX_UPDATE_STATE_BYTES + 1)
+        if len(raw) > MAX_UPDATE_STATE_BYTES:
+            return {}
+        data = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -5511,8 +5783,22 @@ def update_progress():
         except ValueError:
             exit_code = None
     success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
-    started_at = int(state.get("started_at", 0) or 0)
-    timed_out = bool(started_at and time.time() - started_at > 3600)
+    now = time.time()
+    raw_started_at = state.get("started_at", 0)
+    invalid_started_at = False
+    try:
+        if isinstance(raw_started_at, bool):
+            raise ValueError("boolean timestamp")
+        started_at = float(raw_started_at or 0)
+        if not math.isfinite(started_at) or started_at < 0 or started_at > now + 300:
+            raise ValueError("invalid timestamp")
+    except (TypeError, ValueError, OverflowError):
+        started_at = 0
+        invalid_started_at = True
+    timed_out = bool(
+        state.get("status") == "running"
+        and (invalid_started_at or not started_at or now - started_at > 3600)
+    )
     failure = (
         state.get("status") == "error"
         or timed_out
@@ -5542,7 +5828,7 @@ def update_progress():
         "progress": max(0, min(100, int(progress))),
         "message": message,
         "target_version": state.get("target_version"),
-        "started_at": state.get("started_at"),
+        "started_at": int(started_at) if started_at else None,
         "job": state.get("job"),
     }
 
@@ -5695,6 +5981,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -5714,7 +6001,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5725,7 +6012,13 @@ MAX_BODY_BYTES = 128 * 1024 * 1024
 MAX_REQUEST_THREADS = 32
 REQUEST_SOCKET_TIMEOUT_SECONDS = 15
 SESSION_SECONDS = 12 * 60 * 60
+MAX_SESSIONS = 512
 PASSWORD_ITERATIONS = 260000
+MAX_PASSWORD_ITERATIONS = 1000000
+LOGIN_WINDOW_SECONDS = 5 * 60
+MAX_LOGIN_FAILURES = 5
+MAX_LOGIN_TRACKED_ADDRESSES = 4096
+MAX_LOG_TAIL_BYTES = 256 * 1024
 
 DEFAULT_WEB_CONFIG = {
     "enabled": False,
@@ -5735,6 +6028,20 @@ DEFAULT_WEB_CONFIG = {
     "password_hash": "",
     "cookie_secure": False,
 }
+
+
+def _json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 class WebPanelError(RuntimeError):
@@ -5763,8 +6070,11 @@ def verify_password(password, encoded):
             return False
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(expected_hex)
+        iteration_count = int(iterations)
+        if iteration_count < 1 or iteration_count > MAX_PASSWORD_ITERATIONS:
+            return False
         actual = hashlib.pbkdf2_hmac(
-            "sha256", str(password or "").encode("utf-8"), salt, int(iterations)
+            "sha256", str(password or "").encode("utf-8"), salt, iteration_count
         )
         return hmac.compare_digest(actual, expected)
     except (TypeError, ValueError):
@@ -5783,12 +6093,23 @@ def get_web_config(config):
     result["cookie_secure"] = bool(result.get("cookie_secure", False))
     try:
         result["port"] = int(result.get("port", 8765))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         result["port"] = 0
     return result
 
 
 def validate_web_config(config):
+    configured = config.get("web_panel", {}) if isinstance(config, dict) else {}
+    if not isinstance(configured, dict):
+        raise WebPanelError("web_panel 必须是对象")
+    for field in ("enabled", "cookie_secure"):
+        if field in configured and not isinstance(configured[field], bool):
+            raise WebPanelError("web_panel.{} 必须是布尔值".format(field))
+    raw_port = configured.get("port", DEFAULT_WEB_CONFIG["port"])
+    if isinstance(raw_port, bool) or (
+        isinstance(raw_port, float) and not raw_port.is_integer()
+    ):
+        raise WebPanelError("网页面板端口必须是整数")
     web = get_web_config(config)
     if web["host"] not in ("127.0.0.1", "0.0.0.0"):
         raise WebPanelError("网页面板监听地址只能是 127.0.0.1 或 0.0.0.0")
@@ -5796,6 +6117,8 @@ def validate_web_config(config):
         raise WebPanelError("网页面板端口必须在 1024 到 65535 之间")
     if not web["username"] or len(web["username"]) > 64:
         raise WebPanelError("网页面板用户名不能为空且不能超过 64 个字符")
+    if len(web["password_hash"]) > 1024:
+        raise WebPanelError("网页面板密码哈希过长")
     if web["enabled"]:
         if not web["password_hash"] or not web["password_hash"].startswith(
             "pbkdf2_sha256$"
@@ -6040,11 +6363,30 @@ def _read_recent_log_path(path, limit):
     if not path.exists():
         return []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            chunks = []
+            bytes_read = 0
+            newline_count = 0
+            while position > 0 and bytes_read < MAX_LOG_TAIL_BYTES:
+                chunk_size = min(
+                    64 * 1024,
+                    position,
+                    MAX_LOG_TAIL_BYTES - bytes_read,
+                )
+                position -= chunk_size
+                handle.seek(position)
+                chunk = handle.read(chunk_size)
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+                newline_count += chunk.count(b"\n")
+                if newline_count > limit:
+                    break
     except OSError as exc:
         raise WebPanelError("无法读取日志: {}".format(exc), 500)
-    return [line.rstrip("\r\n") for line in lines[-limit:]]
+    text = b"".join(reversed(chunks)).decode("utf-8", "replace")
+    return text.splitlines()[-limit:]
 
 
 def logs_payload(guard, limit=200, instance_index=None):
@@ -6398,7 +6740,7 @@ def control_instance(
                 },
             }
         )
-        state["history"] = history[-576:]
+        state["history"] = history[-guard.MAX_HISTORY_ENTRIES:]
         guard.save_state(state)
         return {
             "before": before,
@@ -6480,6 +6822,12 @@ class PanelServer(ThreadingHTTPServer):
                 for key, value in self.sessions.items()
                 if value.get("expires", 0) >= now
             }
+            while len(self.sessions) >= MAX_SESSIONS:
+                oldest = min(
+                    self.sessions,
+                    key=lambda key: self.sessions[key].get("expires", 0),
+                )
+                self.sessions.pop(oldest, None)
             self.sessions[session_id] = data
         return session_id, data
 
@@ -6500,20 +6848,28 @@ class PanelServer(ThreadingHTTPServer):
         with self.session_lock:
             self.sessions.pop(session_id, None)
 
-    def login_allowed(self, address):
+    def begin_login_attempt(self, address):
         now = time.time()
         with self.login_attempt_lock:
-            attempts = [
-                value
-                for value in self.login_attempts.get(address, [])
-                if now - value < 300
-            ]
+            for tracked_address, values in list(self.login_attempts.items()):
+                recent = [
+                    value
+                    for value in values
+                    if 0 <= now - value < LOGIN_WINDOW_SECONDS
+                ]
+                if recent:
+                    self.login_attempts[tracked_address] = recent
+                else:
+                    self.login_attempts.pop(tracked_address, None)
+            attempts = self.login_attempts.pop(address, [])
+            if len(attempts) >= MAX_LOGIN_FAILURES:
+                self.login_attempts[address] = attempts
+                return False
+            while len(self.login_attempts) >= MAX_LOGIN_TRACKED_ADDRESSES:
+                self.login_attempts.pop(next(iter(self.login_attempts)))
+            attempts.append(now)
             self.login_attempts[address] = attempts
-            return len(attempts) < 5
-
-    def record_login_failure(self, address):
-        with self.login_attempt_lock:
-            self.login_attempts.setdefault(address, []).append(time.time())
+            return True
 
     def clear_login_failures(self, address):
         with self.login_attempt_lock:
@@ -6615,7 +6971,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _json(self, value, status=200, extra=None):
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(
+            _json_safe(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
         self._base_headers("application/json; charset=utf-8", len(body), status, extra)
         self.wfile.write(body)
 
@@ -6638,7 +6999,10 @@ class PanelHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > maximum:
             raise WebPanelError("请求内容为空或过大", 413)
         try:
-            value = json.loads(self.rfile.read(length).decode("utf-8"))
+            value = json.loads(
+                self.rfile.read(length).decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
         except (UnicodeDecodeError, ValueError):
             raise WebPanelError("JSON 请求格式无效")
         if not isinstance(value, dict):
@@ -6988,7 +7352,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def _handle_login(self):
         address = self.client_address[0]
-        if not self.server.login_allowed(address):
+        if not self.server.begin_login_attempt(address):
             raise WebPanelError("登录失败次数过多，请 5 分钟后再试", 429)
         data = self._read_json()
         config = self.server.guard.load_config()
@@ -6998,7 +7362,6 @@ class PanelHandler(BaseHTTPRequestHandler):
         )
         password_ok = verify_password(data.get("password", ""), web["password_hash"])
         if not username_ok or not password_ok:
-            self.server.record_login_failure(address)
             raise WebPanelError("用户名或密码错误", 401)
         self.server.clear_login_failures(address)
         session_id, session = self.server.create_session()
@@ -9204,6 +9567,7 @@ import hashlib
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import math
 import os
 from pathlib import Path
 import re
@@ -9328,11 +9692,47 @@ _CONFIG_THREAD_LOCK = threading.RLock()
 _JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
+MAX_MONITORED_INSTANCES = 256
+MAX_DISCOVERED_INSTANCES = 5000
+MAX_HISTORY_ENTRIES = 96
+MAX_TELEGRAM_RESPONSE_BYTES = 1024 * 1024
+MAX_ALIYUN_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_JSON_FILE_BYTES = 8 * 1024 * 1024
+USER_TEXT_LIMITS = {
+    "name": 200,
+    "ak": 256,
+    "sk": 512,
+    "region": 128,
+    "instance_id": 256,
+}
 _TELEGRAM_LOCAL = threading.local()
 
 
 class GuardError(RuntimeError):
     pass
+
+
+def _decode_json_object(payload, label="API"):
+    """Decode one bounded SDK response and require a JSON object envelope."""
+    if isinstance(payload, str):
+        try:
+            raw = payload.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise GuardError("{} response is not valid UTF-8".format(label)) from exc
+    elif isinstance(payload, (bytes, bytearray, memoryview)):
+        raw = bytes(payload)
+    else:
+        raise GuardError("{} response body is invalid".format(label))
+    if len(raw) > MAX_ALIYUN_RESPONSE_BYTES:
+        raise GuardError("{} response exceeds 8 MiB".format(label))
+    try:
+        text = raw.decode("utf-8")
+        data = json.loads(text)
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise GuardError("{} returned invalid JSON".format(label)) from exc
+    if not isinstance(data, dict):
+        raise GuardError("{} response root must be an object".format(label))
+    return data
 
 
 def configure_logging(console=True):
@@ -9474,13 +9874,27 @@ def telegram_control_admin_ids(telegram):
     return [chat_id] if chat_id > 0 else []
 
 
+def _reject_json_constant(constant):
+    raise ValueError("不支持的 JSON 数值: {}".format(constant))
+
+
 def load_json(path, default):
+    path = Path(path)
     if not path.exists():
         return json.loads(json.dumps(default))
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (OSError, ValueError) as exc:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_JSON_FILE_BYTES + 1)
+        if len(raw) > MAX_JSON_FILE_BYTES:
+            raise GuardError("{} 超过 {} MiB 限制".format(
+                path, MAX_JSON_FILE_BYTES // (1024 * 1024)
+            ))
+        value = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
+    except GuardError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise GuardError("无法读取 {}: {}".format(path, exc))
     if not isinstance(value, dict):
         raise GuardError("{} 的顶层必须是 JSON 对象".format(path))
@@ -9512,7 +9926,14 @@ def atomic_write_json(path, value, mode=0o600, durable=True):
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=False)
+                json.dump(
+                    value,
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=False,
+                    allow_nan=False,
+                )
                 handle.write("\n")
                 if durable:
                     handle.flush()
@@ -9559,27 +9980,30 @@ def write_heartbeat(status="running", detail=None, now=None):
 
 
 def validate_config(config):
-    try:
-        interval = int(config.get("interval_seconds", 0))
-    except (TypeError, ValueError):
-        raise GuardError("interval_seconds 必须是整数")
-    if interval < 60:
-        raise GuardError("interval_seconds 不能小于 60 秒")
-    try:
-        billing_cache_seconds = int(
-            config.get("billing_cache_seconds", DEFAULT_CONFIG["billing_cache_seconds"])
-        )
-    except (TypeError, ValueError):
-        raise GuardError("billing_cache_seconds 必须是整数")
-    if not 300 <= billing_cache_seconds <= 86400:
-        raise GuardError("billing_cache_seconds 必须在 300 到 86400 秒之间")
-    for field, minimum in (("start_wait_seconds", 0), ("stop_wait_seconds", 0), ("start_poll_seconds", 1)):
-        try:
-            value = int(config.get(field, DEFAULT_CONFIG[field]))
-        except (TypeError, ValueError):
+    integer_fields = (
+        ("interval_seconds", 60, 86400),
+        ("billing_cache_seconds", 300, 86400),
+        ("start_wait_seconds", 0, 600),
+        ("stop_wait_seconds", 0, 600),
+        ("start_poll_seconds", 1, 60),
+    )
+    for field, minimum, maximum in integer_fields:
+        raw = config.get(field, DEFAULT_CONFIG[field])
+        if isinstance(raw, bool):
             raise GuardError("{} 必须是整数".format(field))
-        if value < minimum:
-            raise GuardError("{} 不能小于 {}".format(field, minimum))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise GuardError("{} 必须是整数".format(field))
+        if isinstance(raw, float) and raw != value:
+            raise GuardError("{} 必须是整数".format(field))
+        if value < minimum or value > maximum:
+            raise GuardError(
+                "{} 必须在 {} 到 {} 之间".format(field, minimum, maximum)
+            )
+    for field in ("notify_on_daemon_start", "force_ipv4"):
+        if not isinstance(config.get(field, DEFAULT_CONFIG[field]), bool):
+            raise GuardError("{} 必须是布尔值".format(field))
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
@@ -9588,11 +10012,30 @@ def validate_config(config):
         raise GuardError("watchdog 必须是对象")
     if "enabled" in watchdog and not isinstance(watchdog.get("enabled"), bool):
         raise GuardError("watchdog.enabled 必须是布尔值")
-    try:
-        watchdog_timeout = int(watchdog.get("timeout_seconds", 600))
-        watchdog_failures = int(watchdog.get("failure_threshold", 2))
-    except (TypeError, ValueError):
-        raise GuardError("看门狗超时和连续失败次数必须是整数")
+    watchdog_numbers = (
+        ("timeout_seconds", 600, 120, 86400),
+        ("failure_threshold", 2, 1, 10),
+    )
+    parsed_watchdog = {}
+    for field, default, minimum, maximum in watchdog_numbers:
+        raw = watchdog.get(field, default)
+        if isinstance(raw, bool):
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        if isinstance(raw, float) and raw != value:
+            raise GuardError("看门狗超时和连续失败次数必须是整数")
+        if value < minimum or value > maximum:
+            raise GuardError(
+                "watchdog.{} 必须在 {} 到 {} 之间".format(
+                    field, minimum, maximum
+                )
+            )
+        parsed_watchdog[field] = value
+    watchdog_timeout = parsed_watchdog["timeout_seconds"]
+    watchdog_failures = parsed_watchdog["failure_threshold"]
     if watchdog_timeout < 120 or watchdog_timeout > 86400:
         raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
     if watchdog_failures < 1 or watchdog_failures > 10:
@@ -9615,6 +10058,10 @@ def validate_config(config):
     users = config.get("users")
     if not isinstance(users, list):
         raise GuardError("users 必须是数组")
+    if len(users) > MAX_MONITORED_INSTANCES:
+        raise GuardError(
+            "监控实例不能超过 {} 个".format(MAX_MONITORED_INSTANCES)
+        )
     seen = set()
     for index, user in enumerate(users, 1):
         if not isinstance(user, dict):
@@ -9623,18 +10070,30 @@ def validate_config(config):
             user["instance_log_enabled"], bool
         ):
             raise GuardError("第 {} 个实例的独立日志开关必须是布尔值".format(index))
-        for field in ("name", "ak", "sk", "region", "instance_id"):
-            if not str(user.get(field, "")).strip():
+        for field in ("actions_enabled", "paused"):
+            if field in user and not isinstance(user[field], bool):
+                raise GuardError(
+                    "第 {} 个实例的 {} 必须是布尔值".format(index, field)
+                )
+        for field, maximum in USER_TEXT_LIMITS.items():
+            raw_text = user.get(field, "")
+            if not isinstance(raw_text, str) or not raw_text.strip():
                 raise GuardError("第 {} 个实例缺少 {}".format(index, field))
+            if len(raw_text.strip()) > maximum:
+                raise GuardError(
+                    "第 {} 个实例的 {} 不能超过 {} 个字符".format(
+                        index, field, maximum
+                    )
+                )
         identity = (str(user["ak"]).strip(), str(user["region"]).strip(), str(user["instance_id"]).strip())
         if identity in seen:
             raise GuardError("第 {} 个实例重复配置".format(index))
         seen.add(identity)
         try:
             limit = float(user.get("traffic_limit_gb", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise GuardError("第 {} 个实例的流量阈值无效".format(index))
-        if limit <= 0:
+        if not math.isfinite(limit) or limit <= 0:
             raise GuardError("第 {} 个实例的流量阈值必须大于 0".format(index))
         configured_schedule = user.get("schedule")
         if configured_schedule is not None and not isinstance(configured_schedule, dict):
@@ -9648,11 +10107,34 @@ def validate_config(config):
             stop_time = normalize_schedule_time(schedule["stop_time"], "关机时间")
             if start_time == stop_time:
                 raise GuardError("第 {} 个实例的开机时间和关机时间不能相同".format(index))
+        configured_billing = user.get("billing")
+        if configured_billing is not None and not isinstance(
+            configured_billing, dict
+        ):
+            raise GuardError("第 {} 个实例的账单配置必须是对象".format(index))
+        if isinstance(configured_billing, dict):
+            raw_billing_enabled = configured_billing.get("enabled", True)
+        else:
+            raw_billing_enabled = user.get("billing_enabled", True)
+        if not isinstance(raw_billing_enabled, bool):
+            raise GuardError("第 {} 个实例的账单开关必须是布尔值".format(index))
         billing = get_billing_config(user)
+        if not isinstance(billing.get("enabled", True), bool):
+            raise GuardError("第 {} 个实例的账单开关必须是布尔值".format(index))
         if billing.get("enabled", True):
-            for field in ("endpoint", "region", "currency_code", "currency_symbol"):
-                if not str(billing.get(field, "")).strip():
+            for field, maximum in (
+                ("endpoint", 512),
+                ("region", 128),
+                ("currency_code", 16),
+                ("currency_symbol", 16),
+            ):
+                value = billing.get(field, "")
+                if not isinstance(value, str) or not value.strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+                if len(value.strip()) > maximum:
+                    raise GuardError(
+                        "第 {} 个实例的账单配置 {} 过长".format(index, field)
+                    )
 
 
 def validate_telegram_config(telegram):
@@ -9661,12 +10143,19 @@ def validate_telegram_config(telegram):
     try:
         timeout = int(telegram.get("timeout_seconds", 12))
         retries = int(telegram.get("retries", 3))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        raise GuardError("Telegram 超时和重试次数必须是整数")
+    if isinstance(telegram.get("timeout_seconds", 12), bool) or isinstance(
+        telegram.get("retries", 3), bool
+    ):
         raise GuardError("Telegram 超时和重试次数必须是整数")
     if timeout < 3 or timeout > 60:
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    for field, maximum in (("bot_token", 512), ("chat_id", 128)):
+        if len(str(telegram.get(field, "") or "")) > maximum:
+            raise GuardError("Telegram {} 过长".format(field))
     if "control_enabled" in telegram and not isinstance(
         telegram.get("control_enabled"), bool
     ):
@@ -9678,10 +10167,18 @@ def validate_telegram_config(telegram):
     saved_nodes = telegram.get("node_urls", [])
     if not isinstance(saved_nodes, list):
         raise GuardError("Telegram 已保存节点必须是数组")
+    if len(saved_nodes) > telegram_proxy.MAX_SAVED_NODES:
+        raise GuardError(
+            "Telegram 已保存节点不能超过 {} 个".format(
+                telegram_proxy.MAX_SAVED_NODES
+            )
+        )
     saved_node_values = set()
     for index, node_url in enumerate(saved_nodes, 1):
         if not isinstance(node_url, str) or not node_url.strip():
             raise GuardError("Telegram 第 {} 个已保存节点无效".format(index))
+        if len(node_url.strip()) > telegram_proxy.MAX_NODE_LINK_LENGTH:
+            raise GuardError("Telegram 第 {} 个已保存节点过长".format(index))
         saved_node_values.add(node_url.strip())
     subscription_url = str(telegram.get("subscription_url", "") or "").strip()
     if len(subscription_url) > 4096:
@@ -9700,6 +10197,12 @@ def validate_telegram_config(telegram):
     subscription_nodes = telegram.get("subscription_node_urls", [])
     if not isinstance(subscription_nodes, list):
         raise GuardError("Telegram 订阅节点必须是数组")
+    if len(subscription_nodes) > telegram_proxy.MAX_SUBSCRIPTION_NODES:
+        raise GuardError(
+            "Telegram 订阅节点不能超过 {} 个".format(
+                telegram_proxy.MAX_SUBSCRIPTION_NODES
+            )
+        )
     for index, node_url in enumerate(subscription_nodes, 1):
         if not isinstance(node_url, str) or not node_url.strip():
             raise GuardError("Telegram 第 {} 个订阅节点无效".format(index))
@@ -9708,12 +10211,14 @@ def validate_telegram_config(telegram):
     for field in ("subscription_last_refresh_epoch", "subscription_last_attempt_epoch"):
         try:
             timestamp = float(telegram.get(field, 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise GuardError("Telegram 订阅刷新时间无效")
-        if timestamp < 0:
+        if not math.isfinite(timestamp) or timestamp < 0:
             raise GuardError("Telegram 订阅刷新时间无效")
     if mode in ("socks5", "http"):
         proxy_url = str(telegram.get("proxy_url", "")).strip()
+        if len(proxy_url) > 4096:
+            raise GuardError("Telegram 代理地址过长")
         parsed = urllib.parse.urlsplit(proxy_url)
         allowed = ("socks5", "socks5h") if mode == "socks5" else ("http", "https")
         try:
@@ -9729,6 +10234,8 @@ def validate_telegram_config(telegram):
             raise GuardError("Telegram 节点链接无效: {}".format(exc))
     if mode == "api_proxy":
         base_url = str(telegram.get("api_base_url", "")).strip().rstrip("/")
+        if len(base_url) > 4096:
+            raise GuardError("Telegram API 反向代理地址过长")
         parsed = urllib.parse.urlsplit(base_url)
         try:
             parsed.port
@@ -10040,14 +10547,33 @@ def next_schedule_event(user, now=None):
 
 
 def normalize_bill_items(data):
-    items = data.get("Data", {}).get("Items", []) if isinstance(data, dict) else []
+    section = data.get("Data", {}) if isinstance(data, dict) else {}
+    if not isinstance(section, dict):
+        raise GuardError("BSS 返回的 Data 格式无法识别")
+    items = section.get("Items", [])
     if isinstance(items, dict):
         items = items.get("Item", [])
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
         raise GuardError("BSS 返回的 Data.Items 格式无法识别")
-    return [item for item in items if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in items):
+        raise GuardError("BSS 返回的账单项目格式无法识别")
+    return items
+
+
+def _nested_api_items(data, container_key, item_key, label):
+    container = data.get(container_key, {})
+    if not isinstance(container, dict):
+        raise GuardError("{} 返回的 {} 格式无法识别".format(label, container_key))
+    items = container.get(item_key, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or any(
+        not isinstance(item, dict) for item in items
+    ):
+        raise GuardError("{} 返回的 {} 列表格式无法识别".format(label, item_key))
+    return items
 
 
 def query_instance_bill(user):
@@ -10070,7 +10596,7 @@ def query_instance_bill(user):
     request.add_query_param("PageNum", "1")
     request.add_query_param("PageSize", "300")
     response = make_client(user, str(billing["region"]).strip()).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
+    data = _decode_json_object(response, "BSS")
     if data.get("Success") is False:
         raise GuardError(
             "{}: {}".format(data.get("Code", "BSSRequestFailed"), data.get("Message", "请求失败"))
@@ -10078,8 +10604,13 @@ def query_instance_bill(user):
     if "Data" not in data:
         raise GuardError("BSS 返回缺少 Data 字段")
     items = normalize_bill_items(data)
-    amount = sum(float(item.get("PretaxAmount", 0) or 0) for item in items)
-    currency = str(data.get("Data", {}).get("Currency", "") or "")
+    try:
+        amount = sum(float(item.get("PretaxAmount", 0) or 0) for item in items)
+    except (TypeError, ValueError, OverflowError):
+        raise GuardError("BSS 返回的账单金额无效")
+    if not math.isfinite(amount):
+        raise GuardError("BSS 返回的账单金额无效")
+    currency = str(data["Data"].get("Currency", "") or "")
     if not currency:
         for item in items:
             if item.get("Currency"):
@@ -10114,6 +10645,21 @@ def billing_cache_entries(state):
     return cache
 
 
+def _state_datetime(value, reference):
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if reference.tzinfo is None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+    elif parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=reference.tzinfo)
+    else:
+        parsed = parsed.astimezone(reference.tzinfo)
+    return parsed
+
+
 def query_instance_bill_cached(
     user,
     state,
@@ -10122,15 +10668,36 @@ def query_instance_bill_cached(
     force_refresh=False,
 ):
     now = now or dt.datetime.now().astimezone()
+    try:
+        cache_window = max(0, min(int(cache_seconds), 86400))
+    except (TypeError, ValueError, OverflowError):
+        cache_window = 0
     cache = billing_cache_entries(state)
     key = billing_cache_key(user, now)
     cached = cache.get(key)
-    if isinstance(cached, dict) and not force_refresh and int(cache_seconds) > 0:
+    if isinstance(cached, dict):
         try:
-            next_refresh_at = dt.datetime.fromisoformat(
-                str(cached.get("next_refresh_at") or cached["checked_at"])
-            )
-        except (KeyError, TypeError, ValueError):
+            cached_amount = float(cached.get("amount"))
+        except (TypeError, ValueError, OverflowError):
+            cached_amount = None
+        checked_at = _state_datetime(cached.get("checked_at"), now)
+        if (
+            cached_amount is None
+            or not math.isfinite(cached_amount)
+            or checked_at is None
+            or checked_at > now + dt.timedelta(minutes=5)
+        ):
+            cache.pop(key, None)
+            cached = None
+        else:
+            cached["amount"] = cached_amount
+    if isinstance(cached, dict) and not force_refresh and cache_window > 0:
+        next_refresh_at = _state_datetime(
+            cached.get("next_refresh_at") or cached.get("checked_at"), now
+        )
+        if next_refresh_at is not None and next_refresh_at > now + dt.timedelta(
+            seconds=cache_window + 300
+        ):
             next_refresh_at = None
         if next_refresh_at is not None and now < next_refresh_at:
             return (
@@ -10145,7 +10712,7 @@ def query_instance_bill_cached(
     except Exception as exc:
         if isinstance(cached, dict) and cached.get("checked_at"):
             cached["next_refresh_at"] = (
-                now + dt.timedelta(seconds=min(int(cache_seconds), 900))
+                now + dt.timedelta(seconds=min(cache_window, 900))
             ).isoformat(timespec="seconds")
             return (
                 cached.get("amount"),
@@ -10161,7 +10728,7 @@ def query_instance_bill_cached(
         "currency": currency,
         "checked_at": checked_at,
         "next_refresh_at": (
-            now + dt.timedelta(seconds=int(cache_seconds))
+            now + dt.timedelta(seconds=cache_window)
         ).isoformat(timespec="seconds"),
         "instance_id": str(user.get("instance_id", "") or ""),
         "billing_cycle": now.strftime("%Y-%m"),
@@ -10197,9 +10764,21 @@ def query_cdt_traffic_gb(user):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
+    data = _decode_json_object(response, "CDT")
     details = data.get("TrafficDetails", [])
-    total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
+    if not isinstance(details, list):
+        raise GuardError("CDT 返回的 TrafficDetails 格式无法识别")
+    try:
+        traffic_values = [
+            float(item.get("Traffic", 0) or 0) for item in details
+        ]
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise GuardError("CDT 返回的流量数值无效")
+    if any(not math.isfinite(value) or value < 0 for value in traffic_values):
+        raise GuardError("CDT 返回的流量数值无效")
+    total_bytes = sum(traffic_values)
+    if not math.isfinite(total_bytes):
+        raise GuardError("CDT 返回的流量数值无效")
     return total_bytes / (1024.0 ** 3)
 
 
@@ -10239,8 +10818,8 @@ def query_instance_status(user):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(user).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    instances = data.get("Instances", {}).get("Instance", [])
+    data = _decode_json_object(response, "ECS")
+    instances = _nested_api_items(data, "Instances", "Instance", "ECS")
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
@@ -10277,10 +10856,8 @@ def query_instance_statuses(users):
     request.set_connect_timeout(5000)
     request.set_read_timeout(15000)
     response = make_client(users[0]).do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    instances = data.get("Instances", {}).get("Instance", [])
-    if not isinstance(instances, list):
-        raise GuardError("ECS 返回实例列表格式无法识别")
+    data = _decode_json_object(response, "ECS")
+    instances = _nested_api_items(data, "Instances", "Instance", "ECS")
     return {
         str(item.get("InstanceId", "")): str(item.get("Status", "Unknown"))
         for item in instances
@@ -10349,7 +10926,10 @@ def prefetch_instance_statuses(users):
 
 
 def _instance_tags(instance):
-    raw = instance.get("Tags", {}).get("Tag", []) if isinstance(instance, dict) else []
+    tags = instance.get("Tags", {}) if isinstance(instance, dict) else {}
+    if not isinstance(tags, dict):
+        return {}
+    raw = tags.get("Tag", [])
     if isinstance(raw, dict):
         raw = [raw]
     if not isinstance(raw, list):
@@ -10359,6 +10939,18 @@ def _instance_tags(instance):
         for item in raw
         if isinstance(item, dict) and str(item.get("TagKey", ""))
     }
+
+
+def _instance_public_ip(instance):
+    container = instance.get("PublicIpAddress", {})
+    if not isinstance(container, dict):
+        return ""
+    addresses = container.get("IpAddress", [])
+    if not isinstance(addresses, list):
+        return ""
+    return next(
+        (str(value).strip() for value in addresses if str(value).strip()), ""
+    )
 
 
 def discover_ecs_regions(ak, sk):
@@ -10378,12 +10970,8 @@ def discover_ecs_regions(ak, sk):
     request.set_read_timeout(15000)
     credentials = {"ak": access_key, "sk": secret_key}
     response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
-    data = json.loads(response.decode("utf-8"))
-    regions = data.get("Regions", {}).get("Region", [])
-    if isinstance(regions, dict):
-        regions = [regions]
-    if not isinstance(regions, list):
-        raise GuardError("ECS 返回 Region 列表格式无法识别")
+    data = _decode_json_object(response, "ECS")
+    regions = _nested_api_items(data, "Regions", "Region", "ECS")
     result = []
     for item in regions:
         region = str(item.get("RegionId", "") if isinstance(item, dict) else "").strip()
@@ -10411,6 +10999,7 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
     tag_value = str(tag_value or "").strip()
     results = []
     errors = []
+    truncated = False
     credentials = {"ak": access_key, "sk": secret_key}
     for region in region_values:
         try:
@@ -10424,12 +11013,10 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                 request.set_connect_timeout(5000)
                 request.set_read_timeout(20000)
                 response = make_client(credentials, region).do_action_with_exception(request)
-                data = json.loads(response.decode("utf-8"))
-                instances = data.get("Instances", {}).get("Instance", [])
-                if isinstance(instances, dict):
-                    instances = [instances]
-                if not isinstance(instances, list):
-                    raise GuardError("ECS 返回实例列表格式无法识别")
+                data = _decode_json_object(response, "ECS")
+                instances = _nested_api_items(
+                    data, "Instances", "Instance", "ECS"
+                )
                 for instance in instances:
                     if not isinstance(instance, dict):
                         continue
@@ -10449,12 +11036,15 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                             "status": str(instance.get("Status", "Unknown")),
                             "zone_id": str(instance.get("ZoneId", "")),
                             "instance_type": str(instance.get("InstanceType", "")),
-                            "public_ip": str(
-                                (instance.get("PublicIpAddress", {}).get("IpAddress", []) or [""])[0]
-                            ),
+                            "public_ip": _instance_public_ip(instance),
                             "tags": tags,
                         }
                     )
+                    if len(results) >= MAX_DISCOVERED_INSTANCES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
                 total = int(data.get("TotalCount", len(instances)) or 0)
                 if page * 100 >= total or not instances:
                     break
@@ -10466,7 +11056,14 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                     "error": compact_error(exc, secrets=(access_key, secret_key)),
                 }
             )
-    return {"instances": results, "errors": errors, "regions": region_values}
+        if truncated:
+            break
+    return {
+        "instances": results,
+        "errors": errors,
+        "regions": region_values,
+        "truncated": truncated,
+    }
 
 
 def start_instance(user):
@@ -10641,7 +11238,62 @@ def _telegram_post(url, data, timeout, proxies):
         session.trust_env = False
         _TELEGRAM_LOCAL.session = session
         _TELEGRAM_LOCAL.connection_key = connection_key
-    return session.post(url, data=data, timeout=timeout, proxies=proxies)
+    return session.post(
+        url,
+        data=data,
+        timeout=timeout,
+        proxies=proxies,
+        stream=True,
+    )
+
+
+def _read_telegram_response(response):
+    chunks = []
+    total = 0
+    saw_chunk = False
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        try:
+            for chunk in iterator(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                saw_chunk = True
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                elif isinstance(chunk, (bytearray, memoryview)):
+                    chunk = bytes(chunk)
+                elif not isinstance(chunk, bytes):
+                    raise GuardError("Telegram response contains invalid data")
+                total += len(chunk)
+                if total > MAX_TELEGRAM_RESPONSE_BYTES:
+                    raise GuardError("Telegram response exceeds 1 MiB")
+                chunks.append(chunk)
+        except GuardError:
+            raise
+        except (AttributeError, TypeError):
+            saw_chunk = False
+            chunks = []
+
+    if saw_chunk:
+        raw = b"".join(chunks)
+    else:
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            raw = bytes(content)
+        else:
+            text = getattr(response, "text", "")
+            if isinstance(text, bytes):
+                raw = text
+            elif isinstance(text, str):
+                raw = text.encode("utf-8")
+            else:
+                raise GuardError("Telegram response body is invalid")
+        if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
+            raise GuardError("Telegram response exceeds 1 MiB")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GuardError("Telegram response is not valid UTF-8") from exc
 
 
 def close_telegram_session():
@@ -10675,7 +11327,13 @@ def telegram_api(config, method, data=None, request_timeout=None):
     for attempt in range(1, retries + 1):
         try:
             response = _telegram_post(url, data or {}, timeout, proxies)
-            body = response.text
+            try:
+                body = _read_telegram_response(response)
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             if response.status_code >= 400:
                 if response.status_code not in (429, 500, 502, 503, 504) or attempt >= retries:
                     raise GuardError(
@@ -10715,10 +11373,12 @@ def telegram_api(config, method, data=None, request_timeout=None):
                 )
             time.sleep(min(2 ** attempt, 8))
     try:
-        result = json.loads(body)
+        result = json.loads(body, parse_constant=_reject_json_constant)
     except ValueError:
         raise GuardError("Telegram 返回了无效 JSON")
-    if not result.get("ok"):
+    if not isinstance(result, dict):
+        raise GuardError("Telegram response root must be an object")
+    if result.get("ok") is not True:
         raise GuardError("Telegram API 拒绝请求: {}".format(result.get("description", body[:300])))
     return result.get("result")
 
@@ -10758,19 +11418,27 @@ def send_telegram_message(telegram, text):
     return results
 
 
-def _subscription_timestamp(telegram, field):
+def _subscription_timestamp(telegram, field, now=None):
+    now = time.time() if now is None else float(now)
     try:
-        return max(0.0, float(telegram.get(field, 0) or 0))
-    except (TypeError, ValueError):
+        timestamp = float(telegram.get(field, 0) or 0)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    if not math.isfinite(timestamp) or timestamp < 0 or timestamp > now + 300:
+        return 0.0
+    return timestamp
 
 
 def telegram_subscription_refresh_due(telegram, now=None):
     now = time.time() if now is None else float(now)
     if not str(telegram.get("subscription_url", "") or "").strip():
         return False
-    last_refresh = _subscription_timestamp(telegram, "subscription_last_refresh_epoch")
-    last_attempt = _subscription_timestamp(telegram, "subscription_last_attempt_epoch")
+    last_refresh = _subscription_timestamp(
+        telegram, "subscription_last_refresh_epoch", now
+    )
+    last_attempt = _subscription_timestamp(
+        telegram, "subscription_last_attempt_epoch", now
+    )
     return (
         now - last_refresh >= SUBSCRIPTION_REFRESH_SECONDS
         and now - last_attempt >= SUBSCRIPTION_RETRY_SECONDS
@@ -11363,6 +12031,8 @@ def should_notify(config, results, previous_state):
         previous = {}
     for item in results:
         old = previous.get(item["instance_id"], {})
+        if not isinstance(old, dict):
+            old = {}
         if old.get("status_after") and old.get("status_after") != item.get("status_after"):
             return True
     return False
@@ -11384,15 +12054,23 @@ def update_state(
     state["last_cycle_error_count"] = error_count
     state["last_cycle_ok"] = error_count == 0
     state["last_summary"] = summary
-    state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
+    try:
+        cycle_count = int(state.get("cycle_count", 0))
+    except (TypeError, ValueError, OverflowError):
+        cycle_count = 0
+    state["cycle_count"] = max(0, cycle_count) + 1
     state["telegram_error"] = notify_error
     if not dry_run:
         state["last_cycle_epoch"] = started_at.timestamp()
         state["cdt_month_checked"] = cdt_month_key(started_at)
-    if not isinstance(state.get("instances"), dict):
-        state["instances"] = {}
+    previous_instances = state.get("instances")
+    if not isinstance(previous_instances, dict):
+        previous_instances = {}
+    current_instances = {}
     for item in results:
-        previous_instance = state["instances"].get(item["instance_id"], {})
+        previous_instance = previous_instances.get(item["instance_id"], {})
+        if not isinstance(previous_instance, dict):
+            previous_instance = {}
         instance_state = {
             "name": item["name"],
             "traffic_gb": item["traffic_gb"],
@@ -11420,7 +12098,8 @@ def update_state(
             for field in ("schedule_signature", "schedule_target"):
                 if field in previous_instance:
                     instance_state[field] = previous_instance[field]
-        state["instances"][item["instance_id"]] = instance_state
+        current_instances[item["instance_id"]] = instance_state
+    state["instances"] = current_instances
     if not dry_run:
         history = state.get("history")
         if not isinstance(history, list):
@@ -11444,7 +12123,7 @@ def update_state(
                 },
             }
         )
-        state["history"] = history[-576:]
+        state["history"] = history[-MAX_HISTORY_ENTRIES:]
 
 
 @contextlib.contextmanager
@@ -11626,19 +12305,33 @@ def refresh_billing_cache(started_at=None):
     }
 
 
+def _valid_state_epoch(value):
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(epoch) or epoch < 0:
+        return None
+    return epoch
+
+
 def is_due(config, state, now=None):
-    now = now or time.time()
-    last = state.get("last_cycle_epoch")
+    now = time.time() if now is None else float(now)
+    last = _valid_state_epoch(state.get("last_cycle_epoch"))
     if last is None:
         finished = state.get("last_cycle_finished_at")
         if finished:
             try:
-                last = dt.datetime.fromisoformat(finished).timestamp()
-            except (TypeError, ValueError):
+                last = _valid_state_epoch(
+                    dt.datetime.fromisoformat(str(finished)).timestamp()
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
                 last = None
     if last is None:
         return True
-    return now - float(last) >= int(config["interval_seconds"])
+    if last > now:
+        return True
+    return now - last >= int(config["interval_seconds"])
 
 
 def cdt_month_key(now=None):
@@ -11721,11 +12414,11 @@ def run_scheduled():
 
 def scheduler_wait_seconds(config, state, now=None):
     now = time.time() if now is None else float(now)
-    last = state.get("last_cycle_epoch")
-    if last is None:
+    last = _valid_state_epoch(state.get("last_cycle_epoch"))
+    if last is None or last > now:
         regular_wait = 60.0
     else:
-        regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
+        regular_wait = max(1.0, int(config["interval_seconds"]) - (now - last))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
 
@@ -12062,6 +12755,7 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -12085,10 +12779,12 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.8"
-LOCAL_RELEASE_ID = "d1d0e7b9ebfd86c9037b7443148164d10e8a59e9fbcf82b74b68dfac6f111500"
+APP_VERSION = "1.6.9"
+LOCAL_RELEASE_ID = "8f9d84234bc9b394cc126ad6f6298c4d3387f0871aa569d8269676577bed10e0"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
+MAX_UPDATE_DOWNLOAD_BYTES = 8 * 1024 * 1024
+MAX_LOG_TAIL_BYTES = 256 * 1024
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
 
@@ -12207,8 +12903,11 @@ def prompt_float(text, default, minimum=None):
         value = prompt(text, default)
         try:
             number = float(value)
-        except ValueError:
+        except (ValueError, OverflowError):
             print("请输入数字。")
+            continue
+        if not math.isfinite(number):
+            print("请输入有限数字。")
             continue
         if minimum is not None and number < minimum:
             print("不能小于 {}。".format(minimum))
@@ -13344,18 +14043,50 @@ def show_logs(config, lines=80):
     if not path.exists():
         print("日志尚未生成: {}".format(path))
         return
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        content = handle.readlines()[-lines:]
-    print("".join(content), end="")
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        chunks = []
+        bytes_read = 0
+        newline_count = 0
+        while position > 0 and bytes_read < MAX_LOG_TAIL_BYTES:
+            chunk_size = min(
+                64 * 1024,
+                position,
+                MAX_LOG_TAIL_BYTES - bytes_read,
+            )
+            position -= chunk_size
+            handle.seek(position)
+            chunk = handle.read(chunk_size)
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+            newline_count += chunk.count(b"\n")
+            if newline_count > lines:
+                break
+    content = b"".join(reversed(chunks)).decode("utf-8", "replace").splitlines(True)
+    print("".join(content[-lines:]), end="")
 
 
-def download_update_file(url, timeout=30, retries=3):
+def download_update_file(
+    url, timeout=30, retries=3, max_bytes=MAX_UPDATE_DOWNLOAD_BYTES
+):
+    maximum = max(1, int(max_bytes))
     last_error = None
     for attempt in range(1, retries + 1):
         request = urllib.request.Request(url, headers={"User-Agent": "Aliyun-Guard-Updater"})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+                content_length = response.getheader("Content-Length")
+                if content_length and int(content_length) > maximum:
+                    raise guard.GuardError("下载内容超过大小限制")
+                content = bytearray()
+                while True:
+                    chunk = response.read(min(64 * 1024, maximum - len(content) + 1))
+                    if not chunk:
+                        return bytes(content)
+                    content.extend(chunk)
+                    if len(content) > maximum:
+                        raise guard.GuardError("下载内容超过大小限制")
         except Exception as exc:
             last_error = exc
             if attempt < retries:
@@ -13370,6 +14101,29 @@ def parse_release_id(value):
     return release_id
 
 
+def parse_version_key(value):
+    text = str(value or "").strip().lstrip("v")
+    release_text = text.split("+", 1)[0]
+    core, separator, prerelease = release_text.partition("-")
+    parts = core.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise guard.GuardError("版本号必须使用 major.minor.patch 格式")
+    core_key = tuple(int(part) for part in parts)
+    if not separator:
+        return core_key + (1, ())
+    if not prerelease:
+        raise guard.GuardError("版本预发布标识无效")
+    prerelease_key = []
+    for identifier in prerelease.split("."):
+        if not identifier:
+            raise guard.GuardError("版本预发布标识无效")
+        if identifier.isdigit():
+            prerelease_key.append((0, int(identifier)))
+        else:
+            prerelease_key.append((1, identifier.lower()))
+    return core_key + (0, tuple(prerelease_key))
+
+
 def parse_version_manifest(payload):
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8", "strict")
@@ -13382,6 +14136,7 @@ def parse_version_manifest(payload):
         raise guard.GuardError("GitHub 版本号格式无效")
     return {
         "version": version,
+        "version_key": parse_version_key(version),
         "release_id": parse_release_id(data.get("release_id")),
     }
 
@@ -13416,7 +14171,12 @@ def check_for_github_update():
         remote = parse_version_manifest(payload)
     except Exception:
         return None
-    remote["available"] = remote["release_id"] != current_release_id
+    local_version_key = parse_version_key(APP_VERSION)
+    remote_version_key = remote.pop("version_key")
+    remote["available"] = remote_version_key > local_version_key or (
+        remote_version_key == local_version_key
+        and remote["release_id"] != current_release_id
+    )
     return remote
 
 
@@ -13436,6 +14196,11 @@ def update_from_github(confirm_update=True, release_info=None):
     if release_info is None:
         release_info = check_for_github_update()
     target_version = release_info.get("version") if release_info else None
+    if target_version and parse_version_key(target_version) < parse_version_key(
+        APP_VERSION
+    ):
+        print("远端版本 v{} 低于当前版本，已拒绝降级。".format(target_version))
+        return None
     if target_version and not release_info.get("available"):
         print("当前版本已经是最新版本了。")
         return None

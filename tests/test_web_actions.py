@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -61,6 +62,28 @@ class WebActionTests(unittest.TestCase):
     def tearDown(self):
         guard.CONFIG_FILE = self.original_config
         self.temp.cleanup()
+
+    def test_numeric_input_rejects_nan_and_infinity(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                web_actions.ManagementError, "有限数字"
+            ):
+                web_actions._number(
+                    {"traffic_limit_gb": value}, "traffic_limit_gb", 180, 0.01
+                )
+
+    def test_integer_input_rejects_boolean_and_fraction(self):
+        for value in (True, 60.5, float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                web_actions.ManagementError, "必须是整数"
+            ):
+                web_actions._integer(
+                    {"interval_seconds": value},
+                    "interval_seconds",
+                    300,
+                    60,
+                    86400,
+                )
 
     def test_management_payload_never_returns_raw_secrets_or_node_links(self):
         config = guard.load_config()
@@ -614,6 +637,27 @@ class WebActionTests(unittest.TestCase):
             result = web_actions.update_progress()
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["progress"], 48)
+
+    def test_update_state_io_is_bounded_and_recovers_future_timestamp(self):
+        app_dir = Path(self.temp.name) / "app"
+        state_path = app_dir / "logs" / web_actions.UPDATE_STATE_NAME
+        state_path.parent.mkdir(parents=True)
+        state_path.write_bytes(b"x" * 9)
+        with mock.patch.object(web_actions, "APP_DIR", app_dir), mock.patch.object(
+            web_actions, "MAX_UPDATE_STATE_BYTES", 8
+        ):
+            self.assertEqual(web_actions._read_update_state(), {})
+
+        legacy_temporary = state_path.with_name(state_path.name + ".tmp")
+        legacy_temporary.write_text("sentinel", encoding="utf-8")
+        future = int(time.time()) + 86400
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._write_update_state(
+                {"status": "running", "started_at": future}
+            )
+            result = web_actions.update_progress()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(legacy_temporary.read_text(encoding="utf-8"), "sentinel")
 
     def test_second_web_update_is_rejected_while_job_is_running(self):
         app_dir = Path(self.temp.name) / "app"

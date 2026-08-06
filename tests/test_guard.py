@@ -445,7 +445,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(guard.cdt_monthly_reset_due({}, now))
 
     def test_update_state_marks_current_cdt_month_once(self):
-        state = {}
+        state = {"history": [{}] * (guard.MAX_HISTORY_ENTRIES + 20)}
         guard.update_state(
             state,
             [],
@@ -455,10 +455,91 @@ class ScheduleTests(unittest.TestCase):
             0,
         )
         self.assertEqual(state["cdt_month_checked"], "2026-08")
+        self.assertEqual(len(state["history"]), guard.MAX_HISTORY_ENTRIES)
         self.assertFalse(
             guard.cdt_monthly_reset_due(
                 state,
                 dt.datetime(2026, 8, 1, 0, 1, tzinfo=guard.CDT_TIMEZONE),
+            )
+        )
+
+    def test_invalid_cycle_timestamps_do_not_disable_scheduling(self):
+        config = {"interval_seconds": 300}
+        for invalid in ("invalid", float("nan"), float("inf"), -1):
+            with self.subTest(value=invalid):
+                self.assertTrue(
+                    guard.is_due(
+                        config, {"last_cycle_epoch": invalid}, now=1000
+                    )
+                )
+                self.assertEqual(
+                    guard.scheduler_wait_seconds(
+                        config, {"last_cycle_epoch": invalid}, now=1020
+                    ),
+                    60.0,
+                )
+
+        self.assertTrue(
+            guard.is_due(config, {"last_cycle_epoch": 2000}, now=1000)
+        )
+        self.assertFalse(
+            guard.is_due(
+                config,
+                {
+                    "last_cycle_epoch": "invalid",
+                    "last_cycle_finished_at": "1970-01-01T00:15:00+00:00",
+                },
+                now=1000,
+            )
+        )
+
+    def test_update_state_repairs_corrupt_counter_and_instance_entry(self):
+        state = {
+            "cycle_count": float("nan"),
+            "instances": {"i-test123": "invalid", "i-deleted": {"level": "ok"}},
+        }
+        result = {
+            "name": "HK",
+            "instance_id": "i-test123",
+            "traffic_gb": None,
+            "limit_gb": 180.0,
+            "status_after": None,
+            "bill_amount": None,
+            "bill_currency": None,
+            "bill_error": None,
+            "level": "paused",
+            "message": "监控已暂停",
+            "paused": True,
+            "schedule_enabled": True,
+            "schedule_start_time": "08:00",
+            "schedule_stop_time": "23:00",
+            "schedule_target": "running",
+        }
+        guard.update_state(
+            state,
+            [result],
+            dt.datetime(2026, 8, 1, 0, 0, tzinfo=guard.CDT_TIMEZONE),
+            0.1,
+            "完成",
+            0,
+        )
+        self.assertEqual(state["cycle_count"], 1)
+        self.assertIsInstance(state["instances"]["i-test123"], dict)
+        self.assertNotIn("i-deleted", state["instances"])
+
+    def test_notification_comparison_ignores_corrupt_instance_entry(self):
+        result = {
+            "instance_id": "i-test123",
+            "level": "ok",
+            "action": "none",
+            "schedule_event": False,
+            "status_after": "Running",
+        }
+        self.assertFalse(
+            guard.should_notify(
+                {"notification_mode": "events"},
+                [result],
+                {"instances": {"i-test123": "invalid"}},
             )
         )
 
@@ -471,6 +552,8 @@ class ScheduleTests(unittest.TestCase):
         lock.__exit__.return_value = False
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             guard, "APP_DIR", Path(directory)
+        ), mock.patch.object(
+            guard, "HEARTBEAT_FILE", Path(directory) / "heartbeat.json"
         ), mock.patch.object(
             guard, "cycle_lock", return_value=lock
         ), mock.patch.object(
@@ -501,6 +584,8 @@ class ScheduleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             guard, "APP_DIR", Path(directory)
         ), mock.patch.object(
+            guard, "HEARTBEAT_FILE", Path(directory) / "heartbeat.json"
+        ), mock.patch.object(
             guard, "cycle_lock", return_value=lock
         ), mock.patch.object(
             guard, "load_config", return_value=config
@@ -524,12 +609,15 @@ class GuardNotificationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_state = guard.STATE_FILE
         self.old_lock = guard.LOCK_FILE
+        self.old_heartbeat = guard.HEARTBEAT_FILE
         guard.STATE_FILE = Path(self.temp.name) / "state.json"
         guard.LOCK_FILE = Path(self.temp.name) / "cycle.lock"
+        guard.HEARTBEAT_FILE = Path(self.temp.name) / "heartbeat.json"
 
     def tearDown(self):
         guard.STATE_FILE = self.old_state
         guard.LOCK_FILE = self.old_lock
+        guard.HEARTBEAT_FILE = self.old_heartbeat
         self.temp.cleanup()
 
     def test_always_mode_sends_each_cycle_summary(self):
@@ -608,6 +696,39 @@ class GuardNotificationTests(unittest.TestCase):
             )
         self.assertEqual(post.call_args.args[2], 30)
 
+    def test_telegram_api_rejects_oversized_streamed_response(self):
+        response = mock.Mock(status_code=200)
+        response.iter_content.return_value = [b"x" * 17]
+        with mock.patch.object(
+            guard, "_telegram_post", return_value=response
+        ), mock.patch.object(guard, "MAX_TELEGRAM_RESPONSE_BYTES", 16):
+            with self.assertRaisesRegex(guard.GuardError, "exceeds"):
+                guard.telegram_api(
+                    {"bot_token": "token", "timeout_seconds": 3, "retries": 1},
+                    "getMe",
+                )
+        response.close.assert_called_once_with()
+
+    def test_telegram_api_rejects_non_object_envelope(self):
+        response = mock.Mock(status_code=200, content=b"[]")
+        response.iter_content = None
+        with mock.patch.object(guard, "_telegram_post", return_value=response):
+            with self.assertRaisesRegex(guard.GuardError, "root must be an object"):
+                guard.telegram_api(
+                    {"bot_token": "token", "timeout_seconds": 3, "retries": 1},
+                    "getMe",
+                )
+
+    def test_telegram_api_rejects_invalid_utf8(self):
+        response = mock.Mock(status_code=200, content=b"\xff")
+        response.iter_content = None
+        with mock.patch.object(guard, "_telegram_post", return_value=response):
+            with self.assertRaisesRegex(guard.GuardError, "valid UTF-8"):
+                guard.telegram_api(
+                    {"bot_token": "token", "timeout_seconds": 3, "retries": 1},
+                    "getMe",
+                )
+
     def test_telegram_reuses_session_and_rebuilds_after_proxy_change(self):
         response = mock.MagicMock(status_code=200, text='{"ok": true, "result": {}}')
         first = mock.MagicMock()
@@ -631,6 +752,9 @@ class GuardNotificationTests(unittest.TestCase):
         guard.close_telegram_session()
         self.assertEqual(requests_module.Session.call_count, 2)
         self.assertEqual(first.post.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["stream"] is True for call in first.post.call_args_list)
+        )
         first.close.assert_called_once()
         second.close.assert_called_once()
 
@@ -852,7 +976,7 @@ class GuardCdtAccountCacheTests(unittest.TestCase):
             guard, "query_cdt_traffic_gb", side_effect=traffic_side_effect
         ) as traffic, mock.patch.object(
             guard, "query_instance_status", return_value="Running"
-        ):
+        ), mock.patch.object(guard, "write_heartbeat"):
             code = guard.run_cycle(no_notify=True)
         return code, traffic
 
@@ -918,6 +1042,79 @@ class GuardPerformanceCacheTests(unittest.TestCase):
         self.assertEqual(failed[:2], (12.34, "CNY"))
         self.assertTrue(failed[3])
         self.assertIsInstance(failed[4], RuntimeError)
+
+    def test_billing_cache_discards_non_finite_amount(self):
+        user = make_user(billing=dict(guard.DEFAULT_BILLING))
+        state = {}
+        now = dt.datetime(2026, 7, 21, 1, 0, tzinfo=dt.timezone.utc)
+        key = guard.billing_cache_key(user, now)
+        state["billing_cache"] = {
+            key: {
+                "amount": float("nan"),
+                "currency": "CNY",
+                "checked_at": now.isoformat(timespec="seconds"),
+                "next_refresh_at": (now + dt.timedelta(hours=1)).isoformat(
+                    timespec="seconds"
+                ),
+            }
+        }
+        with mock.patch.object(
+            guard, "query_instance_bill", return_value=(7.5, "CNY")
+        ) as query:
+            result = guard.query_instance_bill_cached(user, state, 3600, now=now)
+        self.assertEqual(result[:2], (7.5, "CNY"))
+        self.assertFalse(result[3])
+        query.assert_called_once_with(user)
+
+    def test_billing_cache_accepts_legacy_naive_timestamps(self):
+        user = make_user(billing=dict(guard.DEFAULT_BILLING))
+        now = dt.datetime(2026, 7, 21, 1, 0, tzinfo=dt.timezone.utc)
+        key = guard.billing_cache_key(user, now)
+        state = {
+            "billing_cache": {
+                key: {
+                    "amount": 4.5,
+                    "currency": "CNY",
+                    "checked_at": "2026-07-21T01:00:00",
+                    "next_refresh_at": "2026-07-21T01:30:00",
+                }
+            }
+        }
+        with mock.patch.object(guard, "query_instance_bill") as query:
+            result = guard.query_instance_bill_cached(user, state, 3600, now=now)
+        self.assertEqual(result[:2], (4.5, "CNY"))
+        self.assertTrue(result[3])
+        query.assert_not_called()
+
+    def test_billing_cache_refreshes_future_timestamps(self):
+        user = make_user(billing=dict(guard.DEFAULT_BILLING))
+        now = dt.datetime(2026, 7, 21, 1, 0, tzinfo=dt.timezone.utc)
+        key = guard.billing_cache_key(user, now)
+        for field in ("checked_at", "next_refresh_at"):
+            state = {
+                "billing_cache": {
+                    key: {
+                        "amount": 4.5,
+                        "currency": "CNY",
+                        "checked_at": now.isoformat(timespec="seconds"),
+                        "next_refresh_at": (
+                            now + dt.timedelta(minutes=30)
+                        ).isoformat(timespec="seconds"),
+                    }
+                }
+            }
+            state["billing_cache"][key][field] = (
+                now + dt.timedelta(days=2)
+            ).isoformat(timespec="seconds")
+            with self.subTest(field=field), mock.patch.object(
+                guard, "query_instance_bill", return_value=(8.0, "CNY")
+            ) as query:
+                result = guard.query_instance_bill_cached(
+                    user, state, 3600, now=now
+                )
+            self.assertEqual(result[:2], (8.0, "CNY"))
+            self.assertFalse(result[3])
+            query.assert_called_once_with(user)
 
     def test_ecs_status_prefetch_groups_by_credentials_and_region(self):
         users = [
@@ -1011,6 +1208,17 @@ class GuardPerformanceCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    @staticmethod
+    def query_with_response(function, payload, user=None):
+        client = mock.Mock()
+        client.do_action_with_exception.return_value = json.dumps(payload).encode(
+            "utf-8"
+        )
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "CommonRequest", return_value=mock.Mock()
+        ), mock.patch.object(guard, "make_client", return_value=client):
+            return function(user or make_user())
+
     def test_ipv4_dns_wrapper_preserves_getaddrinfo_keyword_signature(self):
         ipv6 = (
             guard.socket.AF_INET6,
@@ -1061,6 +1269,25 @@ class ConfigTests(unittest.TestCase):
             self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
+    def test_json_io_rejects_non_standard_numeric_constants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            with self.assertRaises(ValueError):
+                guard.atomic_write_json(path, {"traffic_gb": float("nan")})
+            self.assertFalse(path.exists())
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+            path.write_text('{"traffic_gb": NaN}', encoding="utf-8")
+            with self.assertRaisesRegex(guard.GuardError, "不支持的 JSON 数值"):
+                guard.load_json(path, {})
+
+    def test_json_io_rejects_oversized_files_before_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_bytes(b"{" + b"x" * 8)
+            with mock.patch.object(guard, "MAX_JSON_FILE_BYTES", 8):
+                with self.assertRaisesRegex(guard.GuardError, "MiB"):
+                    guard.load_json(path, {})
+
     def test_bot_control_defaults_to_enabled_and_uses_private_chat_id(self):
         config = make_config()
         config["telegram"].update({"chat_id": "5902850250"})
@@ -1082,6 +1309,15 @@ class ConfigTests(unittest.TestCase):
         config = make_config()
         config["telegram"]["control_admin_ids"] = ["not-a-user-id"]
         with self.assertRaisesRegex(guard.GuardError, "管理员用户 ID"):
+            guard.validate_config(config)
+
+    def test_rejects_excessive_saved_telegram_nodes(self):
+        config = make_config()
+        config["telegram"]["node_urls"] = [
+            "anytls://password@node{}.example:443".format(index)
+            for index in range(guard.telegram_proxy.MAX_SAVED_NODES + 1)
+        ]
+        with self.assertRaisesRegex(guard.GuardError, "已保存节点不能超过"):
             guard.validate_config(config)
 
     def test_load_config_migrates_legacy_node_url_to_saved_nodes(self):
@@ -1147,6 +1383,14 @@ class ConfigTests(unittest.TestCase):
                 telegram, due_at + guard.SUBSCRIPTION_RETRY_SECONDS
             )
         )
+
+    def test_future_subscription_timestamps_do_not_block_refresh(self):
+        now = guard.SUBSCRIPTION_REFRESH_SECONDS + 1000
+        telegram = json.loads(json.dumps(guard.DEFAULT_CONFIG["telegram"]))
+        telegram["subscription_url"] = "https://subscription.example/list"
+        telegram["subscription_last_refresh_epoch"] = now + 3600
+        telegram["subscription_last_attempt_epoch"] = now + 3600
+        self.assertTrue(guard.telegram_subscription_refresh_due(telegram, now))
 
     def test_automatic_subscription_refresh_replaces_nodes_and_selects_available(self):
         manual = "anytls://manual-password@manual.example:443#Manual"
@@ -1385,6 +1629,53 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(guard.normalize_bill_items(wrapped)), 1)
         self.assertEqual(len(guard.normalize_bill_items(direct)), 1)
 
+    def test_rejects_malformed_aliyun_nested_envelopes(self):
+        for payload in (
+            {"Instances": []},
+            {"Instances": {"Instance": [None]}},
+            {"Regions": "invalid"},
+        ):
+            container, item = (
+                ("Regions", "Region")
+                if "Regions" in payload
+                else ("Instances", "Instance")
+            )
+            with self.subTest(payload=payload), self.assertRaises(guard.GuardError):
+                guard._nested_api_items(payload, container, item, "ECS")
+        with self.assertRaises(guard.GuardError):
+            guard.normalize_bill_items({"Data": []})
+
+    def test_nested_aliyun_items_accept_single_object(self):
+        item = {"InstanceId": "i-one"}
+        self.assertEqual(
+            guard._nested_api_items(
+                {"Instances": {"Instance": item}},
+                "Instances",
+                "Instance",
+                "ECS",
+            ),
+            [item],
+        )
+
+    def test_instance_public_ip_ignores_malformed_container(self):
+        self.assertEqual(
+            guard._instance_public_ip({"PublicIpAddress": ["203.0.113.1"]}),
+            "",
+        )
+
+    def test_aliyun_response_decoder_rejects_oversized_payload(self):
+        with mock.patch.object(guard, "MAX_ALIYUN_RESPONSE_BYTES", 8):
+            with self.assertRaisesRegex(guard.GuardError, "API"):
+                guard._decode_json_object(b'{"value":1}', "API")
+
+    def test_aliyun_response_decoder_requires_object_envelope(self):
+        with self.assertRaises(guard.GuardError):
+            guard._decode_json_object(b"[]", "ECS")
+
+    def test_aliyun_response_decoder_rejects_invalid_json(self):
+        with self.assertRaises(guard.GuardError):
+            guard._decode_json_object(b'{"value":', "CDT")
+
     def test_error_text_redacts_credentials(self):
         text = guard.compact_error(
             RuntimeError("request failed for test-ak with test-sk"),
@@ -1399,6 +1690,149 @@ class ConfigTests(unittest.TestCase):
         config["users"].append(dict(config["users"][0]))
         with self.assertRaises(guard.GuardError):
             guard.validate_config(config)
+
+    def test_rejects_excessive_monitored_instance_count(self):
+        config = make_config()
+        config["users"] = [
+            make_user(instance_id="i-{}".format(index))
+            for index in range(guard.MAX_MONITORED_INSTANCES + 1)
+        ]
+        with self.assertRaisesRegex(guard.GuardError, "监控实例不能超过"):
+            guard.validate_config(config)
+
+    def test_rejects_invalid_or_oversized_instance_text_fields(self):
+        for field, value in (
+            ("name", ["not", "text"]),
+            ("ak", "x" * (guard.USER_TEXT_LIMITS["ak"] + 1)),
+            ("sk", "x" * (guard.USER_TEXT_LIMITS["sk"] + 1)),
+            ("region", "x" * (guard.USER_TEXT_LIMITS["region"] + 1)),
+            (
+                "instance_id",
+                "x" * (guard.USER_TEXT_LIMITS["instance_id"] + 1),
+            ),
+        ):
+            config = make_config()
+            config["users"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(guard.GuardError):
+                guard.validate_config(config)
+
+    def test_instance_discovery_caps_accumulated_results(self):
+        instances = [
+            {
+                "InstanceId": "i-{}".format(index),
+                "InstanceName": "Instance {}".format(index),
+            }
+            for index in range(3)
+        ]
+        client = mock.Mock()
+        client.do_action_with_exception.return_value = json.dumps(
+            {
+                "Instances": {"Instance": instances},
+                "TotalCount": len(instances),
+            }
+        ).encode("utf-8")
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "DescribeInstancesRequest", return_value=mock.Mock()
+        ), mock.patch.object(
+            guard, "make_client", return_value=client
+        ), mock.patch.object(guard, "MAX_DISCOVERED_INSTANCES", 2):
+            result = guard.discover_ecs_instances(
+                "access-key", "secret-key", ["cn-hongkong"]
+            )
+        self.assertEqual(len(result["instances"]), 2)
+        self.assertTrue(result["truncated"])
+
+    def test_rejects_non_finite_traffic_limits(self):
+        for limit in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(limit=limit):
+                config = make_config()
+                config["users"][0]["traffic_limit_gb"] = limit
+                with self.assertRaisesRegex(guard.GuardError, "流量阈值"):
+                    guard.validate_config(config)
+
+    def test_rejects_non_boolean_operational_switches(self):
+        mutations = (
+            lambda config: config.__setitem__("force_ipv4", "false"),
+            lambda config: config.__setitem__("notify_on_daemon_start", 1),
+            lambda config: config["users"][0].__setitem__(
+                "actions_enabled", "false"
+            ),
+            lambda config: config["users"][0].__setitem__("paused", 0),
+            lambda config: config["users"][0]["billing"].__setitem__(
+                "enabled", "false"
+            ),
+            lambda config: config["web_panel"].__setitem__("enabled", "false"),
+            lambda config: config["web_panel"].__setitem__(
+                "cookie_secure", "false"
+            ),
+        )
+        for mutate in mutations:
+            config = make_config()
+            with self.subTest(mutation=mutate):
+                mutate(config)
+                with self.assertRaisesRegex(guard.GuardError, "布尔值"):
+                    guard.validate_config(config)
+
+    def test_rejects_invalid_scheduler_integer_settings(self):
+        mutations = (
+            lambda config: config.__setitem__("interval_seconds", True),
+            lambda config: config.__setitem__("interval_seconds", 60.5),
+            lambda config: config.__setitem__("interval_seconds", float("inf")),
+            lambda config: config.__setitem__("start_wait_seconds", 601),
+            lambda config: config.__setitem__("start_poll_seconds", 61),
+            lambda config: config["watchdog"].__setitem__(
+                "failure_threshold", False
+            ),
+        )
+        for mutate in mutations:
+            config = make_config()
+            with self.subTest(mutation=mutate):
+                mutate(config)
+                with self.assertRaises(guard.GuardError):
+                    guard.validate_config(config)
+
+    def test_rejects_non_finite_subscription_timestamps(self):
+        for timestamp in (float("nan"), float("inf"), float("-inf")):
+            config = make_config()
+            config["telegram"]["subscription_last_refresh_epoch"] = timestamp
+            with self.subTest(timestamp=timestamp), self.assertRaisesRegex(
+                guard.GuardError, "订阅刷新时间无效"
+            ):
+                guard.validate_config(config)
+
+    def test_rejects_invalid_cdt_traffic_values(self):
+        for traffic in (-1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(traffic=traffic), self.assertRaisesRegex(
+                guard.GuardError, "流量数值无效"
+            ):
+                self.query_with_response(
+                    guard.query_cdt_traffic_gb,
+                    {"TrafficDetails": [{"Traffic": traffic}]},
+                )
+
+    def test_rejects_non_finite_billing_amounts_but_allows_credits(self):
+        billing_user = make_user(billing=dict(guard.DEFAULT_BILLING))
+        for amount in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(amount=amount), self.assertRaisesRegex(
+                guard.GuardError, "账单金额无效"
+            ):
+                self.query_with_response(
+                    guard.query_instance_bill,
+                    {
+                        "Success": True,
+                        "Data": {"Items": [{"PretaxAmount": amount}]},
+                    },
+                    billing_user,
+                )
+        amount, _currency = self.query_with_response(
+            guard.query_instance_bill,
+            {
+                "Success": True,
+                "Data": {"Items": [{"PretaxAmount": -1.25}]},
+            },
+            billing_user,
+        )
+        self.assertEqual(amount, -1.25)
 
     def test_rejects_interval_below_one_minute(self):
         config = make_config()
@@ -1465,6 +1899,20 @@ class ConfigTests(unittest.TestCase):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_update_download_rejects_chunked_content_over_limit(self):
+        response = mock.MagicMock()
+        response.getheader.return_value = None
+        response.read.side_effect = [b"1234", b"5"]
+        response.__enter__.return_value = response
+        with mock.patch.object(
+            manager.urllib.request, "urlopen", return_value=response
+        ):
+            with self.assertRaises(guard.GuardError) as raised:
+                manager.download_update_file(
+                    "https://example.com/install.sh", retries=1, max_bytes=4
+                )
+        self.assertIn("超过大小限制", str(raised.exception))
+
     def test_current_release_returns_without_downloading(self):
         release_info = {
             "available": False,
@@ -1483,24 +1931,24 @@ class UpdateTests(unittest.TestCase):
         confirm.assert_not_called()
 
     def test_update_confirmation_names_target_version(self):
-        release_info = {"available": True, "version": "1.3.0", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "9.9.9", "release_id": "b" * 64}
         with mock.patch.object(manager, "yes_no", return_value=False) as confirm:
             result = manager.update_from_github(release_info=release_info)
         self.assertIsNone(result)
-        confirm.assert_called_once_with("下载并安装 GitHub v1.3.0", True)
+        confirm.assert_called_once_with("下载并安装 GitHub v9.9.9", True)
 
     def test_startup_check_reports_remote_version(self):
         local_release = "a" * 64
         remote_release = "b" * 64
         manifest = json.dumps(
-            {"version": "1.3.0", "release_id": remote_release}
+            {"version": "9.9.9", "release_id": remote_release}
         ).encode("utf-8")
         with mock.patch.object(manager, "LOCAL_RELEASE_ID", local_release), mock.patch.object(
             manager, "download_update_file", return_value=manifest
         ) as download:
             result = manager.check_for_github_update()
         self.assertTrue(result["available"])
-        self.assertEqual(result["version"], "1.3.0")
+        self.assertEqual(result["version"], "9.9.9")
         download.assert_called_once_with(
             manager.UPDATE_BASE_URL + "/version.json",
             timeout=manager.UPDATE_CHECK_TIMEOUT_SECONDS,
@@ -1517,6 +1965,46 @@ class UpdateTests(unittest.TestCase):
         ):
             result = manager.check_for_github_update()
         self.assertFalse(result["available"])
+
+    def test_startup_check_offers_same_version_rebuild(self):
+        manifest = json.dumps(
+            {"version": manager.APP_VERSION, "release_id": "b" * 64}
+        ).encode("utf-8")
+        with mock.patch.object(
+            manager, "LOCAL_RELEASE_ID", "a" * 64
+        ), mock.patch.object(
+            manager, "download_update_file", return_value=manifest
+        ):
+            result = manager.check_for_github_update()
+        self.assertTrue(result["available"])
+
+    def test_startup_check_does_not_offer_older_release(self):
+        manifest = json.dumps(
+            {"version": "1.6.8", "release_id": "b" * 64}
+        ).encode("utf-8")
+        with mock.patch.object(
+            manager, "LOCAL_RELEASE_ID", "a" * 64
+        ), mock.patch.object(
+            manager, "download_update_file", return_value=manifest
+        ):
+            result = manager.check_for_github_update()
+        self.assertFalse(result["available"])
+
+    def test_update_refuses_explicit_downgrade(self):
+        release_info = {
+            "available": True,
+            "version": "1.6.8",
+            "release_id": "b" * 64,
+        }
+        output = io.StringIO()
+        with mock.patch.object(manager, "download_update_file") as download, mock.patch.object(
+            manager, "yes_no"
+        ) as confirm, mock.patch("sys.stdout", output):
+            result = manager.update_from_github(release_info=release_info)
+        self.assertIsNone(result)
+        self.assertIn("已拒绝降级", output.getvalue())
+        download.assert_not_called()
+        confirm.assert_not_called()
 
     def test_source_build_reads_local_version_manifest(self):
         release_id = "c" * 64
@@ -1548,7 +2036,7 @@ class UpdateTests(unittest.TestCase):
     def test_github_update_verifies_checksum_and_runs_update_mode(self):
         installer = b"#!/bin/sh\nexit 0\n"
         checksum = hashlib.sha256(installer).hexdigest().encode("ascii") + b"  install.sh\n"
-        release_info = {"available": True, "version": "1.3.0", "release_id": "b" * 64}
+        release_info = {"available": True, "version": "9.9.9", "release_id": "b" * 64}
         output = io.StringIO()
         with mock.patch.object(
             manager, "download_update_file", side_effect=[installer, checksum]
@@ -1562,12 +2050,12 @@ class UpdateTests(unittest.TestCase):
                 )
         self.assertTrue(result)
         self.assertIn("当前版本: v{}".format(manager.APP_VERSION), output.getvalue())
-        self.assertIn("最新版本: v1.3.0", output.getvalue())
+        self.assertIn("最新版本: v9.9.9", output.getvalue())
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/bin/sh")
         self.assertEqual(command[-1], "--update")
         self.assertIs(run.call_args.kwargs["stdin"], manager.subprocess.DEVNULL)
-        release_base = manager.UPDATE_RELEASES_URL + "/download/v1.3.0"
+        release_base = manager.UPDATE_RELEASES_URL + "/download/v9.9.9"
         self.assertEqual(
             [call.args[0] for call in download.call_args_list],
             [release_base + "/install.sh", release_base + "/install.sh.sha256"],

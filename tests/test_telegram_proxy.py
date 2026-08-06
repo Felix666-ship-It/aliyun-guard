@@ -172,6 +172,19 @@ class NodeParserTests(unittest.TestCase):
             telegram_proxy.parse_subscription_content("\n".join(nodes)), nodes
         )
 
+    def test_rejects_excessive_subscription_node_count(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(telegram_proxy.MAX_SUBSCRIPTION_NODES + 1)
+        ]
+        with self.assertRaisesRegex(telegram_proxy.ProxyError, "节点数量"):
+            telegram_proxy.parse_subscription_content("\n".join(nodes))
+
+    def test_rejects_oversized_node_link_before_parsing(self):
+        link = "anytls://" + "x" * telegram_proxy.MAX_NODE_LINK_LENGTH
+        with self.assertRaisesRegex(telegram_proxy.ProxyError, "长度限制"):
+            telegram_proxy.parse_node_link(link)
+
     def test_rejects_private_subscription_address(self):
         with mock.patch.object(
             telegram_proxy.socket,
@@ -260,6 +273,32 @@ class NodeParserTests(unittest.TestCase):
             self.assertTrue(asset_name.startswith("sing-box-1.13.14-linux-"))
             self.assertEqual(len(digest), 64)
             int(digest, 16)
+
+    def test_sing_box_download_rejects_chunked_content_over_limit(self):
+        response = mock.MagicMock()
+        response.getheader.return_value = None
+        response.read.side_effect = [b"1234", b"5"]
+        response.__enter__.return_value = response
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            telegram_proxy, "APP_DIR", Path(directory)
+        ), mock.patch.object(
+            telegram_proxy,
+            "SING_BOX_BINARY",
+            Path(directory) / "bin" / "sing-box",
+        ), mock.patch.object(
+            telegram_proxy, "MAX_SING_BOX_ARCHIVE_BYTES", 4
+        ), mock.patch.object(
+            telegram_proxy, "find_sing_box", return_value=None
+        ), mock.patch.object(
+            telegram_proxy.platform, "system", return_value="Linux"
+        ), mock.patch.object(
+            telegram_proxy, "_architecture", return_value="amd64"
+        ), mock.patch.object(
+            telegram_proxy.urllib.request, "urlopen", return_value=response
+        ):
+            with self.assertRaises(telegram_proxy.ProxyError) as raised:
+                telegram_proxy.install_sing_box()
+        self.assertIn("超过大小限制", str(raised.exception))
 
     def test_check_exception_removes_runtime_directory(self):
         link = "ss://{}@ss.example.com:8388".format(encoded("aes-128-gcm:password"))

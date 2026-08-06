@@ -11,6 +11,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -30,7 +31,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -41,7 +42,13 @@ MAX_BODY_BYTES = 128 * 1024 * 1024
 MAX_REQUEST_THREADS = 32
 REQUEST_SOCKET_TIMEOUT_SECONDS = 15
 SESSION_SECONDS = 12 * 60 * 60
+MAX_SESSIONS = 512
 PASSWORD_ITERATIONS = 260000
+MAX_PASSWORD_ITERATIONS = 1000000
+LOGIN_WINDOW_SECONDS = 5 * 60
+MAX_LOGIN_FAILURES = 5
+MAX_LOGIN_TRACKED_ADDRESSES = 4096
+MAX_LOG_TAIL_BYTES = 256 * 1024
 
 DEFAULT_WEB_CONFIG = {
     "enabled": False,
@@ -51,6 +58,20 @@ DEFAULT_WEB_CONFIG = {
     "password_hash": "",
     "cookie_secure": False,
 }
+
+
+def _json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 class WebPanelError(RuntimeError):
@@ -79,8 +100,11 @@ def verify_password(password, encoded):
             return False
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(expected_hex)
+        iteration_count = int(iterations)
+        if iteration_count < 1 or iteration_count > MAX_PASSWORD_ITERATIONS:
+            return False
         actual = hashlib.pbkdf2_hmac(
-            "sha256", str(password or "").encode("utf-8"), salt, int(iterations)
+            "sha256", str(password or "").encode("utf-8"), salt, iteration_count
         )
         return hmac.compare_digest(actual, expected)
     except (TypeError, ValueError):
@@ -99,12 +123,23 @@ def get_web_config(config):
     result["cookie_secure"] = bool(result.get("cookie_secure", False))
     try:
         result["port"] = int(result.get("port", 8765))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         result["port"] = 0
     return result
 
 
 def validate_web_config(config):
+    configured = config.get("web_panel", {}) if isinstance(config, dict) else {}
+    if not isinstance(configured, dict):
+        raise WebPanelError("web_panel 必须是对象")
+    for field in ("enabled", "cookie_secure"):
+        if field in configured and not isinstance(configured[field], bool):
+            raise WebPanelError("web_panel.{} 必须是布尔值".format(field))
+    raw_port = configured.get("port", DEFAULT_WEB_CONFIG["port"])
+    if isinstance(raw_port, bool) or (
+        isinstance(raw_port, float) and not raw_port.is_integer()
+    ):
+        raise WebPanelError("网页面板端口必须是整数")
     web = get_web_config(config)
     if web["host"] not in ("127.0.0.1", "0.0.0.0"):
         raise WebPanelError("网页面板监听地址只能是 127.0.0.1 或 0.0.0.0")
@@ -112,6 +147,8 @@ def validate_web_config(config):
         raise WebPanelError("网页面板端口必须在 1024 到 65535 之间")
     if not web["username"] or len(web["username"]) > 64:
         raise WebPanelError("网页面板用户名不能为空且不能超过 64 个字符")
+    if len(web["password_hash"]) > 1024:
+        raise WebPanelError("网页面板密码哈希过长")
     if web["enabled"]:
         if not web["password_hash"] or not web["password_hash"].startswith(
             "pbkdf2_sha256$"
@@ -356,11 +393,30 @@ def _read_recent_log_path(path, limit):
     if not path.exists():
         return []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            chunks = []
+            bytes_read = 0
+            newline_count = 0
+            while position > 0 and bytes_read < MAX_LOG_TAIL_BYTES:
+                chunk_size = min(
+                    64 * 1024,
+                    position,
+                    MAX_LOG_TAIL_BYTES - bytes_read,
+                )
+                position -= chunk_size
+                handle.seek(position)
+                chunk = handle.read(chunk_size)
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+                newline_count += chunk.count(b"\n")
+                if newline_count > limit:
+                    break
     except OSError as exc:
         raise WebPanelError("无法读取日志: {}".format(exc), 500)
-    return [line.rstrip("\r\n") for line in lines[-limit:]]
+    text = b"".join(reversed(chunks)).decode("utf-8", "replace")
+    return text.splitlines()[-limit:]
 
 
 def logs_payload(guard, limit=200, instance_index=None):
@@ -714,7 +770,7 @@ def control_instance(
                 },
             }
         )
-        state["history"] = history[-576:]
+        state["history"] = history[-guard.MAX_HISTORY_ENTRIES:]
         guard.save_state(state)
         return {
             "before": before,
@@ -796,6 +852,12 @@ class PanelServer(ThreadingHTTPServer):
                 for key, value in self.sessions.items()
                 if value.get("expires", 0) >= now
             }
+            while len(self.sessions) >= MAX_SESSIONS:
+                oldest = min(
+                    self.sessions,
+                    key=lambda key: self.sessions[key].get("expires", 0),
+                )
+                self.sessions.pop(oldest, None)
             self.sessions[session_id] = data
         return session_id, data
 
@@ -816,20 +878,28 @@ class PanelServer(ThreadingHTTPServer):
         with self.session_lock:
             self.sessions.pop(session_id, None)
 
-    def login_allowed(self, address):
+    def begin_login_attempt(self, address):
         now = time.time()
         with self.login_attempt_lock:
-            attempts = [
-                value
-                for value in self.login_attempts.get(address, [])
-                if now - value < 300
-            ]
+            for tracked_address, values in list(self.login_attempts.items()):
+                recent = [
+                    value
+                    for value in values
+                    if 0 <= now - value < LOGIN_WINDOW_SECONDS
+                ]
+                if recent:
+                    self.login_attempts[tracked_address] = recent
+                else:
+                    self.login_attempts.pop(tracked_address, None)
+            attempts = self.login_attempts.pop(address, [])
+            if len(attempts) >= MAX_LOGIN_FAILURES:
+                self.login_attempts[address] = attempts
+                return False
+            while len(self.login_attempts) >= MAX_LOGIN_TRACKED_ADDRESSES:
+                self.login_attempts.pop(next(iter(self.login_attempts)))
+            attempts.append(now)
             self.login_attempts[address] = attempts
-            return len(attempts) < 5
-
-    def record_login_failure(self, address):
-        with self.login_attempt_lock:
-            self.login_attempts.setdefault(address, []).append(time.time())
+            return True
 
     def clear_login_failures(self, address):
         with self.login_attempt_lock:
@@ -931,7 +1001,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _json(self, value, status=200, extra=None):
-        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(
+            _json_safe(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
         self._base_headers("application/json; charset=utf-8", len(body), status, extra)
         self.wfile.write(body)
 
@@ -954,7 +1029,10 @@ class PanelHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > maximum:
             raise WebPanelError("请求内容为空或过大", 413)
         try:
-            value = json.loads(self.rfile.read(length).decode("utf-8"))
+            value = json.loads(
+                self.rfile.read(length).decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
         except (UnicodeDecodeError, ValueError):
             raise WebPanelError("JSON 请求格式无效")
         if not isinstance(value, dict):
@@ -1304,7 +1382,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def _handle_login(self):
         address = self.client_address[0]
-        if not self.server.login_allowed(address):
+        if not self.server.begin_login_attempt(address):
             raise WebPanelError("登录失败次数过多，请 5 分钟后再试", 429)
         data = self._read_json()
         config = self.server.guard.load_config()
@@ -1314,7 +1392,6 @@ class PanelHandler(BaseHTTPRequestHandler):
         )
         password_ok = verify_password(data.get("password", ""), web["password_hash"])
         if not username_ok or not password_ok:
-            self.server.record_login_failure(address)
             raise WebPanelError("用户名或密码错误", 401)
         self.server.clear_login_failures(address)
         session_id, session = self.server.create_session()

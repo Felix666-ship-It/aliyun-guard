@@ -2,6 +2,7 @@ import contextlib
 import copy
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -76,9 +77,16 @@ def button_callback(data, user_id=123, callback_id="callback-1", message_id=10):
 
 class TelegramControlTests(unittest.TestCase):
     def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.original_config_file = guard.CONFIG_FILE
+        guard.CONFIG_FILE = Path(self.temp.name) / "config.json"
         self.config = make_config()
         self.telegram = self.config["telegram"]
         self.service = telegram_control.TelegramControlService(guard)
+
+    def tearDown(self):
+        guard.CONFIG_FILE = self.original_config_file
+        self.temp.cleanup()
 
     def test_status_and_instance_text_do_not_expose_credentials(self):
         state = {
@@ -504,6 +512,25 @@ class TelegramControlTests(unittest.TestCase):
             guard, self.service.fingerprint, 42
         )
         handle.assert_not_called()
+
+    def test_update_normalization_rejects_wrong_envelope_and_skips_bad_items(self):
+        with self.assertRaises(ValueError):
+            telegram_control._normalize_updates({"update_id": 1})
+        updates = telegram_control._normalize_updates(
+            [
+                {"update_id": 3, "message": private_message("/status")},
+                {"update_id": "4"},
+                {"update_id": True},
+                "malformed",
+            ]
+        )
+        self.assertEqual([item["update_id"] for item in updates], [3])
+
+    def test_update_normalization_caps_poll_result(self):
+        with self.assertRaises(ValueError):
+            telegram_control._normalize_updates(
+                [{"update_id": index} for index in range(101)]
+            )
 
 
 if __name__ == "__main__":

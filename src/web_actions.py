@@ -6,11 +6,13 @@ import copy
 import base64
 import functools
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -27,6 +29,7 @@ UPDATE_LOG_NAME = "web-update.log"
 UPDATE_STATE_NAME = "web-update-state.json"
 UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 MAX_SUBSCRIPTION_FAILURE_DETAILS = 20
+MAX_UPDATE_STATE_BYTES = 1024 * 1024
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -61,6 +64,10 @@ class ManagementError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+def _reject_json_constant(constant):
+    raise ValueError("unsupported JSON number: {}".format(constant))
 
 
 def _config_transaction(function):
@@ -102,9 +109,14 @@ def _boolean(data, name, current=False):
 
 
 def _integer(data, name, current, minimum, maximum):
+    raw = data.get(name, current)
+    if isinstance(raw, bool):
+        raise ManagementError("{}必须是整数".format(name))
     try:
-        value = int(data.get(name, current))
-    except (TypeError, ValueError):
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise ManagementError("{}必须是整数".format(name))
+    if isinstance(raw, float) and raw != value:
         raise ManagementError("{}必须是整数".format(name))
     if value < minimum or value > maximum:
         raise ManagementError(
@@ -116,8 +128,10 @@ def _integer(data, name, current, minimum, maximum):
 def _number(data, name, current, minimum):
     try:
         value = float(data.get(name, current))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ManagementError("{}必须是数字".format(name))
+    if not math.isfinite(value):
+        raise ManagementError("{}必须是有限数字".format(name))
     if value < minimum:
         raise ManagementError("{}不能小于 {}".format(name, minimum))
     return value
@@ -1353,21 +1367,42 @@ def _update_paths():
 def _write_update_state(data):
     _log_path, state_path = _update_paths()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = state_path.with_name(state_path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".{}-".format(state_path.name),
+        suffix=".tmp",
+        dir=str(state_path.parent),
     )
-    os.chmod(temporary, 0o600)
-    os.replace(str(temporary), str(state_path))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                data,
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(state_path))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_update_state():
     _log_path, state_path = _update_paths()
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
+        with state_path.open("rb") as handle:
+            raw = handle.read(MAX_UPDATE_STATE_BYTES + 1)
+        if len(raw) > MAX_UPDATE_STATE_BYTES:
+            return {}
+        data = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
 
@@ -1443,8 +1478,22 @@ def update_progress():
         except ValueError:
             exit_code = None
     success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
-    started_at = int(state.get("started_at", 0) or 0)
-    timed_out = bool(started_at and time.time() - started_at > 3600)
+    now = time.time()
+    raw_started_at = state.get("started_at", 0)
+    invalid_started_at = False
+    try:
+        if isinstance(raw_started_at, bool):
+            raise ValueError("boolean timestamp")
+        started_at = float(raw_started_at or 0)
+        if not math.isfinite(started_at) or started_at < 0 or started_at > now + 300:
+            raise ValueError("invalid timestamp")
+    except (TypeError, ValueError, OverflowError):
+        started_at = 0
+        invalid_started_at = True
+    timed_out = bool(
+        state.get("status") == "running"
+        and (invalid_started_at or not started_at or now - started_at > 3600)
+    )
     failure = (
         state.get("status") == "error"
         or timed_out
@@ -1474,7 +1523,7 @@ def update_progress():
         "progress": max(0, min(100, int(progress))),
         "message": message,
         "target_version": state.get("target_version"),
-        "started_at": state.get("started_at"),
+        "started_at": int(started_at) if started_at else None,
         "job": state.get("job"),
     }
 

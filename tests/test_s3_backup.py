@@ -113,6 +113,19 @@ class S3BackupTests(unittest.TestCase):
         self.assertEqual(validated["bucket"], "guard-backups")
         importer.assert_not_called()
 
+    def test_validation_rejects_non_integer_schedule_values(self):
+        for field, value in (
+            ("weekday", True),
+            ("weekday", 1.5),
+            ("retention", float("inf")),
+        ):
+            config = ready_config()
+            config[field] = value
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                s3_backup.S3BackupError, "必须是整数"
+            ):
+                s3_backup.validate_config(config)
+
     def test_schedule_slots_and_duplicate_attempt_suppression(self):
         config = ready_config()
         config.update({"schedule": "daily", "time": "03:00"})
@@ -127,6 +140,39 @@ class S3BackupTests(unittest.TestCase):
         self.assertTrue(first["ok"])
         self.assertIsNone(second)
         run.assert_called_once()
+
+    def test_future_attempt_timestamp_does_not_suppress_retry(self):
+        config = ready_config()
+        config.update({"schedule": "daily", "time": "03:00"})
+        now = dt.datetime(2026, 7, 19, 4, 0, tzinfo=dt.timezone.utc)
+        slot = s3_backup.schedule_slot(config, now)
+        s3_backup._write_state(
+            self.root / s3_backup.STATE_NAME,
+            {
+                "last_attempt_slot": slot,
+                "last_attempt_at": (now + dt.timedelta(days=1)).isoformat(
+                    timespec="seconds"
+                ),
+            },
+        )
+        uploaded = {"ok": True, "key": "aliyun-guard/test.agbackup", "deleted": []}
+        with mock.patch.object(
+            s3_backup, "create_and_upload", return_value=uploaded
+        ) as run:
+            result = s3_backup.run_if_due(config, self.root, now=now)
+        self.assertTrue(result["ok"])
+        run.assert_called_once()
+
+    def test_scheduler_state_io_is_bounded_and_strict(self):
+        state_path = self.root / s3_backup.STATE_NAME
+        state_path.write_bytes(b"x" * 9)
+        with mock.patch.object(s3_backup, "MAX_STATE_FILE_BYTES", 8):
+            self.assertEqual(s3_backup._read_state(state_path), {})
+        state_path.write_text('{"last_attempt_at": NaN}', encoding="utf-8")
+        self.assertEqual(s3_backup._read_state(state_path), {})
+        with self.assertRaises(ValueError):
+            s3_backup._write_state(state_path, {"value": float("nan")})
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
 
     def test_failure_state_redacts_credentials(self):
         config = ready_config()

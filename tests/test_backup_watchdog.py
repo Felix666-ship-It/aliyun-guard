@@ -70,10 +70,15 @@ class BackupManagerTests(unittest.TestCase):
         (self.root / "version.json").write_text('{"version":"old"}\n', encoding="utf-8")
         snapshot = backup_manager.create_program_snapshot(self.root, "old")
         (self.root / "manager.py").write_text("new\n", encoding="utf-8")
+        legacy_temporary = self.root / "manager.py.rollback.tmp"
+        legacy_temporary.write_text("sentinel\n", encoding="utf-8")
         result = backup_manager.restore_program_snapshot(snapshot, self.root)
         self.assertEqual(result["version"], "old")
         self.assertEqual(Path(result["snapshot"]), snapshot)
         self.assertEqual((self.root / "manager.py").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(
+            legacy_temporary.read_text(encoding="utf-8"), "sentinel\n"
+        )
         self.assertTrue((self.root / "config.json").is_file())
 
     def test_restore_rejects_invalid_config_before_writing(self):
@@ -97,6 +102,73 @@ class BackupManagerTests(unittest.TestCase):
         with self.assertRaises(backup_manager.BackupError):
             backup_manager.restore_backup(path, "correct-password", self.root)
         self.assertEqual((self.root / "config.json").read_bytes(), before)
+
+    def test_preview_rejects_oversized_backup_file(self):
+        oversized = b"x" * (backup_manager.MAX_FILE_BYTES + 1)
+        payload = {
+            "files": {
+                "config.json": {
+                    "content": backup_manager._b64encode(oversized),
+                    "sha256": "invalid",
+                }
+            }
+        }
+        with self.assertRaises(backup_manager.BackupError):
+            backup_manager._preview_payload(payload, self.root)
+
+    def test_preview_hashes_existing_files_without_reading_them_all_at_once(self):
+        content = (self.root / "config.json").read_bytes()
+        payload = {
+            "files": {
+                "config.json": {
+                    "content": backup_manager._b64encode(content),
+                    "sha256": __import__("hashlib").sha256(content).hexdigest(),
+                }
+            }
+        }
+        with mock.patch.object(
+            Path, "read_bytes", side_effect=AssertionError("unexpected bulk read")
+        ):
+            preview = backup_manager._preview_payload(payload, self.root)
+        self.assertEqual(preview["files"][0]["action"], "unchanged")
+
+    def test_restore_ignores_unsafe_file_mode_from_backup(self):
+        path = backup_manager.create_backup("correct-password", self.root)
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        payload = backup_manager.decrypt_payload(envelope, "correct-password")
+        payload["files"]["config.json"]["mode"] = 0o777
+        path.write_text(
+            json.dumps(backup_manager.encrypt_payload(payload, "correct-password")),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            backup_manager.os, "chmod", wraps=backup_manager.os.chmod
+        ) as chmod:
+            backup_manager.restore_backup(path, "correct-password", self.root)
+        restore_modes = [
+            call.args[1]
+            for call in chmod.call_args_list
+            if Path(call.args[0]).name.startswith(".config.json-")
+            and str(call.args[0]).endswith(".restore.tmp")
+        ]
+        self.assertEqual(restore_modes, [0o600])
+
+    def test_restore_does_not_reuse_predictable_temporary_path(self):
+        path = backup_manager.create_backup("correct-password", self.root)
+        legacy_temporary = self.root / "config.json.restore.tmp"
+        legacy_temporary.write_text("sentinel", encoding="utf-8")
+        backup_manager.restore_backup(path, "correct-password", self.root)
+        self.assertEqual(
+            legacy_temporary.read_text(encoding="utf-8"), "sentinel"
+        )
+
+    def test_streaming_loader_rejects_trailing_content(self):
+        path = backup_manager.create_backup("correct-password", self.root)
+        with path.open("ab") as handle:
+            handle.write(b"trailing-content")
+        with self.assertRaises(backup_manager.BackupError) as raised:
+            backup_manager.preview_restore(path, "correct-password", self.root)
+        self.assertIn("文件尾无效", str(raised.exception))
 
 
 class WatchdogTests(unittest.TestCase):
@@ -192,6 +264,106 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(result["status"], "disabled")
         self.assertEqual(result["reason"], "no_valid_instances")
         restart.assert_not_called()
+
+    def test_nonfinite_and_far_future_heartbeats_are_invalid(self):
+        for token in ("NaN", "Infinity"):
+            with self.subTest(token=token):
+                watchdog.HEARTBEAT_FILE.write_text(
+                    '{{"epoch": {}, "at": "invalid"}}'.format(token),
+                    encoding="utf-8",
+                )
+                age, heartbeat = watchdog.heartbeat_age(now=1000)
+                self.assertIsNone(age)
+                self.assertEqual(heartbeat, {})
+        for epoch in (-1, 1301):
+            with self.subTest(epoch=epoch):
+                watchdog._atomic_write(
+                    watchdog.HEARTBEAT_FILE,
+                    {"epoch": epoch, "at": "invalid"},
+                )
+                age, heartbeat = watchdog.heartbeat_age(now=1000)
+                self.assertIsNone(age)
+                self.assertEqual(heartbeat["at"], "invalid")
+
+    def test_watchdog_state_io_is_bounded_and_uses_unique_temporary_files(self):
+        state_path = watchdog.WATCHDOG_STATE_FILE
+        state_path.write_bytes(b"x" * 9)
+        with mock.patch.object(watchdog, "MAX_STATE_FILE_BYTES", 8):
+            self.assertEqual(watchdog.read_json(state_path), {})
+
+        legacy_temporary = state_path.with_name(state_path.name + ".tmp")
+        legacy_temporary.write_text("sentinel", encoding="utf-8")
+        watchdog._atomic_write(state_path, {"failed_checks": 1})
+        self.assertEqual(
+            legacy_temporary.read_text(encoding="utf-8"), "sentinel"
+        )
+        self.assertEqual(watchdog.read_json(state_path)["failed_checks"], 1)
+
+    def test_corrupt_watchdog_counter_is_repaired(self):
+        watchdog._atomic_write(
+            watchdog.HEARTBEAT_FILE,
+            {"epoch": 0, "at": "1970-01-01T00:00:00+00:00"},
+        )
+        watchdog._atomic_write(
+            watchdog.WATCHDOG_STATE_FILE,
+            {"failed_checks": "invalid", "outage_notified": "false"},
+        )
+        with mock.patch.object(guard, "load_config", return_value=self.config):
+            result = watchdog.check_once(now=1000, restart=False, notify=False)
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(result["failed_checks"], 1)
+        state = watchdog.read_json(watchdog.WATCHDOG_STATE_FILE)
+        self.assertEqual(state["failed_checks"], 1)
+        self.assertFalse(state["outage_notified"])
+
+    def test_failed_outage_notification_is_redacted_and_retried(self):
+        self.config["watchdog"]["failure_threshold"] = 1
+        self.config["telegram"]["bot_token"] = "private-bot-token"
+        with mock.patch.object(
+            guard, "load_config", return_value=self.config
+        ), mock.patch.object(
+            watchdog,
+            "_notify",
+            side_effect=[RuntimeError("failed private-bot-token"), None],
+        ) as notify:
+            first = watchdog.check_once(now=1000, restart=False)
+            second = watchdog.check_once(now=1060, restart=False)
+        self.assertEqual(first["status"], "outage")
+        self.assertIn("***", first["notification_error"])
+        self.assertNotIn("private-bot-token", first["notification_error"])
+        self.assertEqual(second["status"], "outage")
+        self.assertIsNone(second["notification_error"])
+        self.assertEqual(notify.call_count, 2)
+        self.assertTrue(
+            watchdog.read_json(watchdog.WATCHDOG_STATE_FILE)["outage_notified"]
+        )
+
+    def test_failed_recovery_notification_is_retried(self):
+        watchdog._atomic_write(
+            watchdog.WATCHDOG_STATE_FILE,
+            {"failed_checks": 2, "outage_notified": True},
+        )
+        watchdog._atomic_write(
+            watchdog.HEARTBEAT_FILE,
+            {"epoch": 990, "at": "2026-07-19T00:00:00+08:00"},
+        )
+        with mock.patch.object(
+            guard, "load_config", return_value=self.config
+        ), mock.patch.object(
+            watchdog,
+            "_notify",
+            side_effect=[RuntimeError("temporary"), None],
+        ) as notify:
+            first = watchdog.check_once(now=1000, restart=False)
+            second = watchdog.check_once(now=1010, restart=False)
+        self.assertEqual(first["status"], "recovered")
+        self.assertEqual(first["notification_error"], "temporary")
+        self.assertEqual(second["status"], "recovered")
+        self.assertIsNone(second["notification_error"])
+        self.assertEqual(notify.call_count, 2)
+        self.assertFalse(
+            watchdog.read_json(watchdog.WATCHDOG_STATE_FILE)["outage_notified"]
+        )
 
 
 class DiscoveryTests(unittest.TestCase):
