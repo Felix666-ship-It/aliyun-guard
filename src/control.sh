@@ -181,6 +181,7 @@ dry-run                演练一轮，不执行开关机
 test-telegram          发送 Telegram 测试消息
 refresh-billing        强制刷新所有实例账单缓存
 web                    查看网页控制面板地址和状态
+reset-web-password     重置网页登录密码
 update                 从 GitHub 下载并安装最新版本
 version                显示当前版本号
 logs                   查看最近 100 行日志
@@ -224,6 +225,9 @@ case "$command_name" in
         ;;
     web)
         exec "$PYTHON" "$MANAGER" web
+        ;;
+    reset-web-password)
+        exec "$PYTHON" "$MANAGER" reset-web-password
         ;;
     update)
         exec "$PYTHON" "$MANAGER" update

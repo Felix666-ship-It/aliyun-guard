@@ -190,6 +190,7 @@ class DockerArtifactTests(unittest.TestCase):
         self.assertIn('export ALIYUN_GUARD_CONFIG="$APP_DIR/config.json"', template)
         self.assertIn("ALIYUN_GUARD_CONFIG=%s/config.json", template)
         self.assertIn("ALIYUN_GUARD_CONFIG=%s/config.json", control)
+        self.assertIn("reset-web-password", control)
 
     def test_one_click_source_update_preserves_env_and_data(self):
         shell = self.shell_path()

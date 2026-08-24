@@ -30,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.11"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -1089,7 +1089,7 @@ def _set_web_password(web):
             continue
         try:
             web["password_hash"] = web_panel.hash_password(password)
-            return
+            return password
         except ValueError as exc:
             print(exc)
 
@@ -1156,6 +1156,36 @@ def configure_web_panel(config, initial=False, restart=True):
             print("配置已保存，但后台服务重启失败。")
     print("网页控制面板配置已保存。")
     print_web_panel_access(candidate)
+    return True
+
+
+def reset_web_password(config=None, restart=True):
+    config = config or load_config()
+    current = web_panel.get_web_config(config)
+    title("重置网页登录密码")
+    print("网页登录用户名: {}".format(current["username"]))
+    if not current["enabled"]:
+        print("提示: 网页控制面板当前未启用，密码仍会保存供下次启用时使用。")
+    candidate = dict(current)
+    password = _set_web_password(candidate)
+    config["web_panel"] = candidate
+    save_config(config)
+    persisted = web_panel.get_web_config(load_config())
+    if (
+        persisted.get("password_hash") != candidate.get("password_hash")
+        or not web_panel.verify_password(password, persisted.get("password_hash", ""))
+    ):
+        raise guard.GuardError("网页登录密码未能持久保存，请检查配置文件所在磁盘")
+    print("网页登录密码已重置并持久保存。")
+    if not restart:
+        return True
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        print("请在宿主机执行 docker compose restart aliyun-guard，使已有登录会话立即失效。")
+        return True
+    if run_control("restart") != 0:
+        print("密码已保存，但后台服务重启失败；新密码仍可用于新的登录请求。")
+        return False
+    print("后台服务已重启，已有网页登录会话已失效。")
     return True
 
 
@@ -1864,7 +1894,8 @@ def menu():
         print("18) 自动发现并批量导入 ECS")
         print("19) 退出")
         print("20) AWS S3 自动备份")
-        choice = prompt_int("请输入序号", 19, 1, 20)
+        print("21) 重置网页登录密码")
+        choice = prompt_int("请输入序号", 19, 1, 21)
         try:
             if choice == 1:
                 show_status(config)
@@ -1908,6 +1939,8 @@ def menu():
                 return 0
             elif choice == 20:
                 s3_backup_menu(config)
+            elif choice == 21:
+                reset_web_password(config)
         except KeyboardInterrupt:
             print("\n操作已取消。")
         if choice != 19:
@@ -1927,6 +1960,7 @@ def parse_args(argv=None):
     update.add_argument("--yes", action="store_true", help="无需交互确认")
     subparsers.add_parser("version", help="显示当前版本")
     subparsers.add_parser("web", help="显示网页控制面板状态")
+    subparsers.add_parser("reset-web-password", help="重置网页登录密码")
     return parser.parse_args(argv)
 
 
@@ -1953,6 +1987,8 @@ def main(argv=None):
             return 0
         if args.command == "web":
             return web_panel.show_status()
+        if args.command == "reset-web-password":
+            return 0 if reset_web_password() else 1
         return menu()
     except guard.GuardError as exc:
         print("错误: {}".format(exc), file=sys.stderr)

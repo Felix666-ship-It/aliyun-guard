@@ -1666,6 +1666,72 @@ class InstallerTemplateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_reset_web_password_persists_and_restarts_native_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config = make_config()
+            config["web_panel"].update(
+                {
+                    "enabled": True,
+                    "username": "operator",
+                    "password_hash": manager.web_panel.hash_password(
+                        "previous-password", iterations=1000
+                    ),
+                }
+            )
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                guard, "CONFIG_FILE", config_path
+            ), mock.patch.object(
+                manager, "prompt_secret", side_effect=["replacement-password", "replacement-password"]
+            ), mock.patch.object(manager, "run_control", return_value=0) as restart:
+                guard.atomic_write_json(config_path, config)
+                result = manager.reset_web_password()
+                persisted = guard.load_config()["web_panel"]
+        self.assertTrue(result)
+        self.assertTrue(
+            manager.web_panel.verify_password(
+                "replacement-password", persisted["password_hash"]
+            )
+        )
+        self.assertFalse(
+            manager.web_panel.verify_password(
+                "previous-password", persisted["password_hash"]
+            )
+        )
+        restart.assert_called_once_with("restart")
+
+    def test_reset_web_password_rejects_failed_persistence_verification(self):
+        config = make_config()
+        with mock.patch.object(
+            manager, "_set_web_password", return_value="replacement-password"
+        ) as set_password, mock.patch.object(manager, "save_config"), mock.patch.object(
+            manager, "load_config", return_value=config
+        ), mock.patch.object(
+            manager.web_panel, "verify_password", return_value=False
+        ), mock.patch.object(manager, "run_control") as restart:
+            config["web_panel"]["password_hash"] = "old-hash"
+            with self.assertRaises(guard.GuardError):
+                manager.reset_web_password(config)
+        set_password.assert_called_once()
+        restart.assert_not_called()
+
+    def test_reset_web_password_in_container_defers_restart_to_host(self):
+        config = make_config()
+        with mock.patch.object(
+            manager, "_set_web_password", return_value="replacement-password"
+        ) as set_password, mock.patch.object(manager, "save_config"), mock.patch.object(
+            manager, "load_config", return_value=config
+        ), mock.patch.object(
+            manager.web_panel, "verify_password", return_value=True
+        ), mock.patch.object(manager, "run_control") as restart, mock.patch.dict(
+            manager.os.environ, {"ALIYUN_GUARD_CONTAINER": "1"}, clear=False
+        ):
+            set_password.side_effect = lambda web: web.update(
+                {"password_hash": "new-hash"}
+            ) or "replacement-password"
+            self.assertTrue(manager.reset_web_password(config))
+        restart.assert_not_called()
+
     def test_terminal_bot_control_defaults_on_and_accepts_multiple_admins(self):
         telegram = dict(guard.DEFAULT_CONFIG["telegram"])
         telegram["chat_id"] = "123"
@@ -2177,7 +2243,35 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertIn(" 9) 定时开关机设置", output.getvalue())
         self.assertIn("10) 网页控制面板", output.getvalue())
         self.assertIn("16) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
+        self.assertIn("21) 重置网页登录密码", output.getvalue())
         check.assert_called_once_with()
+
+    def test_menu_dispatches_web_password_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            config = make_config()
+            config["force_ipv4"] = False
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(
+                manager, "check_for_github_update", return_value=None
+            ), mock.patch.object(
+                manager, "prompt_int", side_effect=[21, 19]
+            ), mock.patch.object(manager, "prompt", return_value=""), mock.patch.object(
+                manager, "reset_web_password", return_value=True
+            ) as reset:
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        reset.assert_called_once_with(config)
+
+    def test_reset_web_password_command_dispatches_directly(self):
+        with mock.patch.object(
+            manager, "reset_web_password", return_value=True
+        ) as reset:
+            result = manager.main(["reset-web-password"])
+        self.assertEqual(result, 0)
+        reset.assert_called_once_with()
 
     def test_menu_test_action_does_not_open_connection_settings(self):
         with tempfile.TemporaryDirectory() as directory:

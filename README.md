@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.10-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.11-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -162,6 +162,7 @@ sequenceDiagram
 18) 自动发现并批量导入 ECS
 19) 退出
 20) AWS S3 自动备份
+21) 重置网页登录密码
 ```
 
 面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.5.4 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
@@ -491,6 +492,7 @@ aliyun-guard dry-run         # 查询真实数据，但不执行开关机
 aliyun-guard refresh-billing # 强制刷新所有未暂停实例的账单缓存
 aliyun-guard test-telegram   # 测试 Telegram、显示 3 次平均延迟并发送消息
 aliyun-guard web             # 查看网页控制面板地址和状态
+aliyun-guard reset-web-password # 重置网页登录密码并重启原生后台服务
 aliyun-guard update          # 校验并安装 GitHub 最新版本
 aliyun-guard version         # 显示当前版本号
 aliyun-guard logs            # 查看最近 100 行日志
