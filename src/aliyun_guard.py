@@ -307,6 +307,20 @@ def load_state():
         return {}
 
 
+def fsync_directory(path):
+    """Make a replaced directory entry durable across a host reboot."""
+    if os.name == "nt":  # pragma: no cover - deployed targets are Linux
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(str(Path(path)), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_write_json(path, value, mode=0o600, durable=True):
     path = Path(path)
     with _JSON_WRITE_LOCK:
@@ -324,6 +338,8 @@ def atomic_write_json(path, value, mode=0o600, durable=True):
                     os.fsync(handle.fileno())
             os.chmod(str(temporary), mode)
             os.replace(str(temporary), str(path))
+            if durable:
+                fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 

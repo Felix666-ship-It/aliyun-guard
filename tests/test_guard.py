@@ -1011,6 +1011,20 @@ class GuardPerformanceCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_durable_atomic_json_write_syncs_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            with mock.patch.object(guard, "fsync_directory") as sync_directory:
+                guard.atomic_write_json(path, {"version": 1})
+            sync_directory.assert_called_once_with(path.parent)
+
+    def test_non_durable_atomic_json_write_skips_parent_directory_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heartbeat.json"
+            with mock.patch.object(guard, "fsync_directory") as sync_directory:
+                guard.atomic_write_json(path, {"status": "running"}, durable=False)
+            sync_directory.assert_not_called()
+
     def test_ipv4_dns_wrapper_preserves_getaddrinfo_keyword_signature(self):
         ipv6 = (
             guard.socket.AF_INET6,
