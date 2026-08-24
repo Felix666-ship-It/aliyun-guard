@@ -981,6 +981,17 @@ def update_web_settings(guard, data):
         raise ManagementError("启用网页面板前必须设置登录密码")
     config["web_panel"] = candidate
     _save_config(guard, config)
+    persisted = web_panel.get_web_config(guard.load_config())
+    if (
+        persisted.get("password_hash") != candidate.get("password_hash")
+        or (
+            password
+            and not web_panel.verify_password(
+                password, persisted.get("password_hash", "")
+            )
+        )
+    ):
+        raise ManagementError("网页密码未能持久保存，请检查配置文件所在磁盘", 500)
     return {
         "enabled": candidate["enabled"],
         "host": candidate["host"],

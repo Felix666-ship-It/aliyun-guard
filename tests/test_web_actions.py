@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -264,6 +265,57 @@ class WebActionTests(unittest.TestCase):
         saved = guard.load_config()["web_panel"]
         self.assertEqual(saved["password_hash"], password_hash)
         self.assertEqual(saved["port"], 9000)
+
+    def test_changed_web_password_survives_fresh_process_reload(self):
+        config = guard.load_config()
+        config["web_panel"].update(
+            {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 8765,
+                "username": "admin",
+                "password_hash": web_panel.hash_password(
+                    "previous-password", iterations=1000
+                ),
+            }
+        )
+        guard.atomic_write_json(guard.CONFIG_FILE, config)
+
+        web_actions.update_web_settings(
+            guard,
+            {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 8765,
+                "username": "admin",
+                "password": "replacement-password",
+                "password_confirm": "replacement-password",
+            },
+        )
+
+        environment = os.environ.copy()
+        environment["ALIYUN_GUARD_CONFIG"] = str(guard.CONFIG_FILE)
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import aliyun_guard as guard, web_panel; "
+                    "web = guard.load_config()['web_panel']; "
+                    "assert web_panel.verify_password('replacement-password', "
+                    "web['password_hash']); "
+                    "assert not web_panel.verify_password('previous-password', "
+                    "web['password_hash'])"
+                ),
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_node_is_saved_only_after_success_and_does_not_switch_mode(self):
         result = {

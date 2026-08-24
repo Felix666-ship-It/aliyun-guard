@@ -5049,6 +5049,17 @@ def update_web_settings(guard, data):
         raise ManagementError("启用网页面板前必须设置登录密码")
     config["web_panel"] = candidate
     _save_config(guard, config)
+    persisted = web_panel.get_web_config(guard.load_config())
+    if (
+        persisted.get("password_hash") != candidate.get("password_hash")
+        or (
+            password
+            and not web_panel.verify_password(
+                password, persisted.get("password_hash", "")
+            )
+        )
+    ):
+        raise ManagementError("网页密码未能持久保存，请检查配置文件所在磁盘", 500)
     return {
         "enabled": candidate["enabled"],
         "host": candidate["host"],
@@ -9502,6 +9513,20 @@ def load_state():
         return {}
 
 
+def fsync_directory(path):
+    """Make a replaced directory entry durable across a host reboot."""
+    if os.name == "nt":  # pragma: no cover - deployed targets are Linux
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(str(Path(path)), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_write_json(path, value, mode=0o600, durable=True):
     path = Path(path)
     with _JSON_WRITE_LOCK:
@@ -9519,6 +9544,8 @@ def atomic_write_json(path, value, mode=0o600, durable=True):
                     os.fsync(handle.fileno())
             os.chmod(str(temporary), mode)
             os.replace(str(temporary), str(path))
+            if durable:
+                fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -12086,7 +12113,7 @@ UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
 APP_VERSION = "1.6.8"
-LOCAL_RELEASE_ID = "d1d0e7b9ebfd86c9037b7443148164d10e8a59e9fbcf82b74b68dfac6f111500"
+LOCAL_RELEASE_ID = "725f9d48e480a8facd49b1e8a919408dee2fba4c484d169f940ef47143f2250c"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -14047,8 +14074,8 @@ enable_watchdog_cron() {
     cron_new=$(mktemp)
     crontab -l > "$cron_old" 2>/dev/null || :
     grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
-    printf '* * * * * %s %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
-        "$PYTHON" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$PYTHON" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
 }
@@ -14468,6 +14495,9 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=ALIYUN_GUARD_HOME=$APP_DIR
+Environment=ALIYUN_GUARD_CONFIG=$APP_DIR/config.json
+Environment=ALIYUN_GUARD_STATE=$APP_DIR/state.json
 ExecStart=$VENV_DIR/bin/python $APP_DIR/aliyun_guard.py daemon
 Restart=always
 RestartSec=10
@@ -14489,6 +14519,9 @@ Type=oneshot
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=ALIYUN_GUARD_HOME=$APP_DIR
+Environment=ALIYUN_GUARD_CONFIG=$APP_DIR/config.json
+Environment=ALIYUN_GUARD_STATE=$APP_DIR/state.json
 ExecStart=$VENV_DIR/bin/python $APP_DIR/watchdog.py
 UMask=0077
 NoNewPrivileges=true
@@ -14542,6 +14575,9 @@ command_background="yes"
 pidfile="/run/$SERVICE_NAME.pid"
 output_log="$APP_DIR/logs/service.log"
 error_log="$APP_DIR/logs/service.log"
+export ALIYUN_GUARD_HOME="$APP_DIR"
+export ALIYUN_GUARD_CONFIG="$APP_DIR/config.json"
+export ALIYUN_GUARD_STATE="$APP_DIR/state.json"
 
 depend() {
     need net
@@ -14585,13 +14621,13 @@ setup_cron() {
     cron_new=$(mktemp)
     crontab -l > "$cron_old" 2>/dev/null || :
     grep -v '# aliyun-guard' "$cron_old" > "$cron_new" || :
-    printf '* * * * * %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
-        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
-    printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
-        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     if [ "$START_BACKEND" = yes ]; then
-        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
-            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+        printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     fi
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"

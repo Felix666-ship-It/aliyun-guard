@@ -181,6 +181,16 @@ class DockerArtifactTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("用法: docker-install.sh [--update]", result.stdout)
 
+    def test_native_backends_pin_persistent_config_paths(self):
+        template = (ROOT / "packaging" / "install.template.sh").read_text(
+            encoding="utf-8"
+        )
+        control = (ROOT / "src" / "control.sh").read_text(encoding="utf-8")
+        self.assertIn("Environment=ALIYUN_GUARD_CONFIG=$APP_DIR/config.json", template)
+        self.assertIn('export ALIYUN_GUARD_CONFIG="$APP_DIR/config.json"', template)
+        self.assertIn("ALIYUN_GUARD_CONFIG=%s/config.json", template)
+        self.assertIn("ALIYUN_GUARD_CONFIG=%s/config.json", control)
+
     def test_one_click_source_update_preserves_env_and_data(self):
         shell = self.shell_path()
         if shell is None:

@@ -24,8 +24,8 @@ enable_watchdog_cron() {
     cron_new=$(mktemp)
     crontab -l > "$cron_old" 2>/dev/null || :
     grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
-    printf '* * * * * %s %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
-        "$PYTHON" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$PYTHON" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
 }
