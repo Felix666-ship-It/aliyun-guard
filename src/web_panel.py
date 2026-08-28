@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.12"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -444,6 +444,34 @@ def update_pause(guard, index, paused):
     return paused
 
 
+def _set_instance_monitor_state(guard, user, paused):
+    """Persist the monitor state coupled to a manual power operation."""
+    instance_id = str(user.get("instance_id", ""))
+    region = str(user.get("region", ""))
+    with guard.config_lock():
+        latest_config = guard.load_config()
+        latest_user = next(
+            (
+                item
+                for item in latest_config.get("users", [])
+                if str(item.get("instance_id", "")) == instance_id
+                and str(item.get("region", "")) == region
+            ),
+            None,
+        )
+        if latest_user is None:
+            raise WebPanelError("实例配置已经变化，请重新操作", 409)
+        changed = bool(latest_user.get("paused", False)) != bool(paused)
+        latest_user["paused"] = bool(paused)
+        if changed:
+            guard.validate_config(latest_config)
+            guard.atomic_write_json(
+                guard.CONFIG_FILE, latest_config, mode=0o600
+            )
+        user["paused"] = bool(paused)
+        return changed
+
+
 @web_actions._config_transaction
 def update_settings(guard, data):
     config = guard.load_config()
@@ -526,20 +554,8 @@ def control_instance(
         poll_error = None
         threshold_overridden = False
         monitor_paused = False
+        monitor_resumed = False
         try:
-            schedule_target = guard.schedule_target(user)
-            automation_active = bool(user.get("actions_enabled", True)) and not bool(
-                user.get("paused", False)
-            )
-            if action == "stop" and automation_active and schedule_target != "stopped":
-                raise WebPanelError(
-                    "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控",
-                    409,
-                )
-            if action == "start" and automation_active and schedule_target == "stopped":
-                raise WebPanelError(
-                    "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
-                )
             before = guard.query_instance_status(user)
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
@@ -553,34 +569,16 @@ def control_instance(
                             409,
                         )
                     threshold_overridden = True
+                if threshold_overridden and pause_on_threshold_override:
+                    _set_instance_monitor_state(guard, user, True)
+                    monitor_paused = True
                 if before != "Running":
-                    if threshold_overridden and pause_on_threshold_override:
-                        with guard.config_lock():
-                            latest_config = guard.load_config()
-                            latest_user = next(
-                                (
-                                    item
-                                    for item in latest_config.get("users", [])
-                                    if str(item.get("instance_id", ""))
-                                    == str(user.get("instance_id", ""))
-                                    and str(item.get("region", ""))
-                                    == str(user.get("region", ""))
-                                ),
-                                None,
-                            )
-                            if latest_user is None:
-                                raise WebPanelError(
-                                    "实例配置已经变化，请重新操作", 409
-                                )
-                            latest_user["paused"] = True
-                            guard.validate_config(latest_config)
-                            guard.atomic_write_json(
-                                guard.CONFIG_FILE, latest_config, mode=0o600
-                            )
-                        user["paused"] = True
-                        monitor_paused = True
                     guard.start_instance(user)
                     performed = True
+                    if not threshold_overridden:
+                        monitor_resumed = _set_instance_monitor_state(
+                            guard, user, False
+                        )
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Running",
@@ -589,9 +587,16 @@ def control_instance(
                     )
                 else:
                     after = before
+                    if not threshold_overridden:
+                        monitor_resumed = _set_instance_monitor_state(
+                            guard, user, False
+                        )
             elif before != "Stopped":
                 guard.stop_instance(user)
                 performed = True
+                monitor_paused = _set_instance_monitor_state(
+                    guard, user, True
+                )
                 after, poll_error = guard.wait_for_status(
                     user,
                     "Stopped",
@@ -600,6 +605,9 @@ def control_instance(
                 )
             else:
                 after = before
+                monitor_paused = _set_instance_monitor_state(
+                    guard, user, True
+                )
         except WebPanelError as exc:
             message = "{}手动{}未执行: {}".format(
                 source, "开机" if action == "start" else "关机", exc
@@ -623,7 +631,9 @@ def control_instance(
                 "开机" if action == "start" else "关机", error
             )
             if monitor_paused:
-                message += "；该实例监控已暂停，请处理后按需恢复"
+                message += "；该实例监控已自动暂停，请处理后按需恢复"
+            elif monitor_resumed:
+                message += "；该实例监控已自动恢复"
             _write_manual_instance_log(
                 guard,
                 user,
@@ -649,7 +659,12 @@ def control_instance(
         if poll_error:
             message += "\n状态复查: {}".format(poll_error)
         if monitor_paused:
-            message += "\n监控: 已自动暂停（流量阈值强制开机）"
+            if threshold_overridden:
+                message += "\n监控: 已自动暂停（流量阈值强制开机）"
+            else:
+                message += "\n监控: 已自动暂停（手动关机后不会被自动开机）"
+        elif monitor_resumed:
+            message += "\n监控: 已自动恢复"
         notify_error = None
         if notify:
             try:
@@ -723,6 +738,7 @@ def control_instance(
             "notification_error": notify_error,
             "threshold_overridden": threshold_overridden,
             "monitor_paused": monitor_paused,
+            "monitor_resumed": monitor_resumed,
         }
 
 

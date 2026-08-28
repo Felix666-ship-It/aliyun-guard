@@ -714,16 +714,77 @@ class ManualControlTests(unittest.TestCase):
         write_log.assert_called_once()
         self.assertEqual(write_log.call_args.kwargs["event"], "网页手动关机")
 
-    def test_manual_stop_requires_pausing_active_keepalive(self):
+    def test_manual_stop_automatically_pauses_active_keepalive(self):
         config = make_config()
+        config["users"][0]["paused"] = False
         config["users"][0]["schedule"]["enabled"] = False
         with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
-            guard, "stop_instance"
-        ) as stop:
-            with self.assertRaises(web_panel.WebPanelError) as raised:
-                web_panel.control_instance(guard, 0, "stop")
-        self.assertEqual(raised.exception.status, 409)
-        stop.assert_not_called()
+            guard, "query_instance_status", return_value="Running"
+        ), mock.patch.object(guard, "stop_instance") as stop, mock.patch.object(
+            guard, "wait_for_status", return_value=("Stopped", None)
+        ), mock.patch.object(guard, "atomic_write_json") as save_config, mock.patch.object(
+            guard, "load_state", return_value={"instances": {}, "history": []}
+        ), mock.patch.object(guard, "save_state"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            result = web_panel.control_instance(guard, 0, "stop", notify=False)
+        stop.assert_called_once()
+        save_config.assert_called_once()
+        self.assertTrue(config["users"][0]["paused"])
+        self.assertTrue(result["monitor_paused"])
+        self.assertFalse(result["monitor_resumed"])
+        self.assertIn("手动关机后不会被自动开机", result["message"])
+
+    def test_manual_start_automatically_resumes_monitor(self):
+        config = make_config()
+        config["users"][0]["paused"] = True
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=10.0
+        ), mock.patch.object(guard, "start_instance") as start, mock.patch.object(
+            guard, "wait_for_status", return_value=("Running", None)
+        ), mock.patch.object(guard, "atomic_write_json") as save_config, mock.patch.object(
+            guard, "load_state", return_value={"instances": {}, "history": []}
+        ), mock.patch.object(guard, "save_state"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            result = web_panel.control_instance(guard, 0, "start", notify=False)
+        start.assert_called_once()
+        save_config.assert_called_once()
+        self.assertFalse(config["users"][0]["paused"])
+        self.assertFalse(result["monitor_paused"])
+        self.assertTrue(result["monitor_resumed"])
+        self.assertIn("监控: 已自动恢复", result["message"])
+
+    def test_manual_start_failure_keeps_monitor_paused(self):
+        config = make_config()
+        config["users"][0]["paused"] = True
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=10.0
+        ), mock.patch.object(
+            guard, "start_instance", side_effect=RuntimeError("StartFailed")
+        ), mock.patch.object(guard, "write_instance_log"):
+            with self.assertRaises(web_panel.WebPanelError):
+                web_panel.control_instance(guard, 0, "start", notify=False)
+        self.assertTrue(config["users"][0]["paused"])
+
+    def test_manual_stop_failure_does_not_pause_monitor(self):
+        config = make_config()
+        config["users"][0]["paused"] = False
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Running"
+        ), mock.patch.object(
+            guard, "stop_instance", side_effect=RuntimeError("StopFailed")
+        ), mock.patch.object(guard, "write_instance_log"):
+            with self.assertRaises(web_panel.WebPanelError):
+                web_panel.control_instance(guard, 0, "stop", notify=False)
+        self.assertFalse(config["users"][0]["paused"])
 
     def test_bot_threshold_override_pauses_monitor_before_start(self):
         config = make_config()

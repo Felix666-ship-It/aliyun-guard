@@ -831,6 +831,26 @@ class GuardNotificationTests(unittest.TestCase):
         self.assertNotIn(base_url, text)
         self.assertNotIn("secret", text)
 
+    def test_signed_aliyun_request_error_is_short_and_redacted(self):
+        raw = (
+            "SDK.HttpError HTTPSConnectionPool(host='cdt.aliyuncs.com', port=443): "
+            "Max retries exceeded with url: /?Version=2021-08-13&Action="
+            "ListCdtInternetTraffic&Timestamp=2026-08-28T02%3A12%3A53Z&"
+            "SignatureNonce=nonce&AccessKeyId=ak&Signature=signature "
+            "(Caused by SSLError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF'))"
+        )
+        text = guard.compact_error(RuntimeError(raw), secrets=("ak", "signature"))
+        self.assertEqual(
+            text,
+            "cdt.aliyuncs.com:443：TLS/SSL 连接被对端提前关闭（可能与出口网络、代理或 IPv4/IPv6 路径有关）",
+        )
+        self.assertNotIn("Timestamp", text)
+        self.assertNotIn("SignatureNonce", text)
+        self.assertNotIn("signature", text)
+
+    def test_long_duration_is_human_readable(self):
+        self.assertEqual(guard.format_duration(4666.5), "1 小时 17 分 46.5 秒")
+
     def test_dormant_saved_node_is_redacted_from_errors(self):
         node_uuid = "11111111-1111-1111-1111-111111111111"
         node_url = "vless://{}@example.com:443?security=tls#Saved".format(node_uuid)
@@ -1347,10 +1367,10 @@ class ConfigTests(unittest.TestCase):
                 self.action = value
 
             def set_connect_timeout(self, value):
-                pass
+                self.connect_timeout = value
 
             def set_read_timeout(self, value):
-                pass
+                self.read_timeout = value
 
             def add_query_param(self, key, value):
                 self.params[key] = value
@@ -1392,6 +1412,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(request.domain, "business.ap-southeast-1.aliyuncs.com")
         self.assertEqual(request.action, "DescribeInstanceBill")
         self.assertEqual(request.params["InstanceID"], "i-test123")
+        self.assertEqual(request.connect_timeout, 5)
+        self.assertEqual(request.read_timeout, 15)
 
     def test_normalizes_bss_item_shapes(self):
         wrapped = {"Data": {"Items": {"Item": [{"PretaxAmount": "1.20"}]}}}
@@ -1439,6 +1461,30 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(errors, 1)
         self.assertIn("CDT 流量查询失败", summary)
+        self.assertIn("流量: 查询失败（阈值 180.00 GB）", summary)
+
+    def test_summary_warns_when_cycle_is_unusually_long(self):
+        result = {
+            "name": "HK",
+            "instance_id": "i-test123",
+            "traffic_gb": 10.0,
+            "limit_gb": 180.0,
+            "status_before": "Running",
+            "status_after": "Running",
+            "action": "none",
+            "action_performed": False,
+            "level": "ok",
+            "message": "流量安全，实例运行正常",
+            "errors": [],
+            "paused": False,
+            "billing_enabled": False,
+        }
+        summary, errors, _actions, _warnings = guard.build_summary(
+            [result], dt.datetime.now().astimezone(), 4666.5
+        )
+        self.assertEqual(errors, 0)
+        self.assertIn("耗时: 1 小时 17 分 46.5 秒", summary)
+        self.assertIn("本轮耗时较长", summary)
 
     def test_summary_includes_bill_amount_and_bss_error(self):
         base = {

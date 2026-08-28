@@ -5725,7 +5725,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.12"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -6139,6 +6139,34 @@ def update_pause(guard, index, paused):
     return paused
 
 
+def _set_instance_monitor_state(guard, user, paused):
+    """Persist the monitor state coupled to a manual power operation."""
+    instance_id = str(user.get("instance_id", ""))
+    region = str(user.get("region", ""))
+    with guard.config_lock():
+        latest_config = guard.load_config()
+        latest_user = next(
+            (
+                item
+                for item in latest_config.get("users", [])
+                if str(item.get("instance_id", "")) == instance_id
+                and str(item.get("region", "")) == region
+            ),
+            None,
+        )
+        if latest_user is None:
+            raise WebPanelError("实例配置已经变化，请重新操作", 409)
+        changed = bool(latest_user.get("paused", False)) != bool(paused)
+        latest_user["paused"] = bool(paused)
+        if changed:
+            guard.validate_config(latest_config)
+            guard.atomic_write_json(
+                guard.CONFIG_FILE, latest_config, mode=0o600
+            )
+        user["paused"] = bool(paused)
+        return changed
+
+
 @web_actions._config_transaction
 def update_settings(guard, data):
     config = guard.load_config()
@@ -6221,20 +6249,8 @@ def control_instance(
         poll_error = None
         threshold_overridden = False
         monitor_paused = False
+        monitor_resumed = False
         try:
-            schedule_target = guard.schedule_target(user)
-            automation_active = bool(user.get("actions_enabled", True)) and not bool(
-                user.get("paused", False)
-            )
-            if action == "stop" and automation_active and schedule_target != "stopped":
-                raise WebPanelError(
-                    "自动保活当前有效，直接关机会被重新启动；请先暂停该实例监控",
-                    409,
-                )
-            if action == "start" and automation_active and schedule_target == "stopped":
-                raise WebPanelError(
-                    "当前处于计划关机时段；请先暂停监控或修改定时计划", 409
-                )
             before = guard.query_instance_status(user)
             if action == "start":
                 traffic = guard.query_cdt_traffic_gb(user)
@@ -6248,34 +6264,16 @@ def control_instance(
                             409,
                         )
                     threshold_overridden = True
+                if threshold_overridden and pause_on_threshold_override:
+                    _set_instance_monitor_state(guard, user, True)
+                    monitor_paused = True
                 if before != "Running":
-                    if threshold_overridden and pause_on_threshold_override:
-                        with guard.config_lock():
-                            latest_config = guard.load_config()
-                            latest_user = next(
-                                (
-                                    item
-                                    for item in latest_config.get("users", [])
-                                    if str(item.get("instance_id", ""))
-                                    == str(user.get("instance_id", ""))
-                                    and str(item.get("region", ""))
-                                    == str(user.get("region", ""))
-                                ),
-                                None,
-                            )
-                            if latest_user is None:
-                                raise WebPanelError(
-                                    "实例配置已经变化，请重新操作", 409
-                                )
-                            latest_user["paused"] = True
-                            guard.validate_config(latest_config)
-                            guard.atomic_write_json(
-                                guard.CONFIG_FILE, latest_config, mode=0o600
-                            )
-                        user["paused"] = True
-                        monitor_paused = True
                     guard.start_instance(user)
                     performed = True
+                    if not threshold_overridden:
+                        monitor_resumed = _set_instance_monitor_state(
+                            guard, user, False
+                        )
                     after, poll_error = guard.wait_for_status(
                         user,
                         "Running",
@@ -6284,9 +6282,16 @@ def control_instance(
                     )
                 else:
                     after = before
+                    if not threshold_overridden:
+                        monitor_resumed = _set_instance_monitor_state(
+                            guard, user, False
+                        )
             elif before != "Stopped":
                 guard.stop_instance(user)
                 performed = True
+                monitor_paused = _set_instance_monitor_state(
+                    guard, user, True
+                )
                 after, poll_error = guard.wait_for_status(
                     user,
                     "Stopped",
@@ -6295,6 +6300,9 @@ def control_instance(
                 )
             else:
                 after = before
+                monitor_paused = _set_instance_monitor_state(
+                    guard, user, True
+                )
         except WebPanelError as exc:
             message = "{}手动{}未执行: {}".format(
                 source, "开机" if action == "start" else "关机", exc
@@ -6318,7 +6326,9 @@ def control_instance(
                 "开机" if action == "start" else "关机", error
             )
             if monitor_paused:
-                message += "；该实例监控已暂停，请处理后按需恢复"
+                message += "；该实例监控已自动暂停，请处理后按需恢复"
+            elif monitor_resumed:
+                message += "；该实例监控已自动恢复"
             _write_manual_instance_log(
                 guard,
                 user,
@@ -6344,7 +6354,12 @@ def control_instance(
         if poll_error:
             message += "\n状态复查: {}".format(poll_error)
         if monitor_paused:
-            message += "\n监控: 已自动暂停（流量阈值强制开机）"
+            if threshold_overridden:
+                message += "\n监控: 已自动暂停（流量阈值强制开机）"
+            else:
+                message += "\n监控: 已自动暂停（手动关机后不会被自动开机）"
+        elif monitor_resumed:
+            message += "\n监控: 已自动恢复"
         notify_error = None
         if notify:
             try:
@@ -6418,6 +6433,7 @@ def control_instance(
             "notification_error": notify_error,
             "threshold_overridden": threshold_overridden,
             "monitor_paused": monitor_paused,
+            "monitor_resumed": monitor_resumed,
         }
 
 
@@ -9341,6 +9357,11 @@ _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
 
+# 阿里云 SDK 对可重试的 HTTP 错误可能进行额外重试。检测服务是周期任务，
+# 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
+ALIYUN_API_CONNECT_TIMEOUT_SECONDS = 5
+ALIYUN_API_READ_TIMEOUT_SECONDS = 15
+
 
 class GuardError(RuntimeError):
     pass
@@ -9791,12 +9812,54 @@ def enable_ipv4_only():
         pass
 
 
+def _redact_request_details(text):
+    """Remove signed API request details from errors shown in logs/notifications."""
+    def redact_url(match):
+        value = match.group(0)
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            path = parsed.path or "/"
+            suffix = "?[请求参数已隐藏]" if parsed.query else ""
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, path, "", "")
+            ) + suffix
+        except ValueError:
+            return "[请求地址已隐藏]"
+
+    text = re.sub(r"https?://[^\s<>\"']+", redact_url, text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(with url:\s+)(/[^\s)]*)",
+        lambda match: match.group(1)
+        + ("/[请求参数已隐藏]" if "?" in match.group(2) else match.group(2)),
+        text,
+        flags=re.IGNORECASE,
+    )
+    if "SSLEOFError" in text or "UNEXPECTED_EOF_WHILE_READING" in text:
+        endpoint = re.search(
+            r"(?:host=|HTTPSConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        target = "{}:{}".format(endpoint.group(1), endpoint.group(2)) if endpoint else "阿里云 API"
+        return "{}：TLS/SSL 连接被对端提前关闭（可能与出口网络、代理或 IPv4/IPv6 路径有关）".format(target)
+    if "Max retries exceeded" in text and "ConnectionPool" in text:
+        endpoint = re.search(
+            r"(?:host=|ConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        target = "{}:{}".format(endpoint.group(1), endpoint.group(2)) if endpoint else "远程 API"
+        return "{}：网络请求重试次数已耗尽".format(target)
+    return text
+
+
 def compact_error(exc, limit=500, secrets=None):
     text = " ".join(str(exc).replace("\r", " ").replace("\n", " ").split())
     for secret in secrets or []:
         secret = str(secret or "")
         if secret:
             text = text.replace(secret, "***")
+    text = _redact_request_details(text)
     return text[:limit] if text else exc.__class__.__name__
 
 
@@ -9947,12 +10010,41 @@ def require_sdk():
         raise GuardError("阿里云 SDK 未安装: {}".format(SDK_IMPORT_ERROR))
 
 
+def configure_aliyun_request(
+    request,
+    connect_timeout_seconds=ALIYUN_API_CONNECT_TIMEOUT_SECONDS,
+    read_timeout_seconds=ALIYUN_API_READ_TIMEOUT_SECONDS,
+):
+    """Apply bounded network settings to an individual API request."""
+    request.set_connect_timeout(int(connect_timeout_seconds))
+    request.set_read_timeout(int(read_timeout_seconds))
+    return request
+
+
+def format_duration(seconds):
+    """Render long cycle durations in a form that is easy to scan."""
+    try:
+        seconds = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "未知"
+    if seconds < 60:
+        return "{:.1f} 秒".format(seconds)
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return "{} 分 {:.1f} 秒".format(int(minutes), remainder)
+    hours, minutes = divmod(int(minutes), 60)
+    return "{} 小时 {} 分 {:.1f} 秒".format(hours, minutes, remainder)
+
+
 def make_client(user, region=None):
     require_sdk()
     return AcsClient(
         str(user["ak"]).strip(),
         str(user["sk"]).strip(),
         region or str(user["region"]).strip(),
+        auto_retry=False,
+        connect_timeout=ALIYUN_API_CONNECT_TIMEOUT_SECONDS,
+        timeout=ALIYUN_API_READ_TIMEOUT_SECONDS,
     )
 
 
@@ -10089,8 +10181,7 @@ def query_instance_bill(user):
     request.set_domain(str(billing["endpoint"]).strip())
     request.set_version("2017-12-14")
     request.set_action_name("DescribeInstanceBill")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
     request.add_query_param("InstanceID", str(user["instance_id"]).strip())
     request.add_query_param("ProductCode", "ecs")
@@ -10221,8 +10312,7 @@ def query_cdt_traffic_gb(user):
     request.set_domain("cdt.aliyuncs.com")
     request.set_version("2021-08-13")
     request.set_action_name("ListCdtInternetTraffic")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
     details = data.get("TrafficDetails", [])
@@ -10263,8 +10353,7 @@ def query_instance_status(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     response = make_client(user).do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
@@ -10301,8 +10390,7 @@ def query_instance_statuses(users):
         json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
     )
     request.set_PageSize(min(100, len(users)))
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     response = make_client(users[0]).do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
@@ -10401,8 +10489,7 @@ def discover_ecs_regions(ak, sk):
     request.set_domain("ecs.aliyuncs.com")
     request.set_version("2014-05-26")
     request.set_action_name("DescribeRegions")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     credentials = {"ak": access_key, "sk": secret_key}
     response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
@@ -10448,8 +10535,7 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                 request.set_accept_format("json")
                 request.set_PageNumber(page)
                 request.set_PageSize(100)
-                request.set_connect_timeout(5000)
-                request.set_read_timeout(20000)
+                configure_aliyun_request(request, read_timeout_seconds=20)
                 response = make_client(credentials, region).do_action_with_exception(request)
                 data = json.loads(response.decode("utf-8"))
                 instances = data.get("Instances", {}).get("Instance", [])
@@ -10502,8 +10588,7 @@ def start_instance(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
 
@@ -10513,8 +10598,7 @@ def stop_instance(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
 
@@ -11330,7 +11414,7 @@ def build_summary(results, started_at, duration, dry_run=False):
                 )
             )
         if item["traffic_gb"] is None:
-            lines.append("  流量: 查询失败 / {:.2f} GB".format(item["limit_gb"]))
+            lines.append("  流量: 查询失败（阈值 {:.2f} GB）".format(item["limit_gb"]))
         else:
             lines.append("  流量: {:.2f} / {:.2f} GB".format(item["traffic_gb"], item["limit_gb"]))
         status = item["status_before"] or "查询失败"
@@ -11366,7 +11450,9 @@ def build_summary(results, started_at, duration, dry_run=False):
         for error in item.get("errors", []):
             if error != item["message"]:
                 lines.append("  错误: {}".format(error))
-    lines.extend(["", "耗时: {:.1f} 秒".format(duration)])
+    lines.extend(["", "耗时: {}".format(format_duration(duration))])
+    if float(duration or 0) >= 600:
+        lines.append("提示: 本轮耗时较长，请检查阿里云 API 出口网络、代理和 SDK 重试配置")
     return "\n".join(lines), error_count, action_count, warning_count
 
 
@@ -12112,8 +12198,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.11"
-LOCAL_RELEASE_ID = "802d4f2541f11b2bf1878bf08036580a05919e26059e55c17411e2532d7a53d7"
+APP_VERSION = "1.6.12"
+LOCAL_RELEASE_ID = "37169f327ffd6dae5d90c98e24c62e97c52a5101ca9723565898064a6abac236"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

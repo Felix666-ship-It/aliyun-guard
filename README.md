@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.11-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.12-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -248,7 +248,7 @@ http://127.0.0.1:8765
 - API 不返回 AccessKey、AccessKey Secret、Bot Token、原始代理 URL、代理凭据、节点原链接或网页登录密码哈希，只返回“是否已保存”和不含凭据的连接说明。
 - 编辑敏感参数时输入框不会回填星号或旧值；已配置字段统一提示“已保存，留空不修改”，留空时后端保留原值。
 - 新增节点必须先通过到 Telegram Bot API 的 3 次往返延迟检测和测试消息，成功后才保存；保存新节点不会擅自切换当前连接方式。
-- 网页手动开机仍检查 CDT 阈值；自动保活有效时直接关机会被拒绝，需要先暂停实例监控。
+- 网页或 Telegram 手动开机仍检查 CDT 阈值；手动关机会自动暂停该实例监控，流量安全的手动开机会自动恢复监控，不需要先手动切换监控状态。
 
 systemd 和 OpenRC 环境中，网页面板随 `aliyun-guard` 后台服务启动。cron 回退环境会每分钟轻量检查网页进程并在需要时恢复。查看入口和运行方式：
 
