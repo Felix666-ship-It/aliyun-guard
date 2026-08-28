@@ -843,7 +843,7 @@ class ManualControlTests(unittest.TestCase):
                     pause_on_threshold_override=True,
                 )
         self.assertTrue(config["users"][0]["paused"])
-        self.assertIn("监控已暂停", str(raised.exception))
+        self.assertIn("监控已自动暂停", str(raised.exception))
 
 
 class WebHtmlTests(unittest.TestCase):
