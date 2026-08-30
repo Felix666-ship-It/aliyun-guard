@@ -9222,9 +9222,18 @@ __AG_WEB_PY_EOF__
       }
     });
 
-    $("instances").addEventListener("pointermove", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
-    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
-    $("instances").addEventListener("pointerout", event => { const target = event.target.closest(".chart-hit"); if (target && !target.contains(event.relatedTarget)) hideChartTooltip(target); });
+    $("instances").addEventListener("pointermove", event => {
+      const sparkline = event.target.closest(".sparkline");
+      if (!sparkline || event.target.closest(".chart-tooltip")) return;
+      const svg = sparkline.querySelector("svg");
+      const hits = [...sparkline.querySelectorAll(".chart-hit")];
+      if (!svg || !hits.length) return;
+      const rect = svg.getBoundingClientRect();
+      const viewX = Math.max(4, Math.min(316, 4 + ((event.clientX - rect.left) / rect.width) * 312));
+      const nearest = hits.reduce((best, hit) => Math.abs(Number(hit.dataset.x) - viewX) < Math.abs(Number(best.dataset.x) - viewX) ? hit : best, hits[0]);
+      showChartTooltip(nearest, event.clientX);
+    });
+    $("instances").addEventListener("pointerout", event => { const sparkline = event.target.closest(".sparkline"); if (sparkline && !sparkline.contains(event.relatedTarget)) hideChartTooltip(sparkline.querySelector(".chart-hit")); });
     $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
     $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });
     $("instances").addEventListener("pointerdown", event => { const target = event.target.closest(".chart-hit"); if (target) { event.stopPropagation(); showChartTooltip(target); } });
@@ -12701,8 +12710,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.19"
-LOCAL_RELEASE_ID = "a9827b23d7ec20922431e35bd730152b647725763c65c483d5a5b6b652b7589b"
+APP_VERSION = "1.6.20"
+LOCAL_RELEASE_ID = "41e859255e133777ed5c8107d94ea093234e4cc7ef5b0281f6a0326d31fa6e73"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

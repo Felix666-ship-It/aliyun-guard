@@ -1958,9 +1958,18 @@
       }
     });
 
-    $("instances").addEventListener("pointermove", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
-    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
-    $("instances").addEventListener("pointerout", event => { const target = event.target.closest(".chart-hit"); if (target && !target.contains(event.relatedTarget)) hideChartTooltip(target); });
+    $("instances").addEventListener("pointermove", event => {
+      const sparkline = event.target.closest(".sparkline");
+      if (!sparkline || event.target.closest(".chart-tooltip")) return;
+      const svg = sparkline.querySelector("svg");
+      const hits = [...sparkline.querySelectorAll(".chart-hit")];
+      if (!svg || !hits.length) return;
+      const rect = svg.getBoundingClientRect();
+      const viewX = Math.max(4, Math.min(316, 4 + ((event.clientX - rect.left) / rect.width) * 312));
+      const nearest = hits.reduce((best, hit) => Math.abs(Number(hit.dataset.x) - viewX) < Math.abs(Number(best.dataset.x) - viewX) ? hit : best, hits[0]);
+      showChartTooltip(nearest, event.clientX);
+    });
+    $("instances").addEventListener("pointerout", event => { const sparkline = event.target.closest(".sparkline"); if (sparkline && !sparkline.contains(event.relatedTarget)) hideChartTooltip(sparkline.querySelector(".chart-hit")); });
     $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
     $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });
     $("instances").addEventListener("pointerdown", event => { const target = event.target.closest(".chart-hit"); if (target) { event.stopPropagation(); showChartTooltip(target); } });
