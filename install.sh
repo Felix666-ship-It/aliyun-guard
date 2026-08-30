@@ -5725,7 +5725,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.13"
+APP_VERSION = "1.6.15"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -9361,6 +9361,8 @@ _TELEGRAM_LOCAL = threading.local()
 # 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
 ALIYUN_API_CONNECT_TIMEOUT_SECONDS = 5
 ALIYUN_API_READ_TIMEOUT_SECONDS = 15
+CDT_REQUEST_ATTEMPTS = 3
+CDT_RETRY_BACKOFF_SECONDS = (1, 2)
 
 
 class GuardError(RuntimeError):
@@ -9827,6 +9829,8 @@ def _redact_request_details(text):
             return "[请求地址已隐藏]"
 
     text = re.sub(r"https?://[^\s<>\"']+", redact_url, text, flags=re.IGNORECASE)
+
+    # urllib3 会把签名后的 query string 放在 `with url:` 后面，而不是完整 URL。
     text = re.sub(
         r"(with url:\s+)(/[^\s)]*)",
         lambda match: match.group(1)
@@ -9834,6 +9838,8 @@ def _redact_request_details(text):
         text,
         flags=re.IGNORECASE,
     )
+
+    # SSLEOFError 的原始 repr 很长，且通常伴随已签名 URL；保留服务端点和可操作结论即可。
     if "SSLEOFError" in text or "UNEXPECTED_EOF_WHILE_READING" in text:
         endpoint = re.search(
             r"(?:host=|HTTPSConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
@@ -9842,6 +9848,8 @@ def _redact_request_details(text):
         )
         target = "{}:{}".format(endpoint.group(1), endpoint.group(2)) if endpoint else "阿里云 API"
         return "{}：TLS/SSL 连接被对端提前关闭（可能与出口网络、代理或 IPv4/IPv6 路径有关）".format(target)
+
+    # 其他连接池错误也不需要把完整签名请求复制到 Telegram。
     if "Max retries exceeded" in text and "ConnectionPool" in text:
         endpoint = re.search(
             r"(?:host=|ConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
@@ -10042,10 +10050,56 @@ def make_client(user, region=None):
         str(user["ak"]).strip(),
         str(user["sk"]).strip(),
         region or str(user["region"]).strip(),
+        # CommonRequest 转换后不会把其超时字段完整传递到底层请求；
+        # 在客户端层同时设置超时，并关闭 SDK 的隐式重试，确保单轮有界。
         auto_retry=False,
         connect_timeout=ALIYUN_API_CONNECT_TIMEOUT_SECONDS,
         timeout=ALIYUN_API_READ_TIMEOUT_SECONDS,
     )
+
+
+def is_retryable_aliyun_network_error(exc):
+    """Identify transport failures that are likely to succeed on a fresh request."""
+    pending = [exc]
+    seen = set()
+    markers = (
+        "connection aborted",
+        "connection reset",
+        "connection reset by peer",
+        "connection refused",
+        "connection broken",
+        "remote end closed connection",
+        "unexpected_eof_while_reading",
+        "ssleoferror",
+        "read timed out",
+        "connect timeout",
+        "connection timed out",
+        "timed out",
+    )
+    while pending:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, socket.timeout)):
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in markers):
+            return True
+        pending.extend(
+            nested
+            for nested in (
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            )
+            if isinstance(nested, BaseException)
+        )
+        pending.extend(
+            nested
+            for nested in getattr(current, "args", ())
+            if isinstance(nested, BaseException)
+        )
+    return False
 
 
 def get_billing_config(user):
@@ -10305,15 +10359,33 @@ def query_instance_bill_cached(
 
 def query_cdt_traffic_gb(user):
     require_sdk()
-    request = CommonRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_method("POST")
-    request.set_domain("cdt.aliyuncs.com")
-    request.set_version("2021-08-13")
-    request.set_action_name("ListCdtInternetTraffic")
-    configure_aliyun_request(request)
-    response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
+    response = None
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        request = CommonRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_method("POST")
+        request.set_domain("cdt.aliyuncs.com")
+        request.set_version("2021-08-13")
+        request.set_action_name("ListCdtInternetTraffic")
+        configure_aliyun_request(request)
+        try:
+            response = make_client(
+                user, "cn-hangzhou"
+            ).do_action_with_exception(request)
+            break
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[CDT] 流量查询网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
     data = json.loads(response.decode("utf-8"))
     details = data.get("TrafficDetails", [])
     total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
@@ -12198,8 +12270,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.13"
-LOCAL_RELEASE_ID = "58f6a7d5af79a24561b75bd687d619284f7f0a1773718342517863d0916e9261"
+APP_VERSION = "1.6.15"
+LOCAL_RELEASE_ID = "3d6622b017b8a6cf84597ab0fb5dd83d1b3a17cdc79d5d8c77d8dbab4676e57c"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

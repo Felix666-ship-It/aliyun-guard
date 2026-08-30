@@ -1415,6 +1415,101 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(request.connect_timeout, 5)
         self.assertEqual(request.read_timeout, 15)
 
+    def test_cdt_query_retries_transient_connection_reset(self):
+        class FakeRequest:
+            def set_protocol_type(self, value):
+                pass
+
+            def set_accept_format(self, value):
+                pass
+
+            def set_method(self, value):
+                pass
+
+            def set_domain(self, value):
+                pass
+
+            def set_version(self, value):
+                pass
+
+            def set_action_name(self, value):
+                pass
+
+            def set_connect_timeout(self, value):
+                pass
+
+            def set_read_timeout(self, value):
+                pass
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def do_action_with_exception(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "SDK.HttpError ('Connection aborted.', "
+                        "ConnectionResetError(104, 'Connection reset by peer'))"
+                    )
+                return json.dumps(
+                    {"TrafficDetails": [{"Traffic": 2 ** 30}]}
+                ).encode("utf-8")
+
+        client = FakeClient()
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "CommonRequest", FakeRequest
+        ), mock.patch.object(guard, "make_client", return_value=client) as make_client, mock.patch.object(
+            guard.time, "sleep"
+        ) as sleep:
+            traffic = guard.query_cdt_traffic_gb(make_user())
+
+        self.assertEqual(traffic, 1.0)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(make_client.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_cdt_query_does_not_retry_business_error(self):
+        class FakeRequest:
+            def set_protocol_type(self, value):
+                pass
+
+            def set_accept_format(self, value):
+                pass
+
+            def set_method(self, value):
+                pass
+
+            def set_domain(self, value):
+                pass
+
+            def set_version(self, value):
+                pass
+
+            def set_action_name(self, value):
+                pass
+
+            def set_connect_timeout(self, value):
+                pass
+
+            def set_read_timeout(self, value):
+                pass
+
+        client = mock.Mock()
+        client.do_action_with_exception.side_effect = RuntimeError(
+            "InvalidAccessKeyId.NotFound"
+        )
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "CommonRequest", FakeRequest
+        ), mock.patch.object(guard, "make_client", return_value=client), mock.patch.object(
+            guard.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "InvalidAccessKeyId"):
+                guard.query_cdt_traffic_gb(make_user())
+
+        client.do_action_with_exception.assert_called_once()
+        sleep.assert_not_called()
+
     def test_normalizes_bss_item_shapes(self):
         wrapped = {"Data": {"Items": {"Item": [{"PretaxAmount": "1.20"}]}}}
         direct = {"Data": {"Items": [{"PretaxAmount": "2.30"}]}}

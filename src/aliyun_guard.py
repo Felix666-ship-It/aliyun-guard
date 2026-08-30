@@ -139,6 +139,8 @@ _TELEGRAM_LOCAL = threading.local()
 # 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
 ALIYUN_API_CONNECT_TIMEOUT_SECONDS = 5
 ALIYUN_API_READ_TIMEOUT_SECONDS = 15
+CDT_REQUEST_ATTEMPTS = 3
+CDT_RETRY_BACKOFF_SECONDS = (1, 2)
 
 
 class GuardError(RuntimeError):
@@ -834,6 +836,50 @@ def make_client(user, region=None):
     )
 
 
+def is_retryable_aliyun_network_error(exc):
+    """Identify transport failures that are likely to succeed on a fresh request."""
+    pending = [exc]
+    seen = set()
+    markers = (
+        "connection aborted",
+        "connection reset",
+        "connection reset by peer",
+        "connection refused",
+        "connection broken",
+        "remote end closed connection",
+        "unexpected_eof_while_reading",
+        "ssleoferror",
+        "read timed out",
+        "connect timeout",
+        "connection timed out",
+        "timed out",
+    )
+    while pending:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, socket.timeout)):
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in markers):
+            return True
+        pending.extend(
+            nested
+            for nested in (
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            )
+            if isinstance(nested, BaseException)
+        )
+        pending.extend(
+            nested
+            for nested in getattr(current, "args", ())
+            if isinstance(nested, BaseException)
+        )
+    return False
+
+
 def get_billing_config(user):
     configured = user.get("billing")
     if isinstance(configured, dict):
@@ -1091,15 +1137,33 @@ def query_instance_bill_cached(
 
 def query_cdt_traffic_gb(user):
     require_sdk()
-    request = CommonRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_method("POST")
-    request.set_domain("cdt.aliyuncs.com")
-    request.set_version("2021-08-13")
-    request.set_action_name("ListCdtInternetTraffic")
-    configure_aliyun_request(request)
-    response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
+    response = None
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        request = CommonRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_method("POST")
+        request.set_domain("cdt.aliyuncs.com")
+        request.set_version("2021-08-13")
+        request.set_action_name("ListCdtInternetTraffic")
+        configure_aliyun_request(request)
+        try:
+            response = make_client(
+                user, "cn-hangzhou"
+            ).do_action_with_exception(request)
+            break
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[CDT] 流量查询网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
     data = json.loads(response.decode("utf-8"))
     details = data.get("TrafficDetails", [])
     total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
