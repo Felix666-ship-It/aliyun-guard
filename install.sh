@@ -7801,9 +7801,11 @@ __AG_WEB_PY_EOF__
       pointer-events: none;
     }
     .chart-tooltip {
-      position: absolute;
-      z-index: 12;
-      bottom: 68px;
+      position: fixed;
+      z-index: 120;
+      left: 0;
+      top: 0;
+      transform: translate(-50%, calc(-100% - 14px));
       width: min(290px, calc(100% - 8px));
       padding: 11px 13px;
       color: var(--ink-soft);
@@ -9080,15 +9082,13 @@ __AG_WEB_PY_EOF__
       tooltip.innerHTML = `<div class="tooltip-title">${esc(fmtDate(point.at))}</div><div class="tooltip-row"><span>当时流量</span><strong>${fmtNum(point.value)} GB</strong></div><div class="tooltip-row"><span>ECS 状态</span><strong>${esc(status)}</strong></div><div class="tooltip-row"><span>执行动作</span><strong>${esc(actionText(point))}</strong></div><div class="tooltip-row"><span>检测结果</span><strong>${esc(point.message || "历史样本无详细结果")}</strong></div>`;
       tooltip.hidden = false;
       requestAnimationFrame(() => {
-        const containerRect = container.getBoundingClientRect();
-        const targetRect = target.getBoundingClientRect();
-        const desired = pointerX === null
-          ? targetRect.left + targetRect.width / 2 - containerRect.left
-          : pointerX - containerRect.left;
-        const width = containerRect.width;
-        const left = Math.max(4, Math.min(width - tooltip.offsetWidth - 4, desired - tooltip.offsetWidth / 2));
-        tooltip.style.left = `${left}px`;
-        tooltip.style.setProperty("--tip-arrow", `${Math.max(12, Math.min(tooltip.offsetWidth - 12, desired - left))}px`);
+        const x = pointerX === null ? target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2 : pointerX;
+        const y = target.getBoundingClientRect().top;
+        const width = tooltip.offsetWidth;
+        const clampedX = Math.max(width / 2 + 8, Math.min(window.innerWidth - width / 2 - 8, x));
+        tooltip.style.left = `${clampedX}px`;
+        tooltip.style.top = `${Math.max(8, y)}px`;
+        tooltip.style.setProperty("--tip-arrow", "50%");
       });
     }
 
@@ -12710,8 +12710,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.20"
-LOCAL_RELEASE_ID = "41e859255e133777ed5c8107d94ea093234e4cc7ef5b0281f6a0326d31fa6e73"
+APP_VERSION = "1.6.21"
+LOCAL_RELEASE_ID = "f2ae209455a9fe67459611751d77c7f6b36b4965640113436f9c80a4f1542332"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
