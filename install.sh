@@ -9080,8 +9080,10 @@ __AG_WEB_PY_EOF__
       tooltip.innerHTML = `<div class="tooltip-title">${esc(fmtDate(point.at))}</div><div class="tooltip-row"><span>当时流量</span><strong>${fmtNum(point.value)} GB</strong></div><div class="tooltip-row"><span>ECS 状态</span><strong>${esc(status)}</strong></div><div class="tooltip-row"><span>执行动作</span><strong>${esc(actionText(point))}</strong></div><div class="tooltip-row"><span>检测结果</span><strong>${esc(point.message || "历史样本无详细结果")}</strong></div>`;
       tooltip.hidden = false;
       requestAnimationFrame(() => {
-        const width = container.clientWidth;
-        const desired = Number(target.dataset.x) / 320 * width;
+        const containerRect = container.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const desired = targetRect.left + targetRect.width / 2 - containerRect.left;
+        const width = containerRect.width;
         const left = Math.max(4, Math.min(width - tooltip.offsetWidth - 4, desired - tooltip.offsetWidth / 2));
         tooltip.style.left = `${left}px`;
         tooltip.style.setProperty("--tip-arrow", `${Math.max(12, Math.min(tooltip.offsetWidth - 12, desired - left))}px`);
@@ -12697,7 +12699,7 @@ UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
 APP_VERSION = "1.6.17"
-LOCAL_RELEASE_ID = "d9d00e21267e4ad995d23a66b9d7823065f0d879c59706dd48d7b9953b3ec641"
+LOCAL_RELEASE_ID = "bc17895d72cb8c62ee1bc1a59b99c9bcc30e2afcb21c91f2fa49622f42bde908"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
