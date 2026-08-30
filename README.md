@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.15-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.20-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -11,37 +11,30 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 
 本项目参考了 [10000ge10000/aliyun_monitor](https://github.com/10000ge10000/aliyun_monitor) 的核心思路，并借鉴 [wang4386/CDT-Monitor](https://github.com/wang4386/CDT-Monitor) 的按实例每日开关机面板设计。项目针对实际部署中遇到的安装兼容、通知缺失、账单 Endpoint 混用、错误来源不清晰和更新困难等问题进行了独立重写。
 
+## 目录
+
+- [核心能力](#核心能力)
+- [系统架构](#系统架构)
+- [保活逻辑](#保活逻辑)
+- [终端管理面板](#终端管理面板)
+- [网页控制面板](#网页控制面板)
+- [配置与权限](#配置与权限)
+- [安装与部署](#安装与部署)
+- [常用命令](#常用命令)
+- [备份、看门狗与自动发现](#备份看门狗与自动发现)
+- [故障排查](#故障排查)
+- [开发与验证](#开发与验证)
+
 ## 核心能力
 
-- **CDT 流量止损**：流量达到设定阈值后停止 ECS，防止继续产生公网流量。
-- **自动保活恢复**：流量低于阈值而实例处于 `Stopped` 时自动启动；次月 CDT 重置后可自动恢复。
-- **月度额度重置检测**：网页显示下次 CDT 自然月重置倒计时；进入北京时间每月 1 日后额外检测一次，同月去重且与常规检测、计划动作合并执行。
-- **每日定时开关机**：每个实例可独立设置 `HH:MM` 开机和关机时间，支持跨午夜时段、下一动作预览和服务离线后的补偿执行。
-- **完整网页控制台**：终端管理面板的检测、演练、实例增删改查、Telegram 与节点、全局设置、服务重启和 GitHub 更新均可在网页完成；更新过程显示真实阶段进度并自动跨服务重启续接。
-- **可解释流量趋势**：悬停、键盘聚焦或触摸折线检测点，可查看检测时间、当时流量、ECS 状态变化、执行动作和检测结果。
-- **国内站与国际站账单**：分别支持人民币和美元账单 Endpoint，也允许自定义 BSS Endpoint。
-- **账单缓存与手动刷新**：BSS 账单默认缓存 1 小时，可在终端或网页调整，并可随时强制刷新；刷新失败时保留最近一次成功金额并明确告警。
-- **错误来源分离**：CDT、ECS、BSS 和 Telegram 分别记录结果；账单失败不会阻断保活判断。
-- **每轮 Telegram 汇总**：默认每轮都通知，也可切换为仅事件或仅错误通知；临时网络失败自动重试。
-- **Telegram 多连接方式**：支持直连、SOCKS5、HTTP/HTTPS、API 反向代理，以及保存、切换多个 VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS 节点；也可导入订阅并自动选择可用节点。
-- **通知标明代理节点**：使用代理时，每条 Bot 通知都会显示脱敏后的代理端点或节点备注。
-- **Telegram 路径延迟测试**：按当前连接方式向 Telegram Bot API 发起 3 次请求，并在终端和测试通知中显示平均往返延迟。
-- **Telegram Bot 单消息控制**：默认启用管理员私聊控制，状态、实例、检测、开关机和定时计划都在同一条 Bot 消息内切换；真实动作均需按钮确认，关机实例开机需要连续两次确认。
-- **多账号、多地域、多实例**：每个实例可使用独立 AccessKey、Region、阈值和账单站点。
-- **单实例独立日志**：可为指定实例单独启用日志，周期检测与网页手动开关机按实例隔离记录。
-- **交互式管理面板**：增删改、暂停/恢复、立即检测、演练、日志、服务管理和 GitHub 更新均可在菜单完成。
-- **多发行版安装**：兼容 `apt`、`dnf`、`yum`、`apk`、`pacman` 和 `zypper`。
-- **多调度后端**：优先使用 systemd，其次 OpenRC；无 init 服务时自动回退到 cron。
-- **Docker / Compose**：提供可直接构建的镜像、交互式首次配置、公网 IP 访问、数据卷持久化和容器专用重启/更新提示。
-- **安全更新**：更新前校验 GitHub `install.sh.sha256`，保留配置、状态和日志后重启服务。
-- **加密备份与回滚**：网页和终端均可创建 AES-256-GCM 加密备份、预览恢复差异；每次更新前自动保存程序快照，可一键回滚且不覆盖配置。
-- **S3 自动异地备份**：按小时、每天或每周把 AES-256-GCM 加密备份上传 AWS S3；支持 IAM Role、R2、MinIO、保留清理、Telegram 结果通知和云端恢复。
-- **监控失联看门狗**：独立 systemd timer 或 cron 每分钟检查主服务心跳，连续失联后自动重启并通过 Telegram 通知，恢复后再次通知。
-- **自动发现 ECS**：输入 AccessKey 后跨多个 Region 扫描实例，可按标签键值筛选并批量导入，避免手填 Region 和实例 ID。
-- **启动检查版本**：每次打开管理面板都会读取上游 `version.json`；发现新版时在更新菜单旁显示目标版本。
-- **并发保护**：检测任务带文件锁，避免后台巡检与手动执行重叠。
-- **低开销长期运行**：同账号同 Region 的 ECS 状态按批查询，Telegram 复用 HTTP 连接，S3/加密重依赖按需加载，频繁心跳写入不再每次强制磁盘同步。
-- **凭据保护**：Token、AccessKey 不写入日志，配置文件权限固定为 `600`。
+Aliyun Guard 将能力分成四组，便于按需启用：
+
+- **流量与 ECS**：CDT 阈值止损、低流量自动恢复、月初重置补检、每日开关机计划、多账号/多地域/多实例、独立日志与 ECS 自动发现。
+- **管理入口**：响应式网页控制台、交互式终端面板、演练检测、手动开关机、日志、服务管理与 GitHub 更新。
+- **通知网络**：Telegram 每轮汇总、事件/错误通知模式、直连与 SOCKS5/HTTP/HTTPS/API 反代、多协议节点、订阅刷新、管理员 Bot 单消息控制与危险操作确认。
+- **备份运维**：AES-256-GCM 加密备份、恢复预览、程序快照回滚、AWS S3/R2/MinIO 异地备份、watchdog 失联自愈、并发保护与凭据脱敏。
+
+项目支持中国站与国际站 BSS 账单、systemd/OpenRC/cron 调度和 Docker Compose 部署；配置文件权限固定为 `600`，网页 API 不回传敏感凭据。
 
 ## 系统架构
 
@@ -131,6 +124,31 @@ sequenceDiagram
 
 > BSS 账单查询完全独立，默认成功结果缓存 3600 秒。即使出现 `NoPermission`、`InvalidAccessKeyId.NotFound` 或 Endpoint 错误，CDT 与 ECS 查询成功后仍会继续执行保活决策，并把账单错误写入 Telegram 汇总。缓存刷新失败时会继续展示最近一次成功金额、数据时间和刷新错误，并在不超过 15 分钟后重试。
 
+```mermaid
+flowchart TD
+    A[开始检测] --> B{实例已暂停?}
+    B -- 是 --> Z[跳过本轮]
+    B -- 否 --> C[查询 CDT / ECS / BSS]
+    C --> D{处于计划关机时段?}
+    D -- 是 --> E{ECS 正在运行?}
+    E -- 是 --> F[停止 ECS]
+    E -- 否 --> Z2[保持关机]
+    D -- 否 --> G{CDT 达到阈值?}
+    G -- 是 --> H{ECS 正在运行?}
+    H -- 是 --> I[停止 ECS]
+    H -- 否 --> Z3[保持关机]
+    G -- 否 --> J{ECS 已关机?}
+    J -- 是 --> K[启动 ECS并确认状态]
+    J -- 否 --> L[保持运行]
+    F --> M[写入状态、日志并发送汇总]
+    I --> M
+    Z2 --> M
+    Z3 --> M
+    K --> M
+    L --> M
+    Z --> M
+```
+
 ## 终端管理面板
 
 安装完成后不会自动打开配置或管理界面。请返回命令行，手动输入完整命令 `aliyun-guard`，或输入快捷命令 `ag`。首次打开会先进入配置向导，配置成功后再显示管理面板：
@@ -157,7 +175,7 @@ sequenceDiagram
 13) 修改全局设置
 14) 查看最近日志
 15) 重启后台服务
-16) 更新 GitHub 版本  [有新版本 v1.5.4]  # 仅发现更新时显示提示
+16) 更新 GitHub 版本  [有新版本]  # 仅发现更新时显示提示
 17) 备份、恢复与版本回滚
 18) 自动发现并批量导入 ECS
 19) 退出
@@ -165,7 +183,7 @@ sequenceDiagram
 21) 重置网页登录密码
 ```
 
-面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.5.4 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
+面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.6.20 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
 
 ## Telegram Bot 控制
 
@@ -202,6 +220,8 @@ Bot 使用 Telegram `getUpdates` 长轮询，同一个 Token 不应再由其他�
 
 <div align="center">
   <img src="docs/images/web-dashboard.png" width="900" alt="Aliyun Guard 网页控制面板桌面视图" />
+  <br />
+  <img src="docs/images/web-dashboard-mobile.png" width="375" alt="Aliyun Guard 网页控制面板移动视图" />
 </div>
 
 网页面板包含五个独立视图：
@@ -256,9 +276,9 @@ systemd 和 OpenRC 环境中，网页面板随 `aliyun-guard` 后台服务启动
 aliyun-guard web
 ```
 
-## 前置准备
+## 配置与权限
 
-### 1. Telegram 通知参数
+### Telegram 通知参数
 
 - 使用 [@BotFather](https://t.me/BotFather) 创建机器人并获取 Bot Token。
 - 使用 [@userinfobot](https://t.me/userinfobot) 获取接收消息的 Chat ID。
@@ -266,7 +286,7 @@ aliyun-guard web
 
 安装向导会调用 `getMe`、测量 3 次 Telegram API 往返延迟并发送测试消息，只有 Token、Chat ID 和所选连接方式均可用时才会显示测试成功并保存。
 
-### 2. 阿里云 RAM 权限
+### 阿里云 RAM 权限
 
 不要使用主账号 AccessKey。建议创建独立 RAM 用户并授予：
 
@@ -281,7 +301,7 @@ aliyun-guard web
 
 调试完成后可以改成自定义最小权限策略。
 
-### 3. 账单站点选择
+### 账单站点选择
 
 账单站点必须按照 **AccessKey 所属账号** 选择，不能根据 ECS Region 猜测。
 
@@ -299,7 +319,9 @@ BSS 账单查询失败: InvalidAccessKeyId.NotFound
 
 该错误只影响账单显示，不会影响已经成功的流量查询和 ECS 保活。
 
-## 支持系统
+## 安装与部署
+
+### 支持系统
 
 | 包管理器 | 发行版示例 |
 |---|---|
@@ -706,13 +728,13 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 
 ## 从 GitHub 更新
 
-在管理面板选择“更新 GitHub 版本”，或者执行：
+例如当前发布版本为 `v1.6.20`。若网页更新失败，先在服务器终端执行 `sudo /opt/aliyun-guard/control.sh update` 查看具体错误；Docker 部署请在 Compose 目录执行 `docker compose up -d --build`。
 
 ```sh
 aliyun-guard update
 ```
 
-更新确认页面会同时显示当前版本和 GitHub 最新版本；例如从 `v1.5.3` 更新时会显示 `最新版本: v1.5.4`，确认提示中也会带上目标版本号。如果构建指纹一致，则显示 `当前版本已经是最新版本了。` 并直接返回，不重复下载安装。网页“系统”页使用同一更新检查和 SHA-256 校验流程，并显示下载、校验、写入、恢复配置、重启和验证阶段的实际进度。
+更新确认页面会同时显示当前版本和 GitHub 最新版本；确认提示会带上目标版本号。如果构建指纹一致，则显示 `当前版本已经是最新版本了。` 并直接返回，不重复下载安装。网页“系统”页使用同一更新检查和 SHA-256 校验流程，并显示下载、校验、写入、恢复配置、重启和验证阶段的实际进度。
 
 更新流程：
 
@@ -813,7 +835,6 @@ aliyun-guard dry-run
 | `chat not found` | Chat ID 错误，或尚未与 Bot 建立会话 | 向 Bot 发送 `/start` 并重新测试 |
 | `Conflict: terminated by other getUpdates request` | 同一 Token 被其他 Bot 程序同时轮询 | 停止旧控制 Bot，确保只有 Aliyun Guard 使用 `getUpdates` |
 | Bot 回复“无权限” | 当前 Telegram 用户 ID 不在管理员名单 | 在网页 Telegram 页面或终端第 5 项填写自己的用户 ID |
-| `v1.3.1` 及更早版本输入正确密码后仍提示“请先登录” | HTTP 与 Secure Cookie 配置冲突 | 更新到 `v1.3.2`，HTTP/HTTPS 会话会自动分离并同时可用 |
 | `reset by peer` / TLS 超时 | Telegram 或出口网络临时异常 | 保持 IPv4 优先，检查代理/防火墙；程序会自动重试 |
 | `SOCKSHTTPSConnectionPool` / 代理连接失败 | SOCKS5 或 HTTP 代理地址不可达 | 检查代理监听地址、端口、账号和密码 |
 | `sing-box 节点配置校验失败` | 节点链接参数不完整或传输类型不支持 | 重新复制完整单节点链接，或改用本机 SOCKS5 |
@@ -822,9 +843,18 @@ aliyun-guard dry-run
 | S3 Endpoint 连接失败 | R2/MinIO Endpoint、Region、证书或寻址方式错误 | 测试连接，MinIO 尝试改为路径寻址 |
 | `未安装 sing-box` | 节点模式所需核心被删除或安装失败 | 进入 Telegram 配置，第 4 项重新输入节点并选择第 8 项测试安装 |
 | `未找到实例` | Region 或 Instance ID 不匹配 | 在 ECS 控制台核对 Region ID 和实例 ID |
-| `v1.5.1` 网页提示已启动更新但版本未变化 | 旧网页更新进程随 systemd 主服务停止而被终止 | 先通过 SSH 执行一次 `aliyun-guard update` 升级到 `v1.5.2`；后续网页更新会使用独立 systemd 单元 |
-| `v1.5.2` / `v1.5.3` 网页更新校验失败或无完成反馈 | `main` 分支 Raw 文件可能存在缓存错配，旧页面也不显示后台进度 | 使用 `v1.5.4` Release 安装器升级一次；之后更新固定使用同一 Release，并显示真实进度 |
-| `v1.5.4` / `v1.5.5` 网页更新停在 25% | systemd 更新任务没有控制终端，旧安装器误判 `/dev/tty` 可用后提前退出 | `v1.5.6` 发布后在网页直接重试；若仍失败，再通过 SSH 执行 `aliyun-guard update` |
+
+### 历史版本升级问题
+
+以下条目仅适用于升级旧版本时的兼容场景：
+
+<details>
+<summary>展开历史升级故障</summary>
+
+| 版本 | 现象 | 处理方法 |
+|---|---|---|
+
+</details>
 
 日志会明确使用 `CDT 流量查询失败`、`ECS 实例查询失败`、`BSS 账单查询失败` 或 `Telegram ... 失败` 标注来源，避免一条模糊错误掩盖其他已成功的检查。
 
