@@ -854,7 +854,7 @@ class WebHtmlTests(unittest.TestCase):
         )[0]
         self.assertEqual(telegram.count("<details"), 3)
         self.assertEqual(telegram.count("</details>"), 3)
-        self.assertIn('<details class="panel collapsible-panel" open>', telegram)
+        self.assertNotIn('<details class="panel" open>', telegram)
         self.assertIn('title="展开或收起机器人配置"', telegram)
         self.assertIn('title="展开或收起 Telegram 连接设置"', telegram)
         self.assertIn('title="展开或收起节点管理"', telegram)
@@ -871,19 +871,22 @@ class WebHtmlTests(unittest.TestCase):
 
     def test_settings_forms_keep_existing_ids_inside_collapsible_panels(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
-        self.assertIn('<details class="panel collapsible-panel" open>', html)
-        self.assertIn('title="展开或收起全局检测设置"', html)
-        self.assertIn('title="展开或收起网页控制面板设置"', html)
         self.assertIn('<form id="settingsForm">', html)
         self.assertIn('<form id="webSettingsForm">', html)
-        self.assertIn(".collapsible-panel > summary", html)
+        self.assertIn(".panel > summary", html)
+
+    def test_panels_collapse_by_default(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertNotIn('<details class="panel" open>', html)
+        self.assertNotIn('<details class="panel full" open>', html)
+        self.assertNotIn("ag-panel-open", html)
 
     def test_system_controls_keep_existing_ids_inside_collapsible_panels(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         system = html.split('<section id="systemTab"', 1)[1].split("</main>", 1)[0]
         self.assertEqual(system.count("<details"), 6)
         self.assertEqual(system.count("</details>"), 6)
-        self.assertEqual(system.count('class="panel collapsible-panel" open'), 1)
+        self.assertEqual(system.count('class="panel" open'), 0)
         for title in (
             "展开或收起运行环境",
             "展开或收起 GitHub 更新",
@@ -968,6 +971,19 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn("MAX_BODY_BYTES = 128 * 1024 * 1024", panel)
         self.assertIn("backup_upload", panel)
         self.assertIn("else 1024 * 1024", panel)
+
+    def test_reworked_shell_keeps_theme_nav_and_confirm_controls(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertIn('id="themeToggle"', html)
+        self.assertIn('localStorage.getItem("ag-theme")', html)
+        self.assertIn("prefers-color-scheme", html)
+        for tab in ("dashboard", "telegram", "logs", "settings", "system"):
+            self.assertIn(f'data-tab="{tab}"', html)
+        self.assertIn('id="confirmDialog"', html)
+        self.assertIn("async function confirmAction(", html)
+        self.assertIn('id="toasts"', html)
+        self.assertIn('class="sidenav"', html)
+        self.assertNotIn("window.confirm", html)
 
 if __name__ == "__main__":
     unittest.main()

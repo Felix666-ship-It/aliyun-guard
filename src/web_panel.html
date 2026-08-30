@@ -3,24 +3,91 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="dark light">
   <title>Aliyun Guard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232dd4bf' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-4l-3 9L9 3l-3 9H2'/%3E%3C/svg%3E">
+  <script>
+    (function () {
+      var theme = null;
+      try { theme = localStorage.getItem("ag-theme"); } catch (_) {}
+      if (theme !== "light" && theme !== "dark") {
+        theme = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <style>
+    /* ---------- Design tokens ---------- */
     :root {
-      --bg: #f4f6f3;
-      --surface: #ffffff;
-      --surface-alt: #eef4f1;
-      --ink: #17201d;
-      --muted: #65716c;
-      --line: #d9e1dc;
-      --brand: #08775a;
-      --brand-dark: #075e49;
-      --cyan: #167c94;
-      --amber: #b96808;
-      --red: #b63d36;
-      --shadow: 0 8px 24px rgba(23, 32, 29, .07);
-      --radius: 6px;
+      --radius-s: 9px;
+      --radius: 13px;
+      --radius-l: 18px;
+      --pill: 999px;
+      --font: "Inter", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      --mono: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --chart: #2dd4bf;
     }
+    :root, [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0a0e16;
+      --bg-glow-1: rgba(45, 212, 191, .08);
+      --bg-glow-2: rgba(56, 189, 248, .07);
+      --surface: #101725;
+      --surface-2: #16203530;
+      --raise: #182338;
+      --line: #26325066;
+      --line-strong: #33436b;
+      --ink: #e8eef8;
+      --ink-soft: #c3cddd;
+      --muted: #8b98b0;
+      --faint: #5f6d87;
+      --brand: #2dd4bf;
+      --brand-2: #38bdf8;
+      --brand-ink: #06251f;
+      --brand-soft: rgba(45, 212, 191, .13);
+      --brand-line: rgba(45, 212, 191, .38);
+      --danger-soft: rgba(248, 113, 113, .13);
+      --danger-line: rgba(248, 113, 113, .4);
+      --warn-soft: rgba(251, 191, 36, .12);
+      --warn-line: rgba(251, 191, 36, .38);
+      --shadow: 0 18px 44px rgba(2, 6, 14, .5);
+      --shadow-soft: 0 6px 20px rgba(2, 6, 14, .35);
+      --input-bg: #0d1320;
+      --tip-bg: #101b2e;
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --bg: #eef2f8;
+      --bg-glow-1: rgba(13, 148, 136, .1);
+      --bg-glow-2: rgba(2, 132, 199, .08);
+      --surface: #ffffff;
+      --surface-2: #f4f7fb;
+      --raise: #ffffff;
+      --line: #dbe3ee;
+      --line-strong: #c3cfe0;
+      --ink: #101a2c;
+      --ink-soft: #33415a;
+      --muted: #5d6b84;
+      --faint: #8593ab;
+      --brand: #0d9488;
+      --brand-2: #0284c7;
+      --brand-ink: #ffffff;
+      --brand-soft: rgba(13, 148, 136, .1);
+      --brand-line: rgba(13, 148, 136, .42);
+      --danger-soft: rgba(220, 38, 38, .08);
+      --danger-line: rgba(220, 38, 38, .38);
+      --warn-soft: rgba(180, 83, 9, .09);
+      --warn-line: rgba(180, 83, 9, .35);
+      --shadow: 0 18px 40px rgba(15, 30, 60, .12);
+      --shadow-soft: 0 6px 18px rgba(15, 30, 60, .08);
+      --input-bg: #ffffff;
+      --tip-bg: #10213a;
+    }
+
+    /* ---------- Base ---------- */
     * { box-sizing: border-box; }
     html { min-width: 320px; background: var(--bg); }
     body {
@@ -28,533 +95,798 @@
       min-height: 100vh;
       color: var(--ink);
       background: var(--bg);
-      font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      font-family: var(--font);
       font-size: 14px;
-      line-height: 1.5;
-      letter-spacing: 0;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
     }
-    button, input, select, textarea { font: inherit; letter-spacing: 0; }
+    button, input, select, textarea { font: inherit; color: inherit; letter-spacing: 0; }
     button { cursor: pointer; }
     [hidden] { display: none !important; }
+    ::selection { background: var(--brand-soft); }
+    :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 4px; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: var(--pill); border: 2px solid transparent; background-clip: content-box; }
+    ::-webkit-scrollbar-track { background: transparent; }
     .icon { width: 18px; height: 18px; flex: 0 0 18px; stroke-width: 2; }
-    .auth-shell {
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .num { font-variant-numeric: tabular-nums; }
+    .warning-text { color: var(--warn); }
+    .danger-text { color: var(--bad); }
+    .spin { animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---------- Buttons ---------- */
+    .button {
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: var(--radius-s);
+      padding: 8px 15px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      white-space: nowrap;
+      transition: background .16s ease, border-color .16s ease, color .16s ease, transform .1s ease, box-shadow .16s ease;
+    }
+    .button:active { transform: translateY(1px); }
+    .button.primary {
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      color: var(--brand-ink);
+      box-shadow: 0 4px 14px var(--brand-line);
+    }
+    .button.primary:hover { filter: brightness(1.07); }
+    .button.secondary { background: var(--surface); border-color: var(--line-strong); color: var(--ink-soft); }
+    .button.secondary:hover { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+    .button.danger { background: transparent; border-color: var(--danger-line); color: var(--bad); }
+    .button.danger:hover { background: var(--danger-soft); }
+    .button.warning { background: transparent; border-color: var(--warn-line); color: var(--warn); }
+    .button.warning:hover { background: var(--warn-soft); }
+    .button.ghost { background: transparent; color: var(--muted); border-color: transparent; }
+    .button.ghost:hover { background: var(--surface-2); color: var(--ink); }
+    .button.small { min-height: 32px; padding: 5px 11px; font-size: 12px; border-radius: var(--radius-s); }
+    .button:disabled { cursor: not-allowed; opacity: .5; transform: none; box-shadow: none; }
+    .icon-button {
+      width: 38px;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-s);
+      background: var(--surface);
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+      padding: 0;
+      transition: color .15s ease, border-color .15s ease, background .15s ease;
+    }
+    .icon-button:hover { color: var(--brand); border-color: var(--brand-line); background: var(--brand-soft); }
+
+    /* ---------- Fields ---------- */
+    .field { display: grid; gap: 7px; margin-bottom: 15px; min-width: 0; }
+    .field label { font-size: 12.5px; font-weight: 650; color: var(--muted); }
+    input, select, textarea {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-s);
+      background: var(--input-bg);
+      color: var(--ink);
+      padding: 9px 12px;
+      outline: none;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
+    input::placeholder, textarea::placeholder { color: var(--faint); }
+    .input-wrap { position: relative; }
+    .input-wrap input { padding-right: 46px; }
+    .input-icon {
+      position: absolute;
+      right: 4px;
+      top: 4px;
+      width: 34px;
+      height: 34px;
+      border: 0;
+      border-radius: var(--radius-s);
+      background: transparent;
+      color: var(--faint);
+      display: grid;
+      place-items: center;
+    }
+    .input-icon:hover { color: var(--brand); background: var(--brand-soft); }
+    .check-row { min-height: 42px; display: flex; align-items: center; gap: 10px; color: var(--ink-soft); font-weight: 550; }
+    .check-row input { width: 18px; min-height: 18px; margin: 0; accent-color: var(--brand); }
+    .switch { position: relative; width: 44px; height: 25px; flex: 0 0 44px; }
+    .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .switch span { position: absolute; inset: 0; background: var(--line-strong); border-radius: var(--pill); transition: .18s ease; }
+    .switch span::after { content: ""; position: absolute; width: 19px; height: 19px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: .18s ease; box-shadow: 0 1px 4px rgba(0, 0, 0, .3); }
+    .switch input:checked + span { background: linear-gradient(135deg, var(--brand), var(--brand-2)); }
+    .switch input:checked + span::after { transform: translateX(19px); }
+    .switch input:focus-visible + span { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+    /* ---------- Login ---------- */
+    .login-view {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
-      background: var(--surface);
-    }
-    .auth-panel {
-      padding: 52px 42px;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      border-right: 1px solid var(--line);
-    }
-    .auth-scene {
+      place-items: center;
+      padding: 26px;
       position: relative;
       overflow: hidden;
-      background: #14352d;
-      color: #fff;
-      display: grid;
-      align-content: center;
-      padding: 8vw;
     }
-    .auth-scene::before {
+    .login-view::before, .login-view::after {
       content: "";
       position: absolute;
+      width: 560px;
+      height: 560px;
+      border-radius: 50%;
+      filter: blur(110px);
+      opacity: .8;
+      pointer-events: none;
+    }
+    .login-view::before { background: var(--bg-glow-1); top: -180px; left: -140px; }
+    .login-view::after { background: var(--bg-glow-2); bottom: -200px; right: -140px; }
+    .login-grid {
+      position: absolute;
       inset: 0;
-      opacity: .18;
       background-image:
-        linear-gradient(#b8fff0 1px, transparent 1px),
-        linear-gradient(90deg, #b8fff0 1px, transparent 1px);
-      background-size: 48px 48px;
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(ellipse 70% 60% at 50% 42%, #000 20%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 42%, #000 20%, transparent 75%);
+      opacity: .55;
+      pointer-events: none;
     }
-    .scene-chart { position: relative; width: min(660px, 100%); }
-    .scene-chart svg { display: block; width: 100%; height: auto; }
-    .scene-title { position: relative; margin: 26px 0 0; font-size: 18px; font-weight: 600; }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
+    .login-card {
+      position: relative;
+      width: min(420px, 100%);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-l);
+      box-shadow: var(--shadow);
+      padding: 34px 30px 28px;
     }
+    .login-card .brand { margin-bottom: 30px; }
+    .login-title { margin: 0 0 4px; font-size: 24px; font-weight: 750; letter-spacing: -.01em; }
+    .login-meta { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
+    .login-submit { width: 100%; min-height: 44px; border-radius: var(--radius); font-size: 14px; margin-top: 4px; }
+    .form-error { min-height: 22px; color: var(--bad); margin: 10px 0 0; font-size: 13px; }
+    .login-foot { margin-top: 22px; padding-top: 16px; border-top: 1px dashed var(--line); color: var(--faint); font-size: 12px; display: flex; align-items: center; gap: 8px; }
+
+    /* ---------- Brand ---------- */
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .brand-mark {
       width: 38px;
       height: 38px;
       display: grid;
       place-items: center;
-      background: var(--brand);
-      color: #fff;
-      border-radius: var(--radius);
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      color: var(--brand-ink);
+      border-radius: 11px;
       flex: 0 0 38px;
+      box-shadow: 0 4px 12px var(--brand-line);
     }
-    .brand-name { font-size: 20px; font-weight: 750; line-height: 1.1; overflow-wrap: anywhere; }
-    .brand-sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
-    .auth-title { margin: 50px 0 4px; font-size: 27px; line-height: 1.25; }
-    .auth-meta { margin: 0 0 28px; color: var(--muted); }
-    .field { display: grid; gap: 7px; margin-bottom: 17px; }
-    .field label { font-size: 13px; font-weight: 650; color: #3d4944; }
-    .input-wrap { position: relative; }
-    input, select, textarea {
-      width: 100%;
-      min-height: 42px;
-      border: 1px solid #cbd5cf;
-      border-radius: 5px;
-      background: #fff;
-      color: var(--ink);
-      padding: 9px 11px;
-      outline: none;
-    }
-    textarea { min-height: 82px; resize: vertical; }
-    input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(8, 119, 90, .12); }
-    .input-wrap input { padding-right: 44px; }
-    .input-icon {
-      position: absolute;
-      right: 3px;
-      top: 3px;
-      width: 36px;
-      height: 36px;
-      border: 0;
-      background: transparent;
-      color: var(--muted);
+    .brand-name { font-size: 17px; font-weight: 750; line-height: 1.15; overflow-wrap: anywhere; letter-spacing: -.01em; }
+    .brand-sub { color: var(--muted); font-size: 11px; margin-top: 2px; font-weight: 600; letter-spacing: .04em; }
+
+    /* ---------- App shell ---------- */
+    .shell {
+      min-height: 100vh;
       display: grid;
-      place-items: center;
+      grid-template-columns: 236px minmax(0, 1fr);
+      grid-template-rows: auto 1fr;
+      grid-template-areas: "side top" "side main";
     }
-    .button {
-      min-height: 38px;
-      border: 1px solid transparent;
-      border-radius: 5px;
-      padding: 8px 13px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
+    .sidenav {
+      grid-area: side;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
       gap: 8px;
-      font-weight: 650;
-      white-space: nowrap;
+      padding: 20px 14px;
+      background: var(--surface);
+      border-right: 1px solid var(--line);
     }
-    .button.primary { background: var(--brand); color: #fff; }
-    .button.primary:hover { background: var(--brand-dark); }
-    .button.secondary { background: #fff; border-color: var(--line); color: var(--ink); }
-    .button.secondary:hover { background: var(--surface-alt); }
-    .button.danger { background: #fff; border-color: #e1b5b1; color: var(--red); }
-    .button.warning { background: #fff8ed; border-color: #e8c897; color: #8b4e07; }
-    .button:disabled { cursor: not-allowed; opacity: .55; }
-    .auth-submit { width: 100%; margin-top: 6px; min-height: 44px; }
-    .form-error { min-height: 22px; color: var(--red); margin: 5px 0 0; }
-    .app { min-height: 100vh; }
-    .app-header {
-      height: 66px;
+    .sidenav .brand { padding: 2px 8px 18px; }
+    .nav-list { display: flex; flex-direction: column; gap: 8px; }
+    .nav-item {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      padding: 0 28px;
-      background: var(--surface);
-      border-bottom: 1px solid var(--line);
+      gap: 11px;
+      min-height: 42px;
+      padding: 0 13px;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 13.5px;
+      text-align: left;
+      transition: background .15s ease, color .15s ease;
+    }
+    .nav-item:hover { color: var(--ink); background: var(--surface-2); }
+    .nav-item.active {
+      color: var(--brand);
+      background: var(--brand-soft);
+      border-color: var(--brand-line);
+    }
+    .sidenav-foot { margin-top: auto; display: grid; gap: 10px; padding: 0 6px; }
+    .service-chip {
+      height: 32px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--pill);
+      color: var(--ink-soft);
+      background: var(--surface-2);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      width: fit-content;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+    .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent); }
+    .topbar {
+      grid-area: top;
       position: sticky;
       top: 0;
       z-index: 30;
-    }
-    .header-actions { display: flex; align-items: center; gap: 8px; }
-    .icon-button {
-      width: 38px;
-      height: 38px;
-      border: 1px solid var(--line);
-      border-radius: 5px;
-      background: #fff;
-      color: #46534e;
-      display: grid;
-      place-items: center;
-      padding: 0;
-    }
-    .icon-button:hover { background: var(--surface-alt); color: var(--brand); }
-    .service-chip {
-      height: 30px;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 0 10px;
-      border: 1px solid var(--line);
-      border-radius: 15px;
-      color: #355047;
-      background: #f8faf8;
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--brand); }
-    .dot.bad { background: var(--red); }
-    .app-nav {
-      height: 48px;
-      padding: 0 28px;
+      min-height: 62px;
       display: flex;
-      align-items: end;
-      gap: 24px;
-      background: var(--surface);
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 10px 26px;
+      background: color-mix(in srgb, var(--bg) 78%, transparent);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--line);
-      overflow-x: auto;
     }
-    .tab-button {
-      height: 48px;
-      border: 0;
-      border-bottom: 2px solid transparent;
-      background: transparent;
-      color: var(--muted);
-      padding: 0 2px;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      font-weight: 650;
-      white-space: nowrap;
+    .topbar-actions { display: flex; align-items: center; gap: 8px; }
+    .main {
+      grid-area: main;
+      width: min(1280px, 100%);
+      margin: 0 auto;
+      padding: 26px 28px 48px;
     }
-    .tab-button.active { color: var(--brand); border-bottom-color: var(--brand); }
-    .main { width: min(1440px, 100%); margin: 0 auto; padding: 24px 28px 44px; }
-    .section-heading {
+
+    /* ---------- Section heads ---------- */
+    .tab-panel { animation: fadeUp .22s ease; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } }
+    .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+    .section-heading h1 { font-size: 22px; margin: 0; font-weight: 750; letter-spacing: -.015em; }
+    .section-heading p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+    .section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+
+    /* ---------- Stat band ---------- */
+    .stat-band { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .stat {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 17px;
-    }
-    .section-heading h1 { font-size: 20px; margin: 0; }
-    .section-heading p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
-    .section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-    .summary-band {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 13px;
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      margin-bottom: 18px;
-      overflow: hidden;
+      padding: 16px 18px;
+      box-shadow: var(--shadow-soft);
+      min-width: 0;
     }
-    .summary-item { min-width: 0; padding: 17px 18px; border-right: 1px solid var(--line); }
-    .summary-item:last-child { border-right: 0; }
-    .summary-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
-    .summary-value { margin-top: 5px; font-size: 20px; font-weight: 750; overflow-wrap: anywhere; }
+    .stat-icon {
+      width: 40px;
+      height: 40px;
+      flex: 0 0 40px;
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      background: var(--brand-soft);
+      color: var(--brand);
+      border: 1px solid var(--brand-line);
+    }
+    .stat-icon.tone-ok { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+    .stat-icon.tone-warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-line); }
+    .stat-icon.tone-neutral { background: var(--surface-2); color: var(--muted); border-color: var(--line); }
+    .stat-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    .stat-value { margin-top: 2px; font-size: 22px; font-weight: 750; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; letter-spacing: -.01em; }
+
     .notice {
       display: flex;
       align-items: flex-start;
       gap: 10px;
-      border: 1px solid #e6c38d;
-      border-left: 4px solid var(--amber);
-      background: #fff9ef;
-      padding: 11px 13px;
+      border: 1px solid var(--warn-line);
+      background: var(--warn-soft);
+      padding: 12px 15px;
       margin-bottom: 18px;
-      border-radius: 4px;
-      color: #6c450f;
+      border-radius: var(--radius);
+      color: var(--ink-soft);
+      font-size: 13px;
     }
-    .instances {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }
+    .notice .icon { color: var(--warn); flex: 0 0 auto; margin-top: 1px; }
+
+    /* ---------- Instance cards ---------- */
+    .instances { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .instance-card {
       min-width: 0;
+      display: flex;
+      flex-direction: column;
       background: var(--surface);
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
+      border-radius: var(--radius-l);
+      box-shadow: var(--shadow-soft);
       overflow: hidden;
+      transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
     }
+    .instance-card:hover { border-color: var(--brand-line); box-shadow: var(--shadow); transform: translateY(-2px); }
     .instance-card:only-child { grid-column: 1 / -1; }
     .card-head {
-      min-height: 66px;
-      padding: 14px 16px;
+      min-height: 68px;
+      padding: 15px 18px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
+      gap: 12px;
       border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--surface-2), transparent);
     }
-    .instance-name { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+    .instance-name { margin: 0; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; letter-spacing: -.01em; }
     .instance-meta { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .card-head-tools { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+    .card-tools { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
     .status-badge {
       flex: 0 0 auto;
-      min-width: 82px;
+      min-width: 78px;
       height: 28px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 6px;
-      border-radius: 14px;
-      padding: 0 10px;
+      gap: 7px;
+      border-radius: var(--pill);
+      padding: 0 12px;
       font-size: 12px;
       font-weight: 700;
-      border: 1px solid #b7d8cb;
-      color: #086146;
-      background: #eff9f5;
+      border: 1px solid color-mix(in srgb, var(--ok) 38%, transparent);
+      color: var(--ok);
+      background: color-mix(in srgb, var(--ok) 11%, transparent);
     }
-    .status-badge.stopped, .status-badge.error { color: #96352f; border-color: #e3bab7; background: #fff3f2; }
-    .status-badge.transition { color: #865006; border-color: #ead09f; background: #fff9ed; }
-    .status-badge.unknown { color: #58645f; border-color: #d0d8d3; background: #f4f6f5; }
-    .instance-tools { position: relative; }
-    .instance-tools summary { list-style: none; }
-    .instance-tools summary::-webkit-details-marker { display: none; }
-    .instance-tools[open] summary { color: var(--brand); background: var(--surface-alt); }
-    .instance-menu {
+    .status-badge .dot { width: 7px; height: 7px; box-shadow: none; }
+    .status-badge.stopped, .status-badge.error { color: var(--bad); border-color: var(--danger-line); background: var(--danger-soft); }
+    .status-badge.stopped .dot, .status-badge.error .dot { background: var(--bad); }
+    .status-badge.transition { color: var(--warn); border-color: var(--warn-line); background: var(--warn-soft); }
+    .status-badge.transition .dot { background: var(--warn); }
+    .status-badge.unknown { color: var(--muted); border-color: var(--line-strong); background: var(--surface-2); }
+    .status-badge.unknown .dot { background: var(--muted); }
+
+    .menu { position: relative; }
+    .menu summary { list-style: none; cursor: pointer; }
+    .menu summary::-webkit-details-marker { display: none; }
+    .menu[open] summary { color: var(--brand); border-color: var(--brand-line); background: var(--brand-soft); }
+    .menu-list {
       position: absolute;
       z-index: 24;
-      top: 44px;
+      top: 46px;
       right: 0;
-      width: 196px;
+      width: 208px;
       padding: 6px;
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      box-shadow: 0 14px 34px rgba(17, 36, 30, .18);
+      background: var(--raise);
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      animation: pop .16s ease;
     }
-    .instance-menu .menu-button {
+    @keyframes pop { from { opacity: 0; transform: translateY(-4px) scale(.98); } }
+    .menu-button {
       width: 100%;
       min-height: 38px;
-      padding: 8px 9px;
+      padding: 8px 10px;
       display: flex;
       align-items: center;
-      gap: 9px;
+      gap: 10px;
       border: 0;
-      border-radius: 4px;
+      border-radius: var(--radius-s);
       background: transparent;
-      color: var(--ink);
+      color: var(--ink-soft);
       text-align: left;
       font-weight: 600;
-      font-size: 12px;
+      font-size: 12.5px;
+      transition: background .13s ease, color .13s ease;
     }
-    .instance-menu .menu-button:hover, .instance-menu .menu-button:focus-visible { background: var(--surface-alt); outline: none; }
-    .instance-menu .menu-button.warning { color: #8b4e07; }
-    .instance-menu .menu-button.danger { color: var(--red); border-top: 1px solid var(--line); border-radius: 0 0 4px 4px; margin-top: 4px; padding-top: 10px; }
-    .instance-menu .menu-button:disabled { opacity: .5; cursor: not-allowed; }
-    .card-body { padding: 15px 16px 12px; }
-    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .metric { min-width: 0; }
-    .metric-label { color: var(--muted); font-size: 11px; }
-    .metric-value { margin-top: 3px; font-weight: 700; overflow-wrap: anywhere; }
-    .traffic-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 15px; font-size: 12px; }
-    .progress { height: 7px; margin-top: 7px; background: #e7ede9; border-radius: 3px; overflow: hidden; }
-    .progress > span { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
-    .progress > span.warn { background: var(--amber); }
-    .progress > span.danger { background: var(--red); }
-    .sparkline { position: relative; height: 70px; margin-top: 12px; border-top: 1px solid #edf1ee; padding-top: 9px; }
-    .sparkline svg { width: 100%; height: 58px; display: block; overflow: visible; }
+    .menu-button:hover, .menu-button:focus-visible { background: var(--surface-2); color: var(--ink); outline: none; }
+    .menu-button.warning { color: var(--warn); }
+    .menu-button.danger { color: var(--bad); border-top: 1px solid var(--line); border-radius: 0 0 var(--radius-s) var(--radius-s); margin-top: 4px; padding-top: 10px; }
+    .menu-button:disabled { opacity: .5; cursor: not-allowed; }
+
+    .card-body { padding: 16px 18px 12px; display: flex; flex-direction: column; flex: 1 0 auto; }
+    .metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .metric { min-width: 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 9px 11px; }
+    .metric-label { color: var(--faint); font-size: 11px; font-weight: 600; }
+    .metric-value { margin-top: 3px; font-weight: 700; font-size: 13.5px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+    .traffic-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-top: 15px; font-size: 12px; color: var(--muted); }
+    .traffic-row strong { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink); }
+    .progress { height: 8px; margin-top: 8px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--pill); overflow: hidden; }
+    .progress > span {
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      border-radius: var(--pill);
+      transition: width .4s ease;
+    }
+    .progress > span.warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .progress > span.danger { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+    .sparkline { position: relative; margin-top: 14px; flex: 1 0 auto; }
+    .sparkline svg { width: 100%; height: 64px; display: block; overflow: visible; }
+    .chart-baseline { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 5; vector-effect: non-scaling-stroke; }
+    .chart-area { fill: url(#agArea); stroke: none; }
+    .chart-line { fill: none; stroke: var(--chart); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+    .chart-point { fill: none; stroke: var(--chart); stroke-width: 3; stroke-linecap: round; vector-effect: non-scaling-stroke; animation: chartPulse 2.6s ease-out infinite; }
+    @keyframes chartPulse { 0% { stroke-width: 3; opacity: 1; } 70% { stroke-width: 10; opacity: .18; } 100% { stroke-width: 3; opacity: 1; } }
+    .chart-focus { fill: none; stroke: var(--chart); stroke-width: 6; stroke-linecap: round; vector-effect: non-scaling-stroke; opacity: 0; pointer-events: none; transition: opacity .12s ease; }
     .chart-hit { fill: transparent; stroke: transparent; cursor: crosshair; outline: none; }
-    .chart-focus, .chart-point { fill: none; stroke: var(--cyan); stroke-width: 6px; stroke-linecap: round; vector-effect: non-scaling-stroke; pointer-events: none; }
-    .chart-focus { opacity: 0; }
     .chart-hit:hover + .chart-focus, .chart-hit:focus + .chart-focus { opacity: 1; }
+    .chart-empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--faint);
+      font-size: 12px;
+      pointer-events: none;
+    }
     .chart-tooltip {
       position: absolute;
       z-index: 12;
-      bottom: 64px;
-      width: min(286px, calc(100% - 8px));
-      padding: 10px 11px;
-      color: #effaf6;
-      background: #17372e;
-      border: 1px solid #31564a;
-      border-radius: 5px;
-      box-shadow: 0 10px 28px rgba(17, 36, 30, .22);
+      bottom: 68px;
+      width: min(290px, calc(100% - 8px));
+      padding: 11px 13px;
+      color: var(--ink-soft);
+      background: var(--tip-bg);
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
       pointer-events: none;
-      font-size: 11px;
-      line-height: 1.45;
+      font-size: 11.5px;
+      line-height: 1.5;
     }
-    .chart-tooltip::after { content: ""; position: absolute; bottom: -6px; left: var(--tip-arrow, 50%); width: 10px; height: 10px; background: #17372e; border-right: 1px solid #31564a; border-bottom: 1px solid #31564a; transform: translateX(-50%) rotate(45deg); }
-    .tooltip-title { font-size: 12px; font-weight: 750; margin-bottom: 5px; }
-    .tooltip-row { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 7px; }
-    .tooltip-row span:first-child { color: #9fc2b6; }
+    [data-theme="light"] .chart-tooltip { color: #dbe7f5; }
+    .chart-tooltip::after {
+      content: "";
+      position: absolute;
+      bottom: -6px;
+      left: var(--tip-arrow, 50%);
+      width: 10px;
+      height: 10px;
+      background: var(--tip-bg);
+      border-right: 1px solid var(--line-strong);
+      border-bottom: 1px solid var(--line-strong);
+      transform: translateX(-50%) rotate(45deg);
+    }
+    .tooltip-title { font-size: 12px; font-weight: 750; margin-bottom: 6px; color: var(--ink); }
+    .tooltip-row { display: grid; grid-template-columns: 60px minmax(0, 1fr); gap: 8px; }
+    .tooltip-row span { color: var(--muted); }
     .tooltip-row strong { font-weight: 600; overflow-wrap: anywhere; }
-    .result-line { min-height: 40px; padding: 10px 16px; color: #53605b; background: #fafbfa; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+
+    .next-line { margin-top: 10px; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 7px; }
+    .result-line {
+      min-height: 42px;
+      padding: 11px 18px;
+      color: var(--muted);
+      font-size: 12.5px;
+      background: var(--surface-2);
+      border-top: 1px solid var(--line);
+      overflow-wrap: anywhere;
+    }
+
     .empty {
       grid-column: 1 / -1;
-      min-height: 260px;
+      min-height: 280px;
       display: grid;
       place-items: center;
       text-align: center;
       color: var(--muted);
       background: var(--surface);
-      border: 1px dashed #cbd5cf;
-      border-radius: var(--radius);
+      border: 1px dashed var(--line-strong);
+      border-radius: var(--radius-l);
     }
-    .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .empty .icon { width: 34px; height: 34px; color: var(--faint); }
+
+    .sk-card { min-height: 300px; border-radius: var(--radius-l); border: 1px solid var(--line); background: var(--surface); position: relative; overflow: hidden; }
+    .sk-card::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(100deg, transparent 30%, var(--surface-2) 50%, transparent 70%);
+      animation: shimmer 1.4s infinite;
+    }
+    @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+    /* ---------- Panels & forms ---------- */
+    .panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    .panel { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); box-shadow: var(--shadow-soft); overflow: hidden; }
+    .panel.full { grid-column: 1 / -1; }
+    .panel > summary { cursor: pointer; list-style: none; }
+    .panel > summary::-webkit-details-marker { display: none; }
+    .panel-head {
+      min-height: 60px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      transition: background .15s ease;
+    }
+    .panel > summary:hover { background: var(--surface-2); }
+    .panel > summary:focus-visible { outline: 2px solid var(--brand); outline-offset: -3px; border-radius: var(--radius-l); }
+    .panel-head h2 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
+    .panel-head p { margin: 2px 0 0; color: var(--muted); font-size: 11.5px; }
+    .panel-chev { color: var(--faint); flex: 0 0 auto; transition: transform .18s ease; }
+    .panel[open] > summary .panel-chev { transform: rotate(180deg); color: var(--brand); }
+    .panel[open] > summary { border-bottom-color: var(--line); }
+    .panel:not([open]) > summary { border-bottom: 0; }
+    .panel-head-meta { display: grid; justify-items: end; gap: 2px; margin-left: auto; text-align: right; }
+    .panel-head-meta strong { font-size: 13px; }
+    .panel-head-meta span { color: var(--muted); font-size: 11px; }
+    .panel-body { padding: 18px; }
+    .panel-actions { padding: 13px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; background: var(--surface-2); }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+    .form-grid .wide { grid-column: 1 / -1; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .toggle-row { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 15px; }
+
+    .mode-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; }
+    .mode-option { position: relative; min-width: 0; }
+    .mode-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .mode-option span {
+      min-height: 58px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 8px;
+      border: 1.5px solid var(--line-strong);
+      border-radius: var(--radius);
+      color: var(--muted);
+      background: var(--input-bg);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      overflow-wrap: anywhere;
+      transition: border-color .15s ease, color .15s ease, background .15s ease, box-shadow .15s ease;
+    }
+    .mode-option:hover span { border-color: var(--brand-line); color: var(--ink-soft); }
+    .mode-option input:checked + span {
+      color: var(--brand);
+      border-color: var(--brand);
+      background: var(--brand-soft);
+      box-shadow: 0 0 0 3px var(--brand-soft);
+      font-weight: 700;
+    }
+    .mode-option input:focus-visible + span { outline: 2px solid var(--brand); outline-offset: 2px; }
+    .connection-fields { margin-top: 16px; }
+
+    .inline-result {
+      min-height: 42px;
+      margin-top: 14px;
+      padding: 11px 13px;
+      border: 1px solid var(--brand-line);
+      border-radius: var(--radius-s);
+      background: var(--brand-soft);
+      color: var(--ink-soft);
+      font-size: 12.5px;
+      overflow-wrap: anywhere;
+    }
+    .inline-result.error { border-color: var(--danger-line); background: var(--danger-soft); color: var(--bad); }
+
+    .node-list { display: grid; border-top: 1px solid var(--line); }
+    .node-row {
+      min-width: 0;
+      padding: 13px 18px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid var(--line);
+      transition: background .14s ease;
+    }
+    .node-row:last-child { border-bottom: 0; }
+    .node-row:hover { background: var(--surface-2); }
+    .node-name { font-weight: 650; overflow-wrap: anywhere; }
+    .node-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+    .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
+
+    /* ---------- Logs ---------- */
+    .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
     .log-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-    .log-source { width: min(300px, 46vw); min-height: 38px; padding-block: 7px; }
+    .log-source { width: min(320px, 100%); min-height: 38px; padding-block: 7px; border-radius: var(--radius-s); }
     .log-view {
       min-height: 520px;
       max-height: calc(100vh - 235px);
       overflow: auto;
       margin: 0;
-      padding: 16px;
-      color: #dff7ed;
-      background: #13251f;
-      border-radius: var(--radius);
-      font: 12px/1.65 "Cascadia Mono", Consolas, monospace;
+      padding: 18px;
+      color: #d9efe6;
+      background: #0b1220;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-l);
+      font: 12px/1.7 var(--mono);
       white-space: pre-wrap;
       overflow-wrap: anywhere;
+      box-shadow: var(--shadow-soft);
     }
-    .settings-panel { max-width: 720px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
-    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; }
-    .settings-actions { margin-top: 4px; display: flex; justify-content: flex-end; }
-    .panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
-    .panel { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
-    .panel.full { grid-column: 1 / -1; }
-    .panel-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .panel-head h2 { margin: 0; font-size: 15px; }
-    .panel-head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
-    .panel-head-meta { display: grid; justify-items: end; gap: 2px; margin-left: auto; text-align: right; }
-    .panel-head-meta strong { font-size: 13px; }
-    .panel-head-meta span { color: var(--muted); font-size: 11px; }
-    .collapsible-panel { overflow: hidden; }
-    .collapsible-panel > summary { cursor: pointer; list-style: none; }
-    .collapsible-panel > summary::-webkit-details-marker { display: none; }
-    .collapsible-panel > summary::after {
-      content: "";
-      width: 8px;
-      height: 8px;
-      margin-right: 3px;
-      border-right: 2px solid var(--muted);
-      border-bottom: 2px solid var(--muted);
-      transform: rotate(45deg) translateY(-2px);
-      transition: transform .16s ease;
-      flex: 0 0 auto;
-    }
-    .collapsible-panel[open] > summary::after { transform: rotate(225deg) translate(-2px, -2px); }
-    .collapsible-panel:not([open]) > summary { border-bottom: 0; }
-    .collapsible-panel > summary:hover { background: var(--surface-alt); }
-    .collapsible-panel > summary:focus-visible { outline: 3px solid rgba(8, 119, 90, .22); outline-offset: -3px; }
-    .panel-body { padding: 16px; }
-    .panel-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
-    .form-grid .wide { grid-column: 1 / -1; }
-    .check-row { min-height: 42px; display: flex; align-items: center; gap: 9px; }
-    .check-row input { width: 18px; min-height: 18px; margin: 0; accent-color: var(--brand); }
-    .muted { color: var(--muted); }
-    .small { font-size: 12px; }
-    .mode-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; }
-    .mode-option { position: relative; min-width: 0; }
-    .mode-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
-    .mode-option span { min-height: 54px; display: grid; place-items: center; text-align: center; padding: 7px; border: 1px solid var(--line); border-radius: 5px; color: #45534d; background: #fff; font-size: 11px; cursor: pointer; overflow-wrap: anywhere; }
-    .mode-option input:checked + span { color: var(--brand-dark); border-color: var(--brand); background: #edf8f4; box-shadow: inset 0 0 0 1px var(--brand); }
-    .connection-fields { margin-top: 16px; }
-    .node-list { display: grid; border-top: 1px solid var(--line); }
-    .node-row { min-width: 0; padding: 11px 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
-    .node-row:last-child { border-bottom: 0; }
-    .node-name { font-weight: 650; overflow-wrap: anywhere; }
-    .node-actions { display: flex; gap: 6px; }
-    .node-actions .button { min-height: 32px; padding: 5px 8px; font-size: 11px; }
-    .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
-    .inline-result { min-height: 40px; margin-top: 12px; padding: 10px 11px; border-left: 3px solid var(--cyan); background: #eef7f8; color: #30545c; border-radius: 3px; overflow-wrap: anywhere; }
-    .inline-result.error { border-left-color: var(--red); background: #fff3f2; color: #7f302c; }
-    .update-progress { margin-top: 12px; display: grid; gap: 7px; }
+    [data-theme="light"] .log-view { color: #d3e6de; }
+
+    /* ---------- System rows ---------- */
+    .system-list { display: grid; gap: 11px; }
+    .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 11px; border-bottom: 1px dashed var(--line); font-size: 13px; }
+    .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
+    .system-row span { color: var(--muted); }
+    .system-row strong { text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+
+    .update-progress { margin-top: 12px; display: grid; gap: 8px; }
     .update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
     .update-progress-head span { min-width: 0; overflow-wrap: anywhere; }
-    .update-progress-head strong { color: var(--ink); flex: 0 0 auto; }
-    .update-progress progress { width: 100%; height: 10px; display: block; border: 0; border-radius: 3px; overflow: hidden; background: #e2e8e4; accent-color: var(--brand); }
-    .update-progress progress::-webkit-progress-bar { background: #e2e8e4; }
-    .update-progress progress::-webkit-progress-value { background: var(--brand); transition: width .25s ease; }
-    .update-progress progress::-moz-progress-bar { background: var(--brand); }
-    .update-progress.error progress { accent-color: var(--red); }
-    .update-progress.error progress::-webkit-progress-value { background: var(--red); }
-    .update-progress.error progress::-moz-progress-bar { background: var(--red); }
-    .system-list { display: grid; gap: 10px; }
-    .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #edf1ee; }
-    .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
-    .system-row strong { text-align: right; overflow-wrap: anywhere; }
-    .warning-text { color: #8b4e07; }
-    .danger-text { color: var(--red); }
+    .update-progress-head strong { color: var(--ink); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+    .update-progress progress {
+      width: 100%;
+      height: 10px;
+      display: block;
+      border: 0;
+      border-radius: var(--pill);
+      overflow: hidden;
+      background: var(--surface-2);
+      accent-color: var(--brand);
+    }
+    .update-progress progress::-webkit-progress-bar { background: var(--surface-2); border-radius: var(--pill); }
+    .update-progress progress::-webkit-progress-value { background: linear-gradient(90deg, var(--brand), var(--brand-2)); border-radius: var(--pill); transition: width .25s ease; }
+    .update-progress progress::-moz-progress-bar { background: var(--brand); border-radius: var(--pill); }
+    .update-progress.error progress { accent-color: var(--bad); }
+    .update-progress.error progress::-webkit-progress-value { background: var(--bad); }
+    .update-progress.error progress::-moz-progress-bar { background: var(--bad); }
+
+    /* ---------- Dialogs ---------- */
     dialog {
-      width: min(460px, calc(100vw - 28px));
-      border: 1px solid var(--line);
-      border-radius: 7px;
+      width: min(470px, calc(100vw - 28px));
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-l);
       padding: 0;
       color: var(--ink);
-      box-shadow: 0 24px 70px rgba(17, 28, 24, .24);
-    }
-    dialog.wide-dialog { width: min(760px, calc(100vw - 28px)); }
-    dialog::backdrop { background: rgba(17, 28, 24, .48); }
-    .dialog-head { min-height: 58px; padding: 13px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .dialog-head h2 { margin: 0; font-size: 16px; }
-    .dialog-body { padding: 18px 16px; }
-    .dialog-actions { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
-    .toggle-row { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
-    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 42px; }
-    .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
-    .switch span { position: absolute; inset: 0; background: #bfc9c3; border-radius: 12px; transition: .18s; }
-    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: .18s; box-shadow: 0 1px 4px rgba(0,0,0,.2); }
-    .switch input:checked + span { background: var(--brand); }
-    .switch input:checked + span::after { transform: translateX(18px); }
-    .toast {
-      position: fixed;
-      right: 20px;
-      bottom: 20px;
-      z-index: 80;
-      max-width: min(420px, calc(100vw - 40px));
-      min-height: 46px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 11px 14px;
-      color: #fff;
-      background: #20352e;
-      border-radius: 6px;
+      background: var(--surface);
       box-shadow: var(--shadow);
     }
-    .toast.error { background: #8f312d; }
-    .spin { animation: spin .8s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    @media (max-width: 980px) {
-      .auth-shell { grid-template-columns: minmax(280px, 390px) 1fr; }
-      .auth-scene { padding: 5vw; }
-      .summary-band { grid-template-columns: 1fr 1fr; }
-      .summary-item:nth-child(2) { border-right: 0; }
-      .summary-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
-      .metric-grid { grid-template-columns: 1fr 1fr; }
+    dialog[open] { animation: pop .18s ease; }
+    dialog.wide-dialog { width: min(780px, calc(100vw - 28px)); }
+    dialog::backdrop { background: rgba(3, 7, 14, .58); backdrop-filter: blur(3px); }
+    .dialog-head {
+      min-height: 60px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .dialog-head h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -.01em; }
+    .dialog-body { padding: 20px 18px; max-height: min(66vh, 620px); overflow: auto; }
+    .dialog-actions { padding: 13px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; background: var(--surface-2); border-radius: 0 0 var(--radius-l) var(--radius-l); }
+    .confirm-message { margin: 0; color: var(--ink-soft); font-size: 13.5px; line-height: 1.6; }
+
+    /* ---------- Toasts ---------- */
+    .toasts {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 90;
+      display: grid;
+      gap: 10px;
+      width: min(400px, calc(100vw - 36px));
+    }
+    .toast {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 13px;
+      color: var(--ink);
+      background: var(--raise);
+      border: 1px solid var(--line-strong);
+      border-left: 3px solid var(--brand);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      font-size: 13px;
+      animation: toastIn .22s ease;
+    }
+    .toast .icon { color: var(--brand); flex: 0 0 auto; margin-top: 1px; }
+    .toast.error { border-left-color: var(--bad); }
+    .toast.error .icon { color: var(--bad); }
+    .toast-close { margin-left: auto; border: 0; background: transparent; color: var(--faint); border-radius: 6px; width: 26px; height: 26px; display: grid; place-items: center; flex: 0 0 26px; }
+    .toast-close:hover { color: var(--ink); background: var(--surface-2); }
+    .toast-close .icon { width: 14px; height: 14px; color: inherit; }
+    @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } }
+
+    /* ---------- Responsive ---------- */
+    @media (max-width: 1080px) {
+      .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .mode-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
-    @media (max-width: 760px) {
-      .auth-shell { display: block; background: var(--bg); padding: 0; }
-      .auth-panel { min-height: 100vh; padding: 36px 22px; border: 0; background: var(--surface); }
-      .auth-scene { display: none; }
-      .auth-title { margin-top: 44px; font-size: 24px; }
-      .app-header { height: 60px; padding: 0 14px; }
-      .brand-mark { width: 34px; height: 34px; flex-basis: 34px; }
-      .brand-name { font-size: 17px; }
-      .brand-sub, .service-chip { display: none; }
-      .app-nav { padding: 0 14px; gap: 12px; }
-      .tab-button { font-size: 12px; }
-      .main { padding: 18px 14px 34px; }
-      .section-heading { align-items: flex-start; }
+    @media (max-width: 980px) {
+      .stat-band { grid-template-columns: 1fr 1fr; }
       .instances { grid-template-columns: 1fr; }
+      .instance-card:only-child { grid-column: auto; }
+      .panel-grid { grid-template-columns: 1fr; }
       .settings-grid { grid-template-columns: 1fr; }
-      .form-grid, .panel-grid { grid-template-columns: 1fr; }
+      .form-grid { grid-template-columns: 1fr; }
       .panel.full { grid-column: auto; }
-      .section-heading { flex-wrap: wrap; }
+      .shell { grid-template-columns: 1fr; grid-template-areas: "top" "main"; }
+      .topbar { justify-content: space-between; }
+      .topbar .brand { display: flex; }
+      .sidenav {
+        position: fixed;
+        z-index: 40;
+        top: auto;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: auto;
+        flex-direction: row;
+        gap: 4px;
+        padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+        border-right: 0;
+        border-top: 1px solid var(--line);
+        background: color-mix(in srgb, var(--surface) 92%, transparent);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+      }
+      .sidenav .brand, .sidenav-foot { display: none; }
+      .nav-list { flex-direction: row; flex: 1 1 auto; align-items: stretch; }
+      .nav-item { flex: 1 1 0; flex-direction: column; gap: 3px; min-height: 52px; padding: 6px 2px; justify-content: center; font-size: 11px; border-radius: var(--radius-s); }
+      .nav-item .icon { width: 20px; height: 20px; }
+      .main { padding: 20px 16px calc(92px + env(safe-area-inset-bottom)); }
+      .toasts { bottom: calc(84px + env(safe-area-inset-bottom)); }
+      .section-heading { align-items: flex-start; }
       .section-actions { width: 100%; justify-content: flex-start; }
       .log-actions { width: 100%; justify-content: flex-start; }
-      .log-source { width: auto; flex: 1 1 220px; }
-      .card-head { align-items: flex-start; }
-      .card-head-tools { gap: 6px; }
-      .status-badge { min-width: 74px; padding: 0 8px; }
-      .log-view { min-height: 440px; max-height: calc(100vh - 215px); }
+      .log-source { flex: 1 1 220px; width: auto; }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+      .card-head { align-items: flex-start; flex-wrap: wrap; }
     }
     @media (max-width: 430px) {
-      .summary-band { grid-template-columns: 1fr 1fr; }
-      .summary-item { padding: 13px 12px; }
-      .summary-value { font-size: 17px; }
-      .metric-grid { gap: 12px 8px; }
+      .stat-band { gap: 10px; }
+      .stat { padding: 13px 14px; }
+      .stat-value { font-size: 19px; }
       .button .optional-label { display: none; }
-      .section-heading h1 { font-size: 18px; }
+      .section-heading h1 { font-size: 19px; }
       .mode-grid { grid-template-columns: 1fr 1fr; }
       .node-row { grid-template-columns: 1fr; }
-      .node-actions { overflow-x: auto; }
-      .log-source { flex-basis: 100%; }
+      .metric-grid { gap: 9px; }
+      .brand-name { font-size: 16px; }
+      .login-card { padding: 28px 22px 22px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
     }
   </style>
 </head>
 <body>
-  <section id="loginView" class="auth-shell">
-    <div class="auth-panel">
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="agArea" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#2dd4bf" stop-opacity=".3"/>
+        <stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+  </svg>
+
+  <section id="loginView" class="login-view" hidden>
+    <div class="login-grid" aria-hidden="true"></div>
+    <div class="login-card">
       <div class="brand">
         <div class="brand-mark" data-icon="activity"></div>
         <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub">ECS CONTROL CONSOLE</div></div>
       </div>
-      <h1 class="auth-title">登录控制台</h1>
-      <p class="auth-meta" id="loginVersion">受保护的运维入口</p>
+      <h1 class="login-title">登录控制台</h1>
+      <p class="login-meta" id="loginVersion">受保护的运维入口</p>
       <form id="loginForm" autocomplete="on">
         <div class="field">
           <label for="username">用户名</label>
@@ -567,58 +899,60 @@
             <button class="input-icon" id="togglePassword" type="button" title="显示或隐藏密码" aria-label="显示或隐藏密码" data-icon="eye"></button>
           </div>
         </div>
-        <button class="button primary auth-submit" type="submit"><span data-icon="log-in"></span>登录</button>
+        <button class="button primary login-submit" type="submit"><span data-icon="log-in"></span>登录</button>
         <p id="loginError" class="form-error" role="alert"></p>
       </form>
-    </div>
-    <div class="auth-scene" aria-hidden="true">
-      <div class="scene-chart">
-        <svg viewBox="0 0 760 300" role="img">
-          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55" fill="none" stroke="#5cf0c8" stroke-width="6" stroke-linecap="round"/>
-          <path d="M20 238 C90 225 124 246 176 191 S270 158 322 176 S407 92 461 121 S547 72 598 88 S684 43 740 55 L740 280 L20 280 Z" fill="#5cf0c8" opacity=".1"/>
-          <circle cx="740" cy="55" r="9" fill="#fff" stroke="#5cf0c8" stroke-width="5"/>
-        </svg>
-      </div>
-      <p class="scene-title">Alibaba Cloud · Operations</p>
+      <div class="login-foot"><span data-icon="shield-check"></span>流量保活 · 自动止损 · 账单通知</div>
     </div>
   </section>
 
-  <div id="appView" class="app" hidden>
-    <header class="app-header">
+  <div id="appView" class="shell" hidden>
+    <aside class="sidenav">
       <div class="brand">
         <div class="brand-mark" data-icon="activity"></div>
         <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub" id="appVersion">Web Console</div></div>
       </div>
-      <div class="header-actions">
+      <nav class="nav-list" aria-label="控制台视图">
+        <button class="nav-item active" data-tab="dashboard" type="button"><span data-icon="layout-dashboard"></span>实例总览</button>
+        <button class="nav-item" data-tab="telegram" type="button"><span data-icon="send"></span>Telegram</button>
+        <button class="nav-item" data-tab="logs" type="button"><span data-icon="terminal"></span>运行日志</button>
+        <button class="nav-item" data-tab="settings" type="button"><span data-icon="settings"></span>设置</button>
+        <button class="nav-item" data-tab="system" type="button"><span data-icon="wrench"></span>系统</button>
+      </nav>
+      <div class="sidenav-foot">
         <div class="service-chip"><span id="serviceDot" class="dot"></span><span id="serviceText">读取中</span></div>
+      </div>
+    </aside>
+
+    <header class="topbar">
+      <div class="brand topbar-brand">
+        <div class="brand-mark" data-icon="activity"></div>
+        <div><div class="brand-name">Aliyun Guard</div><div class="brand-sub" id="appVersionTop">Web Console</div></div>
+      </div>
+      <div class="topbar-actions">
+        <button id="themeToggle" class="icon-button" type="button" title="切换明暗主题" aria-label="切换明暗主题"></button>
         <button id="refreshButton" class="icon-button" type="button" title="刷新" aria-label="刷新" data-icon="refresh-cw"></button>
         <button id="logoutButton" class="icon-button" type="button" title="退出登录" aria-label="退出登录" data-icon="log-out"></button>
       </div>
     </header>
-    <nav class="app-nav" aria-label="控制台视图">
-      <button class="tab-button active" data-tab="dashboard"><span data-icon="layout-dashboard"></span>实例</button>
-      <button class="tab-button" data-tab="telegram"><span data-icon="send"></span>Telegram</button>
-      <button class="tab-button" data-tab="logs"><span data-icon="terminal"></span>日志</button>
-      <button class="tab-button" data-tab="settings"><span data-icon="settings"></span>设置</button>
-      <button class="tab-button" data-tab="system"><span data-icon="wrench"></span>系统</button>
-    </nav>
+
     <main class="main">
       <section id="dashboardTab" class="tab-panel">
         <div class="section-heading">
           <div><h1>实例总览</h1><p id="lastUpdated">尚未刷新</p></div>
           <div class="section-actions">
-            <button id="dryRunButton" class="button secondary" type="button"><span data-icon="flask-conical"></span>演练检测</button>
+            <button id="dryRunButton" class="button secondary" type="button" aria-label="演练检测"><span data-icon="flask-conical"></span><span class="optional-label">演练检测</span></button>
             <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
-            <button id="refreshBillingButton" class="button secondary" type="button"><span data-icon="refresh-cw"></span>刷新账单</button>
-            <button id="addInstanceButton" class="button secondary" type="button"><span data-icon="plus"></span>添加实例</button>
-            <button id="discoverInstanceButton" class="button secondary" type="button"><span data-icon="search"></span>自动发现</button>
+            <button id="refreshBillingButton" class="button secondary" type="button" aria-label="刷新账单"><span data-icon="refresh-cw"></span><span class="optional-label">刷新账单</span></button>
+            <button id="addInstanceButton" class="button secondary" type="button" aria-label="添加实例"><span data-icon="plus"></span><span class="optional-label">添加实例</span></button>
+            <button id="discoverInstanceButton" class="button secondary" type="button" aria-label="自动发现"><span data-icon="search"></span><span class="optional-label">自动发现</span></button>
           </div>
         </div>
-        <div class="summary-band">
-          <div class="summary-item"><div class="summary-label"><span data-icon="server"></span>实例</div><div class="summary-value" id="summaryInstances">0</div></div>
-          <div class="summary-item"><div class="summary-label"><span data-icon="activity"></span>运行中</div><div class="summary-value" id="summaryRunning">0</div></div>
-          <div class="summary-item"><div class="summary-label"><span data-icon="triangle-alert"></span>异常</div><div class="summary-value" id="summaryErrors">0</div></div>
-          <div class="summary-item"><div class="summary-label"><span data-icon="clock"></span>累计检测</div><div class="summary-value" id="summaryCycles">0</div></div>
+        <div class="stat-band">
+          <div class="stat"><div class="stat-icon tone-neutral" data-icon="server"></div><div><div class="stat-label">监控实例</div><div class="stat-value" id="summaryInstances">0</div></div></div>
+          <div class="stat"><div class="stat-icon tone-ok" data-icon="activity"></div><div><div class="stat-label">运行中</div><div class="stat-value" id="summaryRunning">0</div></div></div>
+          <div class="stat"><div class="stat-icon tone-warn" data-icon="triangle-alert"></div><div><div class="stat-label">异常</div><div class="stat-value" id="summaryErrors">0</div></div></div>
+          <div class="stat"><div class="stat-icon tone-neutral" data-icon="clock"></div><div><div class="stat-label">累计检测</div><div class="stat-value" id="summaryCycles">0</div></div></div>
         </div>
         <div id="notice" class="notice" hidden><span data-icon="triangle-alert"></span><span id="noticeText"></span></div>
         <div id="instances" class="instances"></div>
@@ -627,26 +961,26 @@
       <section id="telegramTab" class="tab-panel" hidden>
         <div class="section-heading">
           <div><h1>Telegram</h1><p id="telegramCurrent">正在读取当前连接方式</p></div>
-          <button id="telegramTestButton" class="button primary" type="button"><span data-icon="send"></span>发送测试消息</button>
+          <div class="section-actions"><button id="telegramTestButton" class="button primary" type="button"><span data-icon="send"></span>发送测试消息</button></div>
         </div>
         <div class="panel-grid">
-          <details class="panel collapsible-panel" open>
-            <summary class="panel-head" title="展开或收起机器人配置"><div><h2>机器人身份</h2><p>密钥留空时保留原配置</p></div></summary>
+          <details class="panel" id="panelTelegramIdentity">
+            <summary class="panel-head" title="展开或收起机器人配置"><div><h2>机器人身份</h2><p>密钥留空时保留原配置</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="telegramIdentityForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="tgToken">Bot Token</label><input id="tgToken" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
               <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
               <div class="field"><label for="tgTimeout">请求超时（秒）</label><input id="tgTimeout" type="number" min="3" max="60" required></div>
               <div class="field"><label for="tgRetries">重试次数</label><input id="tgRetries" type="number" min="1" max="5" required></div>
-              <div class="field wide"><div class="toggle-row"><div><strong>Bot 控制</strong><div class="brand-sub">仅授权管理员私聊可用</div></div><label class="switch"><input id="tgControlEnabled" type="checkbox"><span></span></label></div></div>
+              <div class="field wide"><div class="toggle-row"><div><strong>Bot 控制</strong><div class="muted small">仅授权管理员私聊可用</div></div><label class="switch"><input id="tgControlEnabled" type="checkbox"><span></span></label></div></div>
               <div id="tgControlAdminsField" class="field wide"><label for="tgControlAdmins">管理员 Telegram 用户 ID</label><input id="tgControlAdmins" autocomplete="off" placeholder="留空使用正数私聊 Chat ID"><div id="tgControlHint" class="muted small"></div></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
             </form>
           </details>
 
-          <details class="panel collapsible-panel">
-            <summary class="panel-head" title="展开或收起 Telegram 连接设置"><div><h2>连接方式</h2><p id="connectionDescription">直连</p></div></summary>
+          <details class="panel" id="panelTelegramConnection">
+            <summary class="panel-head" title="展开或收起 Telegram 连接设置"><div><h2>连接方式</h2><p id="connectionDescription">直连</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="connectionForm">
             <div class="panel-body">
               <div class="mode-grid" role="radiogroup" aria-label="Telegram 连接方式">
@@ -670,11 +1004,11 @@
             </form>
           </details>
 
-          <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><div class="panel-head-meta"><strong id="nodeCount">0 个节点</strong><span id="subscriptionStatus">未配置订阅</span></div></summary>
+          <details class="panel full" id="panelTelegramNodes">
+            <summary class="panel-head" title="展开或收起节点管理"><div><h2>节点管理</h2><p>VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS；订阅会自动选择可用节点</p></div><div class="panel-head-meta"><strong id="nodeCount">0 个节点</strong><span id="subscriptionStatus">未配置订阅</span></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="nodeAddForm" class="panel-body">
               <div class="field"><label for="nodeUrl">节点链接或订阅地址</label><textarea id="nodeUrl" autocomplete="off" placeholder="vless://、vmess://、ss://、trojan://、hy2://、tuic://、anytls:// 或 https://" required></textarea></div>
-              <div class="settings-actions"><button class="button primary" type="submit"><span data-icon="plus"></span>导入订阅或测试保存节点</button></div>
+              <div style="display:flex;justify-content:flex-end"><button class="button primary" type="submit"><span data-icon="plus"></span>导入订阅或测试保存节点</button></div>
               <div id="nodeResult" class="inline-result" hidden></div>
             </form>
             <div id="nodeList" class="node-list"></div>
@@ -697,8 +1031,8 @@
       <section id="settingsTab" class="tab-panel" hidden>
         <div class="section-heading"><div><h1>设置</h1><p>后台检测与网页入口</p></div></div>
         <div class="panel-grid">
-          <details class="panel collapsible-panel" open>
-            <summary class="panel-head" title="展开或收起全局检测设置"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div></summary>
+          <details class="panel" id="panelSettingsGlobal">
+            <summary class="panel-head" title="展开或收起全局检测设置"><div><h2>全局检测设置</h2><p>下一轮自动读取新配置</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="settingsForm">
             <div class="panel-body form-grid">
               <div class="field"><label for="intervalSeconds">检测间隔（秒）</label><input id="intervalSeconds" type="number" min="60" max="86400" required></div>
@@ -717,8 +1051,8 @@
             </form>
           </details>
 
-          <details class="panel collapsible-panel">
-            <summary class="panel-head" title="展开或收起网页控制面板设置"><div><h2>网页控制面板</h2><p>支持 HTTP 与 HTTPS 反向代理访问</p></div></summary>
+          <details class="panel" id="panelSettingsWeb">
+            <summary class="panel-head" title="展开或收起网页控制面板设置"><div><h2>网页控制面板</h2><p>支持 HTTP 与 HTTPS 反向代理访问</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="webSettingsForm">
             <div class="panel-body form-grid">
               <label class="check-row wide"><input id="webEnabled" type="checkbox">启用网页控制面板</label>
@@ -738,8 +1072,8 @@
       <section id="systemTab" class="tab-panel" hidden>
         <div class="section-heading"><div><h1>系统</h1><p>服务状态与 GitHub 版本</p></div></div>
         <div class="panel-grid">
-          <details class="panel collapsible-panel" open>
-            <summary class="panel-head" title="展开或收起运行环境"><div><h2>运行环境</h2><p>当前安装实例</p></div></summary>
+          <details class="panel" id="panelSystemRuntime">
+            <summary class="panel-head" title="展开或收起运行环境"><div><h2>运行环境</h2><p>当前安装实例</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <div class="panel-body system-list">
               <div class="system-row"><span>调度后端</span><strong id="systemBackend">--</strong></div>
               <div class="system-row"><span>访问 IPv4</span><strong id="systemLocalIp">--</strong></div>
@@ -748,8 +1082,8 @@
             </div>
             <div class="panel-actions"><button id="restartServiceButton" class="button warning" type="button"><span data-icon="refresh-cw"></span>重启后台服务</button></div>
           </details>
-          <details class="panel collapsible-panel">
-            <summary class="panel-head" title="展开或收起 GitHub 更新"><div><h2>GitHub 更新</h2><p>从正式发布版本更新</p></div></summary>
+          <details class="panel" id="panelSystemUpdate">
+            <summary class="panel-head" title="展开或收起 GitHub 更新"><div><h2>GitHub 更新</h2><p>从正式发布版本更新</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <div class="panel-body system-list">
               <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
               <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
@@ -761,8 +1095,8 @@
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
           </details>
-          <details class="panel collapsible-panel">
-            <summary class="panel-head" title="展开或收起加密备份"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div></summary>
+          <details class="panel" id="panelSystemBackup">
+            <summary class="panel-head" title="展开或收起加密备份"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="backupCreateForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="backupPassword">备份密码</label><input id="backupPassword" type="password" minlength="8" autocomplete="new-password" required></div>
@@ -772,8 +1106,8 @@
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="download"></span>创建并下载</button></div>
             </form>
           </details>
-          <details class="panel collapsible-panel">
-            <summary class="panel-head" title="展开或收起恢复备份"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div></summary>
+          <details class="panel" id="panelSystemRestore">
+            <summary class="panel-head" title="展开或收起恢复备份"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="backupRestoreForm">
             <div class="panel-body form-grid">
               <div class="field wide"><label for="restoreFile">备份文件</label><input id="restoreFile" type="file" accept=".agbackup,application/json" required></div>
@@ -784,8 +1118,8 @@
             <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
             </form>
           </details>
-          <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起 AWS S3 自动备份"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></summary>
+          <details class="panel full" id="panelSystemS3">
+            <summary class="panel-head" title="展开或收起 AWS S3 自动备份"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><div class="panel-head-meta"><span id="s3BackupStatus">未配置</span></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <form id="s3BackupForm">
             <div class="panel-body form-grid">
               <label class="check-row wide"><input id="s3Enabled" type="checkbox">启用自动备份</label>
@@ -817,8 +1151,8 @@
             <div id="s3BackupList" class="node-list"></div>
             </form>
           </details>
-          <details class="panel full collapsible-panel">
-            <summary class="panel-head" title="展开或收起程序版本回滚"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></summary>
+          <details class="panel full" id="panelSystemRollback">
+            <summary class="panel-head" title="展开或收起程序版本回滚"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div><span class="panel-chev" data-icon="chevron-down"></span></summary>
             <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
             <div class="panel-actions"><button id="rollbackButton" class="button warning" type="button" disabled><span data-icon="refresh-cw"></span>回滚并重启</button></div>
           </details>
@@ -862,7 +1196,7 @@
     <form id="scheduleForm">
       <div class="dialog-head"><h2 id="scheduleTitle">定时开关机</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
       <div class="dialog-body">
-        <div class="toggle-row"><div><strong>每日计划</strong><div class="brand-sub">按服务器本地时间</div></div><label class="switch"><input id="scheduleEnabled" type="checkbox"><span></span></label></div>
+        <div class="toggle-row"><div><strong>每日计划</strong><div class="muted small">按服务器本地时间</div></div><label class="switch"><input id="scheduleEnabled" type="checkbox"><span></span></label></div>
         <div class="settings-grid">
           <div class="field"><label for="startTime">开机时间</label><input id="startTime" type="time" required></div>
           <div class="field"><label for="stopTime">关机时间</label><input id="stopTime" type="time" required></div>
@@ -893,10 +1227,20 @@
     </form>
   </dialog>
 
-  <div id="toast" class="toast" hidden role="status"><span id="toastIcon" data-icon="circle-check"></span><span id="toastText"></span></div>
+  <dialog id="confirmDialog">
+    <form id="confirmForm" method="dialog">
+      <div class="dialog-head"><h2 id="confirmTitle">确认操作</h2><button class="icon-button" type="submit" value="cancel" title="取消" aria-label="取消" data-icon="x"></button></div>
+      <div class="dialog-body"><p id="confirmMessage" class="confirm-message"></p></div>
+      <div class="dialog-actions"><button id="confirmCancelButton" class="button secondary" type="submit" value="cancel">取消</button><button id="confirmOkButton" class="button danger" type="submit" value="ok">确认</button></div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <noscript><p style="padding:20px;text-align:center">控制台需要启用 JavaScript。</p></noscript>
 
   <script>
-    // Paths are from the Lucide icon set (ISC License).
+    // Icon paths come from the Lucide icon set (ISC License).
     const ICONS = {
       "activity": '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
       "eye": '<path d="M2.06 12.35a1 1 0 0 1 0-.7C3.74 7.6 7.69 5 12 5c4.31 0 8.26 2.6 9.94 6.65a1 1 0 0 1 0 .7C20.26 16.4 16.31 19 12 19c-4.31 0-8.26-2.6-9.94-6.65"/><circle cx="12" cy="12" r="3"/>',
@@ -906,7 +1250,7 @@
       "refresh-cw": '<path d="M21 12a9 9 0 0 0-15.22-6.22L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 15.22 6.22L21 16"/><path d="M16 16h5v5"/>',
       "layout-dashboard": '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
       "terminal": '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
-      "settings": '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+      "settings": '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
       "play": '<polygon points="6 3 20 12 6 21 6 3"/>',
       "server": '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
       "triangle-alert": '<path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
@@ -927,12 +1271,16 @@
       "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
       "save": '<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
       "x": '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
-      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>'
+      "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+      "chevron-down": '<path d="m6 9 6 6 6-6"/>',
+      "more-horizontal": '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
+      "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+      "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>'
     };
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, s3RestoreKey: null, s3RestorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, s3RestoreKey: null, s3RestorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null, confirmResolve: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -959,13 +1307,47 @@
     }
 
     function toast(message, isError = false) {
-      $("toastText").textContent = message;
-      $("toast").classList.toggle("error", isError);
-      $("toastIcon").innerHTML = icon(isError ? "triangle-alert" : "circle-check");
-      $("toast").hidden = false;
-      clearTimeout(toast.timer);
-      toast.timer = setTimeout(() => { $("toast").hidden = true; }, 4200);
+      const item = document.createElement("div");
+      item.className = `toast${isError ? " error" : ""}`;
+      item.innerHTML = `${icon(isError ? "triangle-alert" : "circle-check")}<span style="min-width:0;overflow-wrap:anywhere"></span><button class="toast-close" type="button" aria-label="关闭提示">${icon("x")}</button>`;
+      item.querySelector("span").textContent = message;
+      const remove = () => item.remove();
+      item.querySelector(".toast-close").addEventListener("click", remove);
+      $("toasts").appendChild(item);
+      while ($("toasts").children.length > 4) $("toasts").firstElementChild.remove();
+      setTimeout(remove, 4200);
     }
+
+    async function confirmAction({ title = "确认操作", message = "", confirmText = "确认", tone = "danger" } = {}) {
+      return new Promise(resolve => {
+        state.confirmResolve = resolve;
+        $("confirmTitle").textContent = title;
+        $("confirmMessage").textContent = message;
+        const ok = $("confirmOkButton");
+        ok.textContent = confirmText;
+        ok.className = `button ${tone}`;
+        $("confirmDialog").showModal();
+      });
+    }
+
+    function closeConfirm(value) {
+      if (!$("confirmDialog").open) return;
+      const resolve = state.confirmResolve;
+      state.confirmResolve = null;
+      $("confirmDialog").close();
+      if (resolve) resolve(value === "ok");
+    }
+    $("confirmForm").addEventListener("submit", event => { event.preventDefault(); closeConfirm(event.submitter ? event.submitter.value : "cancel"); });
+    $("confirmDialog").addEventListener("cancel", event => { event.preventDefault(); closeConfirm("cancel"); });
+
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      try { localStorage.setItem("ag-theme", theme); } catch (_) {}
+      $("themeToggle").innerHTML = icon(theme === "dark" ? "sun" : "moon");
+    }
+    $("themeToggle").addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
 
     function showLogin() {
       clearInterval(state.timer);
@@ -995,7 +1377,9 @@
     }
 
     function sparkline(points) {
-      if (!points || !points.length) return `<div class="sparkline"><svg viewBox="0 0 320 58"><path d="M0 42 H320" stroke="#d9e1dc" stroke-width="1" stroke-dasharray="4 5"/><text x="8" y="26" fill="#89938e" font-size="11">等待流量样本</text></svg></div>`;
+      if (!points || !points.length) {
+        return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none" aria-hidden="true"><line class="chart-baseline" x1="4" y1="48" x2="316" y2="48"/></svg><div class="chart-empty">等待流量样本</div></div>`;
+      }
       const values = points.map(p => Number(p.value));
       const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, .01);
       const chartLeft = 4, chartRight = 316, chartTop = 10, chartBottom = 48;
@@ -1005,9 +1389,10 @@
         return { x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) };
       });
       const polyline = coords.map(point => `${point.x},${point.y}`).join(" ");
+      const area = `M ${coords[0].x} ${chartBottom} L ${polyline.split(" ").map(p => p.replace(",", " ")).join(" L ")} L ${coords[coords.length - 1].x} ${chartBottom} Z`;
       const hits = coords.map((point, index) => `<circle class="chart-hit" cx="${point.x}" cy="${point.y}" r="9" tabindex="0" data-point="${index}" data-x="${point.x}" aria-label="查看第 ${index + 1} 个检测样本"></circle><path class="chart-focus" d="M ${point.x} ${point.y} h .01"></path>`).join("");
       const latest = coords[coords.length - 1];
-      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none"><path d="M4 53 H316" stroke="#e1e7e3" stroke-width="1"/>${coords.length > 1 ? `<polyline points="${polyline}" fill="none" stroke="#167c94" stroke-width="2.5" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>` : ""}<path class="chart-point" d="M ${latest.x} ${latest.y} h .01"></path>${hits}</svg><div class="chart-tooltip" role="tooltip" hidden></div></div>`;
+      return `<div class="sparkline"><svg viewBox="0 0 320 58" preserveAspectRatio="none" aria-hidden="true"><line class="chart-baseline" x1="4" y1="48" x2="316" y2="48"/><path class="chart-area" d="${area}"/>${coords.length > 1 ? `<polyline class="chart-line" points="${polyline}"/>` : ""}<path class="chart-point" d="M ${latest.x} ${latest.y} h .01"></path>${hits}</svg><div class="chart-tooltip" role="tooltip" hidden></div></div>`;
     }
 
     function instanceCard(item) {
@@ -1026,15 +1411,16 @@
       const resetTitle = resetAt ? ` title="北京时间 ${esc(fmtDate(resetAt))} 自动额外检测一次"` : "";
       const powerAction = item.status === "Running" ? "stop" : "start";
       const powerLabel = powerAction === "start" ? "开机" : "关机";
+      const transitioning = ["Starting", "Stopping", "Pending"].includes(item.status);
       return `<article class="instance-card" data-index="${item.index}">
         <div class="card-head">
-          <div><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div>
-          <div class="card-head-tools">
+          <div style="min-width:0"><h2 class="instance-name">${esc(item.name)}</h2><div class="instance-meta">${esc(item.region)} · ${esc(item.instance_id)}</div></div>
+          <div class="card-tools">
             <div class="status-badge ${status.cls}"><span class="dot ${status.cls === "stopped" || status.cls === "error" ? "bad" : ""}"></span>${esc(status.label)}</div>
-            <details class="instance-tools">
-              <summary class="icon-button" title="单机设置" aria-label="${esc(item.name)} 单机设置">${icon("settings")}</summary>
-              <div class="instance-menu" role="menu" aria-label="${esc(item.name)} 单机操作">
-                <button class="menu-button" type="button" role="menuitem" data-action="power" data-power="${powerAction}" ${["Starting","Stopping","Pending"].includes(item.status) ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
+            <button class="button small ${powerAction === "start" ? "primary" : "secondary"}" type="button" data-action="power" data-power="${powerAction}" ${transitioning ? "disabled" : ""}>${icon("power")}<span>${powerLabel}</span></button>
+            <details class="menu">
+              <summary class="icon-button" title="单机设置" aria-label="${esc(item.name)} 单机设置">${icon("more-horizontal")}</summary>
+              <div class="menu-list" role="menu" aria-label="${esc(item.name)} 单机操作">
                 <button class="menu-button" type="button" role="menuitem" data-action="schedule">${icon("calendar-clock")}<span>定时计划</span></button>
                 <button class="menu-button ${item.paused ? "" : "warning"}" type="button" role="menuitem" data-action="pause">${icon(item.paused ? "play" : "pause")}<span>${item.paused ? "恢复监控" : "暂停监控"}</span></button>
                 <button class="menu-button" type="button" role="menuitem" data-action="edit">${icon("pencil")}<span>编辑配置</span></button>
@@ -1047,16 +1433,16 @@
         </div>
         <div class="card-body">
           <div class="metric-grid">
+            <div class="metric"${resetTitle}><div class="metric-label">额度重置</div><div class="metric-value">${resetText}</div></div>
             <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
-            <div class="metric"${resetTitle}><div class="metric-label">额度重置</div><div class="metric-value">${resetText}</div></div>
           </div>
-          <div class="traffic-row"><span>使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
+          <div class="traffic-row"><span>本月流量使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
           <div class="progress"><span class="${barClass}" style="width:${percent}%"></span></div>
           ${sparkline(item.history)}
-          <div class="instance-meta">下一动作：${esc(next)}</div>
+          <div class="next-line">${icon("calendar-clock")}<span>下一动作：${esc(next)}</span></div>
         </div>
         <div class="result-line">${esc(item.message)}</div>
       </article>`;
@@ -1064,7 +1450,9 @@
 
     function renderDashboard(data) {
       state.dashboard = data;
-      $("appVersion").textContent = `Web Console v${data.version}`;
+      const versionText = `Web Console v${data.version}`;
+      $("appVersion").textContent = versionText;
+      $("appVersionTop").textContent = versionText;
       $("lastUpdated").textContent = `服务器时间 ${fmtDate(data.now)} · 最后检测 ${fmtDate(data.service.last_finished_at)}`;
       $("summaryInstances").textContent = data.users.length;
       $("summaryRunning").textContent = data.users.filter(x => x.status === "Running" && !x.paused).length;
@@ -1083,6 +1471,10 @@
       $("dryRunButton").disabled = Boolean(data.job && data.job.running);
       $("runButton").innerHTML = data.job && data.job.running ? `${icon("refresh-cw", "spin")}检测中` : `${icon("play")}立即检测`;
       $("instances").innerHTML = data.users.length ? data.users.map(instanceCard).join("") : `<div class="empty"><div>${icon("server")}<p>暂无监控实例</p></div></div>`;
+    }
+
+    function renderSkeletons() {
+      $("instances").innerHTML = '<div class="sk-card"></div><div class="sk-card"></div>';
     }
 
     function setInlineResult(element, message, isError = false) {
@@ -1121,7 +1513,7 @@
       $("subscriptionStatus").textContent = telegram.subscription_configured
         ? `订阅每 7 天自动更新 · 上次更新：${telegram.subscription_last_refresh_epoch ? fmtDate(telegram.subscription_last_refresh_epoch * 1000) : "等待首次更新"}`
         : "未配置订阅";
-      $("nodeList").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<div class="node-row" data-node-index="${node.index}"><div><div class="node-name">${esc(node.description)}</div><div class="muted small">节点 #${node.index + 1} ${node.active ? '<span class="active-mark">· 当前使用</span>' : ""}</div></div><div class="node-actions"><button class="button secondary" type="button" data-node-action="test">${icon("gauge")}测试</button><button class="button primary" type="button" data-node-action="select">${icon("shield-check")}选用</button><button class="button danger" type="button" data-node-action="delete">${icon("trash-2")}删除</button></div></div>`).join("") : '<div class="node-row muted">尚未保存节点</div>';
+      $("nodeList").innerHTML = telegram.nodes.length ? telegram.nodes.map(node => `<div class="node-row" data-node-index="${node.index}"><div><div class="node-name">${esc(node.description)}</div><div class="muted small">节点 #${node.index + 1} ${node.active ? '<span class="active-mark">· 当前使用</span>' : ""}</div></div><div class="node-actions"><button class="button small secondary" type="button" data-node-action="test">${icon("gauge")}测试</button><button class="button small primary" type="button" data-node-action="select">${icon("shield-check")}选用</button><button class="button small danger" type="button" data-node-action="delete">${icon("trash-2")}删除</button></div></div>`).join("") : '<div class="node-row muted">尚未保存节点</div>';
       updateConnectionFields();
 
       const settings = data.settings;
@@ -1320,7 +1712,7 @@
       setInlineResult($("s3Result"), "正在读取云端备份...");
       try {
         const data = await api("/api/s3-backup/list");
-        $("s3BackupList").innerHTML = data.backups.length ? data.backups.map(item => `<div class="node-row" data-s3-key="${esc(item.key)}"><div><div class="node-name">${esc(item.name)}</div><div class="muted small">${(item.size / 1048576).toFixed(2)} MiB · ${esc(fmtDate(item.modified_at))}</div></div><div class="node-actions"><button class="button secondary" type="button" data-s3-action="preview">${icon("search")}预览</button><button class="button warning" type="button" data-s3-action="restore">${icon("refresh-cw")}恢复</button></div></div>`).join("") : '<div class="node-row muted">云端没有 Aliyun Guard 加密备份</div>';
+        $("s3BackupList").innerHTML = data.backups.length ? data.backups.map(item => `<div class="node-row" data-s3-key="${esc(item.key)}"><div><div class="node-name">${esc(item.name)}</div><div class="muted small">${(item.size / 1048576).toFixed(2)} MiB · ${esc(fmtDate(item.modified_at))}</div></div><div class="node-actions"><button class="button small secondary" type="button" data-s3-action="preview">${icon("search")}预览</button><button class="button small warning" type="button" data-s3-action="restore">${icon("refresh-cw")}恢复</button></div></div>`).join("") : '<div class="node-row muted">云端没有 Aliyun Guard 加密备份</div>';
         setInlineResult($("s3Result"), `已读取 ${data.backups.length} 份云端备份`);
       } catch (error) { setInlineResult($("s3Result"), error.message, true); }
       finally { $("s3ListButton").disabled = false; }
@@ -1437,8 +1829,8 @@
       if (tooltip) tooltip.hidden = true;
     }
 
-    document.querySelectorAll(".tab-button").forEach(button => button.addEventListener("click", () => {
-      document.querySelectorAll(".tab-button").forEach(x => x.classList.toggle("active", x === button));
+    document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => {
+      document.querySelectorAll(".nav-item").forEach(x => x.classList.toggle("active", x === button));
       document.querySelectorAll(".tab-panel").forEach(x => x.hidden = x.id !== `${button.dataset.tab}Tab`);
       if (button.dataset.tab === "logs") loadLogs();
       if (["telegram", "settings", "system"].includes(button.dataset.tab)) loadManagement(false);
@@ -1499,7 +1891,7 @@
     $("instances").addEventListener("click", async event => {
       const button = event.target.closest("button[data-action]");
       if (!button) return;
-      button.closest(".instance-tools")?.removeAttribute("open");
+      button.closest(".menu")?.removeAttribute("open");
       const card = button.closest("[data-index]");
       const index = Number(card.dataset.index);
       const item = state.dashboard.users.find(x => x.index === index);
@@ -1512,7 +1904,7 @@
       if (button.dataset.action === "logs") {
         if (!state.management) await loadManagement();
         $("logSource").value = String(index);
-        document.querySelector('.tab-button[data-tab="logs"]').click();
+        document.querySelector('.nav-item[data-tab="logs"]').click();
         return;
       }
       if (button.dataset.action === "validate") {
@@ -1525,7 +1917,8 @@
         return;
       }
       if (button.dataset.action === "delete") {
-        if (!confirm(`确认删除 ${item.name} (${item.instance_id})？此操作不会删除阿里云 ECS。`)) return;
+        const confirmed = await confirmAction({ title: "删除监控实例", message: `确认删除 ${item.name} (${item.instance_id})？此操作不会删除阿里云 ECS。`, confirmText: "删除" });
+        if (!confirmed) return;
         button.disabled = true;
         try {
           await api(`/api/instances/${index}/delete`, { method: "POST", body: { instance_id: item.instance_id } });
@@ -1546,14 +1939,16 @@
       }
       if (button.dataset.action === "pause") {
         const paused = !item.paused;
-        if (!confirm(`确认${paused ? "暂停" : "恢复"} ${item.name}？`)) return;
+        const confirmed = await confirmAction({ title: paused ? "暂停监控" : "恢复监控", message: `确认${paused ? "暂停" : "恢复"} ${item.name}？`, confirmText: paused ? "暂停" : "恢复", tone: paused ? "warning" : "primary" });
+        if (!confirmed) return;
         button.disabled = true;
         try { await api(`/api/instances/${index}/pause`, { method: "POST", body: { paused } }); toast(paused ? "实例监控已暂停" : "实例监控已恢复"); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
         return;
       }
       if (button.dataset.action === "power") {
         const action = button.dataset.power;
-        if (!confirm(`确认${action === "start" ? "开机" : "关机"} ${item.name}？`)) return;
+        const confirmed = await confirmAction({ title: action === "start" ? "开机实例" : "关机实例", message: `确认${action === "start" ? "开机" : "关机"} ${item.name}？`, confirmText: action === "start" ? "开机" : "关机", tone: action === "start" ? "primary" : "warning" });
+        if (!confirmed) return;
         button.disabled = true;
         try { const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } }); toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error)); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
       }
@@ -1564,8 +1959,10 @@
     $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
     $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });
     $("instances").addEventListener("pointerdown", event => { const target = event.target.closest(".chart-hit"); if (target) { event.stopPropagation(); showChartTooltip(target); } });
-    document.addEventListener("pointerdown", event => { if (!event.target.closest(".sparkline")) document.querySelectorAll(".chart-tooltip").forEach(element => { element.hidden = true; }); });
-    document.addEventListener("click", event => { document.querySelectorAll(".instance-tools[open]").forEach(element => { if (!element.contains(event.target)) element.removeAttribute("open"); }); });
+    document.addEventListener("pointerdown", event => {
+      if (!event.target.closest(".sparkline")) document.querySelectorAll(".chart-tooltip").forEach(element => { element.hidden = true; });
+      document.querySelectorAll(".menu[open]").forEach(element => { if (!element.contains(event.target)) element.removeAttribute("open"); });
+    });
 
     document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
     $("scheduleForm").addEventListener("submit", async event => {
@@ -1592,8 +1989,11 @@
       try { await save(false); }
       catch (error) {
         setInlineResult($("instanceValidation"), error.details ? validationText(error.details) : error.message, true);
-        if (error.status === 422 && error.details && confirm("实例校验失败。仍然保存并让定时检测继续报告错误？")) {
-          try { await save(true); } catch (forceError) { setInlineResult($("instanceValidation"), forceError.message, true); }
+        if (error.status === 422 && error.details) {
+          const force = await confirmAction({ title: "校验失败", message: "实例校验失败。仍然保存并让定时检测继续报告错误？", confirmText: "仍然保存", tone: "warning" });
+          if (force) {
+            try { await save(true); } catch (forceError) { setInlineResult($("instanceValidation"), forceError.message, true); }
+          }
         }
       } finally { submit.disabled = false; }
     });
@@ -1634,7 +2034,7 @@
     $("restorePassword").addEventListener("input", () => { state.restorePreviewReady = false; $("restoreBackupButton").disabled = true; });
     $("previewRestoreButton").addEventListener("click", async () => {
       const file = $("restoreFile").files[0];
-      if (!file) return toast("请选择备份文件", true);
+      if (!file) { toast("请选择备份文件", true); return; }
       $("previewRestoreButton").disabled = true;
       try {
         state.restoreBackupBase64 = await fileAsBase64(file);
@@ -1649,7 +2049,8 @@
     $("backupRestoreForm").addEventListener("submit", async event => {
       event.preventDefault();
       if (!state.restorePreviewReady || !state.restoreBackupBase64) return;
-      if (!confirm("确认按预览结果恢复？当前配置会先自动创建安全备份。")) return;
+      const confirmed = await confirmAction({ title: "恢复备份", message: "确认按预览结果恢复？当前配置会先自动创建安全备份。", confirmText: "确认恢复", tone: "warning" });
+      if (!confirmed) return;
       try {
         await api("/api/backup/restore", { method: "POST", body: { backup_base64: state.restoreBackupBase64, password: $("restorePassword").value, include_logs: $("restoreLogs").checked } });
         toast("备份已恢复，后台服务即将重启");
@@ -1681,7 +2082,8 @@
       finally { $("s3TestButton").disabled = false; }
     });
     $("s3RunButton").addEventListener("click", async () => {
-      if (!confirm("立即使用已保存的 S3 设置创建并上传一份加密备份？")) return;
+      const confirmed = await confirmAction({ title: "立即备份", message: "立即使用已保存的 S3 设置创建并上传一份加密备份？", confirmText: "立即备份", tone: "primary" });
+      if (!confirmed) return;
       $("s3RunButton").disabled = true;
       setInlineResult($("s3Result"), "正在创建加密备份并上传...");
       try {
@@ -1714,7 +2116,8 @@
         setInlineResult($("s3Result"), "请先预览这份云端备份，再执行恢复。", true);
         return;
       }
-      if (!confirm("确认按刚才的差异预览恢复这份云端备份？当前配置会先自动创建安全备份。")) return;
+      const confirmed = await confirmAction({ title: "恢复云端备份", message: "确认按刚才的差异预览恢复这份云端备份？当前配置会先自动创建安全备份。", confirmText: "确认恢复", tone: "warning" });
+      if (!confirmed) return;
       button.disabled = true;
       try {
         await api("/api/s3-backup/restore", { method: "POST", body: { key, include_logs: true } });
@@ -1725,7 +2128,9 @@
     });
     $("rollbackButton").addEventListener("click", async () => {
       const snapshot = $("rollbackSnapshot").value;
-      if (!snapshot || !confirm(`确认回滚到 ${snapshot}？配置、状态和日志不会改变。`)) return;
+      if (!snapshot) return;
+      const confirmed = await confirmAction({ title: "程序版本回滚", message: `确认回滚到 ${snapshot}？配置、状态和日志不会改变。`, confirmText: "回滚并重启", tone: "warning" });
+      if (!confirmed) return;
       $("rollbackButton").disabled = true;
       try { await api("/api/rollback", { method: "POST", body: { snapshot } }); toast("程序已回滚，后台服务即将重启"); }
       catch (error) { toast(error.message, true); $("rollbackButton").disabled = false; }
@@ -1756,7 +2161,7 @@
       event.preventDefault();
       if (!state.discoveryCredentials) return;
       const selected = Array.from(document.querySelectorAll("[data-discovery-index]:checked")).map(input => state.discoveredInstances[Number(input.dataset.discoveryIndex)]);
-      if (!selected.length) return toast("请选择至少一个实例", true);
+      if (!selected.length) { toast("请选择至少一个实例", true); return; }
       $("importInstancesButton").disabled = true;
       try {
         const data = await api("/api/discovery/import", { method: "POST", body: { ...state.discoveryCredentials, instances: selected, traffic_limit_gb: Number($("discoverLimit").value), actions_enabled: $("discoverActions").checked, billing_site: $("discoverBillingSite").value } });
@@ -1785,6 +2190,7 @@
 
     document.querySelectorAll('input[name="connectionMode"]').forEach(input => input.addEventListener("change", updateConnectionFields));
     $("tgControlEnabled").addEventListener("change", updateTelegramControlFields);
+
     async function submitConnection(save) {
       const target = $("connectionResult");
       setInlineResult(target, "正在连接 Telegram Bot API...");
@@ -1822,7 +2228,10 @@
       if (!button) return;
       const row = button.closest("[data-node-index]");
       const index = Number(row.dataset.nodeIndex), action = button.dataset.nodeAction;
-      if (action === "delete" && !confirm(`确认删除节点 #${index + 1}？`)) return;
+      if (action === "delete") {
+        const confirmed = await confirmAction({ title: "删除节点", message: `确认删除节点 #${index + 1}？`, confirmText: "删除" });
+        if (!confirmed) return;
+      }
       button.disabled = true;
       setInlineResult($("nodeResult"), action === "delete" ? "正在删除节点..." : "正在测试节点到 Telegram Bot API 的往返延迟...");
       try {
@@ -1839,7 +2248,10 @@
       event.preventDefault();
       const publicHost = $("webHost").value === "0.0.0.0";
       const changedToPublic = publicHost && state.management?.web.host !== "0.0.0.0";
-      const confirmed = !changedToPublic || confirm("所有网卡监听下，直接 HTTP 访问会明文传输登录密码。确认继续？");
+      let confirmed = true;
+      if (changedToPublic) {
+        confirmed = await confirmAction({ title: "切换为公网监听", message: "所有网卡监听下，直接 HTTP 访问会明文传输登录密码。确认继续？", confirmText: "继续保存", tone: "warning" });
+      }
       if (!confirmed) return;
       try {
         const data = await api("/api/web-settings", { method: "POST", body: { enabled: $("webEnabled").checked, host: $("webHost").value, port: Number($("webPort").value), username: $("webUsername").value.trim(), password: $("webPassword").value, password_confirm: $("webPasswordConfirm").value, confirm_public: confirmed } });
@@ -1930,7 +2342,9 @@
 
     $("checkUpdateButton").addEventListener("click", () => checkForUpdate(true));
     $("installUpdateButton").addEventListener("click", async () => {
-      if (!state.update?.available || !confirm(`确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`)) return;
+      if (!state.update?.available) return;
+      const confirmed = await confirmAction({ title: "安装更新", message: `确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`, confirmText: "开始更新", tone: "primary" });
+      if (!confirmed) return;
       renderUpdateProgress(2, "正在提交更新任务");
       $("checkUpdateButton").disabled = true;
       $("installUpdateButton").disabled = true;
@@ -1950,12 +2364,16 @@
       }
     });
     $("restartServiceButton").addEventListener("click", async () => {
-      if (!confirm("确认重启后台服务？网页可能短暂断开。")) return;
+      const confirmed = await confirmAction({ title: "重启后台服务", message: "确认重启后台服务？网页可能短暂断开。", confirmText: "重启", tone: "warning" });
+      if (!confirmed) return;
       try { await api("/api/service/restart", { method: "POST", body: {} }); toast("后台服务重启已安排"); }
       catch (error) { toast(error.message, true); }
     });
 
+    applyTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+
     (async function init() {
+      renderSkeletons();
       try { const data = await api("/api/session"); $("loginVersion").textContent = `受保护的运维入口 · v${data.version}`; if (data.authenticated) { state.csrf = data.csrf; showApp(); } else showLogin(); }
       catch (error) { $("loginError").textContent = error.message; showLogin(); }
     })();
