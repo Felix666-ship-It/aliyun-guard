@@ -1803,7 +1803,7 @@
       return point.action_performed ? `${label}（已执行）` : `${label}（未执行）`;
     }
 
-    function showChartTooltip(target) {
+    function showChartTooltip(target, pointerX = null) {
       const card = target.closest("[data-index]");
       const item = state.dashboard?.users.find(value => value.index === Number(card?.dataset.index));
       const point = item?.history?.[Number(target.dataset.point)];
@@ -1818,7 +1818,9 @@
       requestAnimationFrame(() => {
         const containerRect = container.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
-        const desired = targetRect.left + targetRect.width / 2 - containerRect.left;
+        const desired = pointerX === null
+          ? targetRect.left + targetRect.width / 2 - containerRect.left
+          : pointerX - containerRect.left;
         const width = containerRect.width;
         const left = Math.max(4, Math.min(width - tooltip.offsetWidth - 4, desired - tooltip.offsetWidth / 2));
         tooltip.style.left = `${left}px`;
@@ -1956,7 +1958,8 @@
       }
     });
 
-    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
+    $("instances").addEventListener("pointermove", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
+    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
     $("instances").addEventListener("pointerout", event => { const target = event.target.closest(".chart-hit"); if (target && !target.contains(event.relatedTarget)) hideChartTooltip(target); });
     $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
     $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });

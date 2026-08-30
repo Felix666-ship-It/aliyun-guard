@@ -9067,7 +9067,7 @@ __AG_WEB_PY_EOF__
       return point.action_performed ? `${label}（已执行）` : `${label}（未执行）`;
     }
 
-    function showChartTooltip(target) {
+    function showChartTooltip(target, pointerX = null) {
       const card = target.closest("[data-index]");
       const item = state.dashboard?.users.find(value => value.index === Number(card?.dataset.index));
       const point = item?.history?.[Number(target.dataset.point)];
@@ -9082,7 +9082,9 @@ __AG_WEB_PY_EOF__
       requestAnimationFrame(() => {
         const containerRect = container.getBoundingClientRect();
         const targetRect = target.getBoundingClientRect();
-        const desired = targetRect.left + targetRect.width / 2 - containerRect.left;
+        const desired = pointerX === null
+          ? targetRect.left + targetRect.width / 2 - containerRect.left
+          : pointerX - containerRect.left;
         const width = containerRect.width;
         const left = Math.max(4, Math.min(width - tooltip.offsetWidth - 4, desired - tooltip.offsetWidth / 2));
         tooltip.style.left = `${left}px`;
@@ -9220,7 +9222,8 @@ __AG_WEB_PY_EOF__
       }
     });
 
-    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
+    $("instances").addEventListener("pointermove", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
+    $("instances").addEventListener("pointerover", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target, event.clientX); });
     $("instances").addEventListener("pointerout", event => { const target = event.target.closest(".chart-hit"); if (target && !target.contains(event.relatedTarget)) hideChartTooltip(target); });
     $("instances").addEventListener("focusin", event => { const target = event.target.closest(".chart-hit"); if (target) showChartTooltip(target); });
     $("instances").addEventListener("focusout", event => { const target = event.target.closest(".chart-hit"); if (target) hideChartTooltip(target); });
@@ -12698,8 +12701,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.18"
-LOCAL_RELEASE_ID = "b0cc380b6e07ca6e05c40550c17cd203d8e30c2e69bfbdb7776f316ff3f343c6"
+APP_VERSION = "1.6.19"
+LOCAL_RELEASE_ID = "a9827b23d7ec20922431e35bd730152b647725763c65c483d5a5b6b652b7589b"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
