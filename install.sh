@@ -246,6 +246,10 @@ handle_legacy_monitor() {
 }
 
 install_packages() {
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有 Python 环境，跳过系统依赖安装。${RESET}"
+        return
+    fi
     say "${YELLOW}[1/6] 安装系统依赖...${RESET}"
     case "$PKG_MANAGER" in
         apt)
@@ -292,6 +296,10 @@ find_python() {
 
 create_venv() {
     say "${YELLOW}[2/6] 创建 Python 独立环境...${RESET}"
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有虚拟环境。${RESET}"
+        return
+    fi
     if [ ! -x "$VENV_DIR/bin/python" ]; then
         rm -rf "$VENV_DIR"
         if ! "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null; then
@@ -12689,7 +12697,7 @@ UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
 APP_VERSION = "1.6.16"
-LOCAL_RELEASE_ID = "ec05da97c1b16c657ba2e8978e189123eeb9739ec865cabda874ea976cb99b9e"
+LOCAL_RELEASE_ID = "18e8f5ad7dd17974c80779a064e54f1830f2667bc5d7a4803df8746dc244cb8e"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

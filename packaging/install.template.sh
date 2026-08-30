@@ -246,6 +246,10 @@ handle_legacy_monitor() {
 }
 
 install_packages() {
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有 Python 环境，跳过系统依赖安装。${RESET}"
+        return
+    fi
     say "${YELLOW}[1/6] 安装系统依赖...${RESET}"
     case "$PKG_MANAGER" in
         apt)
@@ -292,6 +296,10 @@ find_python() {
 
 create_venv() {
     say "${YELLOW}[2/6] 创建 Python 独立环境...${RESET}"
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有虚拟环境。${RESET}"
+        return
+    fi
     if [ ! -x "$VENV_DIR/bin/python" ]; then
         rm -rf "$VENV_DIR"
         if ! "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null; then
